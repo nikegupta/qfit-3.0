@@ -2372,6 +2372,80 @@ class QFitLigand(_BaseQFit):
             return
         
         return new_coor_set, new_bs
+
+    def rot_trans(self):
+        """
+        Rotate and translate all conformers that pass QP scoring for further sampling of conformational space. Rotate 15 degrees by 5 degree increments in x, y, z directions 
+        and translate 0.3 angstroms in x, y, z directions. 
+        """
+        
+        def apply_translations(conformation, translation_range=0.3):
+            translated_conformations = []
+            for dx in np.linspace(-translation_range, translation_range, num=3):  # num can be adjusted based on the desired granularity
+                for dy in np.linspace(-translation_range, translation_range, num=3):
+                    for dz in np.linspace(-translation_range, translation_range, num=3):
+                        translation_vector = np.array([dx, dy, dz])
+                        translated_conformation = conformation + translation_vector
+                        translated_conformations.append(translated_conformation)
+            return translated_conformations    
+        
+        def apply_rotations(conformation, rotation_range=15, step=5):
+            rotated_conformations = [conformation]  # Include the original conformation
+            center = conformation.mean(axis=0)  # Compute the center of the conformation
+            for angle in range(step, rotation_range + step, step):
+                for axis in ['x', 'y', 'z']:
+                    r = R.from_euler(axis, np.radians(angle), degrees=False)
+                    rotation_matrix = r.as_matrix()
+                    # Apply rotation around the center
+                    rotated_conformation = np.dot(conformation - center, rotation_matrix.T) + center
+                    rotated_conformations.append(rotated_conformation)
+            return rotated_conformations
+        
+        # Initialize empty list to store rotated/translated conformers + b-factors 
+        extended_coor_set = []
+        extended_bs = [] 
+        rotated_coor_set = []
+        rotated_bs = []   
+        new_coor_set = self._coor_set
+        new_bs = self._bs
+
+        # rotations
+        for conf, b in zip(self._coor_set, self._bs):
+            # Apply rotations to each initial conformation
+            rotated_conformations = apply_rotations(conf, rotation_range=15, step=5)
+            rotated_coor_set.extend(rotated_conformations)
+            rotated_bs.extend([b] * len(rotated_conformations))  # Extend b values for each rotated conformation
+
+        # translations 
+        for conf, b in zip(self._coor_set, self._bs):
+            # Apply translations to each conformation
+            translated_conformations = apply_translations(conf, translation_range=0.3)
+            extended_coor_set.extend(translated_conformations)
+            extended_bs.extend([b] * len(translated_conformations))  # Extend b values for each translated conformation
+
+
+        self._coor_set = np.concatenate((new_coor_set, rotated_coor_set, extended_coor_set), axis=0)
+        self._bs = np.concatenate((new_bs, rotated_bs, extended_bs), axis=0)
+
+        logger.info(f"Trans/rot  search generated: {len(self._coor_set)} plausible conformers")  
+        logger.info(f"bfactor shape = {np.shape(self._bs)}")
+        
+        self._convert() 
+        logger.info("Solving QP after trans and rot search.")
+        self._solve_qp()
+        logger.debug("Updating conformers after trans and rot search.")
+        self._update_conformers()
+        self._write_intermediate_conformers(prefix="trans_rot_sol")
+
+        logger.info(f"After rotation and translation QP there are {len(self._coor_set)} conformers")
+
+
+
+        if len(self._coor_set) < 1:
+            logger.warning(
+                f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
+            )
+            return
 class QFitCovalentLigand(_BaseQFit):
     def __init__(self, covalent_ligand, receptor, xmap, options):
         self.chain = covalent_ligand.chain[0]
