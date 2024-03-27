@@ -59,6 +59,13 @@ def build_argparser():
         help="Number of RDKit conformers to generate",
     )
 
+    p.add_argument(
+        "-lb",
+        "--ligand_bic",
+        action="store_true",
+        help="Flag to run with ligand BIC on",
+    )
+
     # Map input options
     p.add_argument(
         "-l",
