@@ -60,6 +60,7 @@ class QFitOptions:
         # RDKit options
         self.numConf = None
         self.smiles = None
+        self.ligand_bic = None
 
         # Density preparation options
         self.density_cutoff = 0.3
@@ -333,6 +334,9 @@ class _BaseQFit:
                 )  #hyperparameter 1.5 determined to be the best cut off between too many conformations and improving Rfree
                 if segment is not None:
                     k = nconfs  # for segment, we only care about the number of conformations come out of MIQP. Considering atoms penalizes this too much
+                if self.options.ligand_bic:
+                    print("bic on")
+                    k = nconfs * natoms
                 BIC = n * np.log(rss / n) + k * np.log(n)
                 solution = MIQPSolutionStats(
                     threshold=threshold,
@@ -1451,14 +1455,14 @@ class QFitLigand(_BaseQFit):
         # Combine protein_atoms and water_molecules
         receptor_combined = protein_atoms.combine(water_molecules)
 
-        # # External clash detection:
-        # self._cd = ClashDetector(
-        #     ligand, receptor, scaling_factor=self.options.clash_scaling_factor
-        # )
         # External clash detection:
         self._cd = ClashDetector(
-            ligand, receptor_combined, scaling_factor=self.options.clash_scaling_factor
+            ligand, receptor, scaling_factor=self.options.clash_scaling_factor
         )
+        # # External clash detection:
+        # self._cd = ClashDetector(
+        #     ligand, receptor_combined, scaling_factor=self.options.clash_scaling_factor
+        # )
 
         # Determine which roots to start building from
         self._rigid_clusters = ligand.rigid_clusters()
@@ -1510,379 +1514,87 @@ class QFitLigand(_BaseQFit):
             logger.error(f"Ligand with chain {ligand_chain} and residue ID {ligand_res_id} not found in the PDB file.")
 
     def run(self):
+        ligand = Chem.MolFromPDBFile(self.ligand_pdb_file)
+        # total number of conformers to generate 
+        num_gen_conformers = self.options.numConf
+        
+        # check if ligand has long branch/side chain
+        branching_test = self.identify_core_and_sidechain(ligand)
+        branching_atoms = branching_test[0]
+        length_branching = branching_test[1]
+        # print("length of side chain = ", length_branching)
 
-        if self.options.numConf:
-            ligand = Chem.MolFromPDBFile(self.ligand_pdb_file)
-            # total number of conformers to generate 
-            num_gen_conformers = self.options.numConf
-            
-            # check if ligand has long branch/side chain
-            branching_test = self.identify_core_and_sidechain(ligand)
-            branching_atoms = branching_test[0]
-            length_branching = branching_test[1]
-            # print("length of side chain = ", length_branching)
+        # run rdkit conformer generator 
+        logger.info("Starting RDKit conformer generation")
 
-            # run rdkit conformer generator 
-            logger.info("Starting RDKit conformer generation")
-
-            if not branching_atoms:
-                # print("No branches")
-                # if there are no branches, qFit will not run branching search or long chain search. Therefore, 3 methods of sampling remain
-                num_conf_for_method = round(num_gen_conformers / 3)
-            if branching_atoms:
-                #print("Has branches, run branching search")
-                if length_branching > 30:
-                    #print("has long branches, run long chain search")
-                    num_conf_for_method = round(num_gen_conformers / 5)
-                elif length_branching <= 30:
-                    num_conf_for_method = round(num_gen_conformers / 4)
+        if not branching_atoms:
+            # print("No branches")
+            # if there are no branches, qFit will not run branching search or long chain search. Therefore, 3 methods of sampling remain
+            num_conf_for_method = round(num_gen_conformers / 3)
+        if branching_atoms:
+            #print("Has branches, run branching search")
+            if length_branching > 30:
+                #print("has long branches, run long chain search")
+                num_conf_for_method = round(num_gen_conformers / 5)
+            elif length_branching <= 30:
+                num_conf_for_method = round(num_gen_conformers / 4)
 
 
-            self.num_conf_for_method = num_conf_for_method
+        self.num_conf_for_method = num_conf_for_method
 
-            self.random_unconstrained()
-            self.terminal_atom_const()
-            self.spherical_search()
-            if branching_atoms:
-                #print("Has branches, run branching search")
-                if length_branching > 30:
-                    #print("has long branches, run long chain search")
-                    self.branching_search()
-                    self.long_chain_search()
-                elif length_branching <= 30:
-                    self.branching_search()
+        self.random_unconstrained()
+        self.terminal_atom_const()
+        self.spherical_search()
+        if branching_atoms:
+            #print("Has branches, run branching search")
+            if length_branching > 30:
+                #print("has long branches, run long chain search")
+                self.branching_search()
+                self.long_chain_search()
+            elif length_branching <= 30:
+                self.branching_search()
 
-            logger.info(f"Number of generated conformers, before scoring: {len(self._coor_set)}")
-            
-            if len(self._coor_set) < 1:
-                logger.error("qFit-ligand failed to produce a valid conformer.")
-                return
-            
-
-            # QP score conformer occupancy
-            logger.debug("Converting densities within run.")
-            self._convert()
-            logger.info("Solving QP within run.")
-            self._solve_qp()
-            # self._write_intermediate_conformers(prefix="pre_qp")
-            logger.debug("Updating conformers within run.")
-            self._update_conformers()
-
-            # Only conformeres that pass QP scoring will be rotated and translated for additional sampling 
-            self.rot_trans()
-
-            # MIQP score conformer occupancy
-            logger.info("Solving MIQP within run.")
-            self._convert()
-            self._solve_miqp(
-                threshold=self.options.threshold,
-                cardinality=self.options.cardinality,
-            )
-            self._update_conformers()
-            if self.options.write_intermediate_conformers:
-                self._write_intermediate_conformers(prefix="miqp_solution")
-            # self._write_intermediate_conformers(prefix="miqp_solution")
-
-            logger.info(f"Number of final conformers: {len(self._coor_set)}")
-                
-            return
-            
-        for self._cluster_index, self._cluster in enumerate(self._clusters_to_sample):
-            self._coor_set = list(self._starting_coor_set)
-            if self.options.local_search:
-                logger.info("Starting local search")
-                self._local_search()
-            self._coor_set.append(self._starting_coor_set)
-            self.ligand._active[self.ligand._selection] = True
-            logger.info("Starting sample internal dofs")
-            self._sample_internal_dofs()
-            self._all_coor_set += self._coor_set
-            self._all_bs += self._bs
-            prefix_tmp = "run_" + str(self._cluster)
-            self._write_intermediate_conformers(prefix=prefix_tmp)
-            logger.info(f"Number of conformers: {len(self._coor_set)}")
-            logger.info(f"Number of final conformers: {len(self._all_coor_set)}")
-
-        # Find consensus across roots:
-        self.conformer = self.ligand
-        self.ligand._q[self.ligand._selection] = 1.0
-        self.ligand._active[self.ligand._selection] = True
-        self._coor_set = self._all_coor_set
-        self._bs = self._all_bs
+        logger.info(f"Number of generated conformers, before scoring: {len(self._coor_set)}")
+        
         if len(self._coor_set) < 1:
             logger.error("qFit-ligand failed to produce a valid conformer.")
             return
+        
 
         # QP score conformer occupancy
         logger.debug("Converting densities within run.")
         self._convert()
         logger.info("Solving QP within run.")
         self._solve_qp()
+        # self._write_intermediate_conformers(prefix="pre_qp")
         logger.debug("Updating conformers within run.")
         self._update_conformers()
-        if len(self._coor_set) < 1:
-            print(
-                f"{self.ligand.resn[0]}: QP {self._cluster_index}: {len(self._coor_set)} conformers"
-            )
-            return
+
+        # Only conformeres that pass QP scoring will be rotated and translated for additional sampling 
+        self.rot_trans()
 
         # MIQP score conformer occupancy
         logger.info("Solving MIQP within run.")
         self._convert()
-        self._solve_miqp(
-            threshold=self.options.threshold,
-            cardinality=self.options.cardinality,
-        )
+        if self.options.ligand_bic:
+            print("BIC IS ON")
+            self._solve_miqp(
+                threshold=self.options.threshold,
+                cardinality=self.options.cardinality,
+                do_BIC_selection=True
+            )
+        if not self.options.ligand_bic:
+            print("BIC IS OFF")
+            self._solve_miqp(
+                threshold=self.options.threshold,
+                cardinality=self.options.cardinality,
+            )
         self._update_conformers()
         if self.options.write_intermediate_conformers:
             self._write_intermediate_conformers(prefix="miqp_solution")
+        # self._write_intermediate_conformers(prefix="miqp_solution")
 
-    def _local_search(self):
-        """Perform a local rigid body search on the cluster."""
-
-        # Set occupancies of rigid cluster and its direct neighboring atoms to
-        # 1 for clash detection and MIQP
-        selection = self.ligand._selection
-        self.ligand._active[selection] = True
-        center = self.ligand.coor[self._cluster].mean(axis=0)
-        new_coor_set = []
-        new_bs = []
-        for coor, b in zip(self._coor_set, self._bs):
-            self.ligand._coor[selection] = coor
-            self.ligand._b[selection] = b
-            rotator = GlobalRotator(self.ligand, center=center)
-            for rotmat in RotationSets.get_local_set():
-                rotator(rotmat)
-                translator = Translator(self.ligand)
-                iterator = itertools.product(
-                    *[np.arange(*trans) for trans in self._trans_box]
-                )
-                for translation in iterator:
-                    translator(translation)
-                    new_coor = self.ligand.coor
-                    if self.options.remove_conformers_below_cutoff:
-                        values = self.xmap.interpolate(new_coor)
-                        mask = self.ligand.e != "H"
-                        if np.min(values[mask]) < self.options.density_cutoff:
-                            continue
-                    if self.options.external_clash:
-                        if not self._cd() and not self.ligand.clashes():
-                            if new_coor_set:
-                                delta = np.array(new_coor_set) - np.array(new_coor)
-                                if (
-                                    np.sqrt(
-                                        min(np.square((delta)).sum(axis=2).sum(axis=1))
-                                    )
-                                    >= self.options.rmsd_cutoff
-                                ):
-                                    new_coor_set.append(new_coor)
-                                    new_bs.append(b)
-                            else:
-                                new_coor_set.append(new_coor)
-                                new_bs.append(b)
-                    elif not self.ligand.clashes():
-                        if new_coor_set:
-                            delta = np.array(new_coor_set) - np.array(new_coor)
-                            if (
-                                np.sqrt(min(np.square((delta)).sum(axis=2).sum(axis=1)))
-                                >= self.options.rmsd_cutoff
-                            ):
-                                new_coor_set.append(new_coor)
-                                new_bs.append(b)
-                        else:
-                            new_coor_set.append(new_coor)
-                            new_bs.append(b)
-        self.ligand._active[self.ligand._selection] = False
-        selection = self.ligand._selection[self._cluster]
-        self.ligand._active[selection] = True
-        for atom in self._cluster:
-            atom_sel = self.ligand._selection[self.ligand.connectivity[atom]]
-            self.ligand._active[atom_sel] = True
-        self.conformer = self.ligand
-        self._coor_set = new_coor_set
-        self._bs = new_bs
-        if len(self._coor_set) < 1:
-            logger.warning(
-                f"{self.ligand.resn[0]}: "
-                f"Local search {self._cluster_index}: {len(self._coor_set)} conformers"
-            )
-            return
-
-        # QP score conformer occupancy
-        logger.debug("Converting densities.")
-        self._convert()
-        self._solve_qp()
-        logger.debug("Updating conformers")
-        self._update_conformers()
-        if self.options.write_intermediate_conformers:
-            self._write_intermediate_conformers(prefix="localsearch_ligand_qp")
-        if len(self._coor_set) < 1:
-            logger.warning(
-                f"{self.ligand.resn[0]}: "
-                f"Local search QP {self._cluster_index}: {len(self._coor_set)} conformers"
-            )
-            return
-
-        # MIQP score conformer occupancy
-        self._convert()
-        self._solve_miqp(
-            threshold=self.options.threshold, cardinality=self.options.cardinality
-        )
-        self._update_conformers()
-        if self.options.write_intermediate_conformers:
-            self._write_intermediate_conformers(prefix="localsearch_ligand_miqp")
-
-    def _sample_internal_dofs(self):
-        opt = self.options
-        sampling_range = np.deg2rad(
-            np.arange(0, 360, self.options.sample_ligand_stepsize)
-        )
-        bond_order = BondOrder(self.ligand, self._cluster[0])
-        bonds = bond_order.order
-        depths = bond_order.depth
-        nbonds = len(bonds)
-
-        starting_bond_index = 0
-
-        sel_str = f"chain {self.ligand.chain[0]} and resi {self.ligand.resi[0]}"
-        if self.ligand.icode[0]:
-            sel_str = f"{sel_str} and icode {self.ligand.icode[0]}"
-        selection = self.ligand._selection
-        iteration = 1
-        while True:
-            if (
-                iteration == 1
-                and self.options.local_search
-                and self.options.dofs_per_iteration > 1
-            ):
-                end_bond_index = (
-                    starting_bond_index + self.options.dofs_per_iteration - 1
-                )
-            else:
-                end_bond_index = min(
-                    starting_bond_index + self.options.dofs_per_iteration, nbonds
-                )
-            self.ligand._active[selection] = True
-            for bond_index in range(starting_bond_index, end_bond_index):
-                nbonds_sampled = bond_index + 1
-
-                bond = bonds[bond_index]
-                atoms = [self.ligand.name[bond[0]], self.ligand.name[bond[1]]]
-                new_coor_set = []
-                new_bs = []
-                for coor, b in zip(self._coor_set, self._bs):
-                    self.ligand._coor[selection] = coor
-                    self.ligand._b[selection] = b
-                    rotator = BondRotator(self.ligand, *atoms)
-                    for angle in sampling_range:
-                        new_coor = rotator(angle)
-                        if opt.remove_conformers_below_cutoff:
-                            values = self.xmap.interpolate(
-                                new_coor[self.ligand._active[selection]]
-                            )
-                            mask = self.ligand.e[self.ligand._active[selection]] != "H"
-                            if np.min(values[mask]) < self.options.density_cutoff:
-                                continue
-                        if self.options.external_clash:
-                            if not self._cd() and not self.ligand.clashes():
-                                if new_coor_set:
-                                    delta = np.array(new_coor_set) - np.array(new_coor)
-                                    if (
-                                        np.sqrt(
-                                            min(
-                                                np.square((delta))
-                                                .sum(axis=2)
-                                                .sum(axis=1)
-                                            )
-                                        )
-                                        >= self.options.rmsd_cutoff
-                                    ):
-                                        new_coor_set.append(new_coor)
-                                        new_bs.append(b)
-                                else:
-                                    new_coor_set.append(new_coor)
-                                    new_bs.append(b)
-                        elif not self.ligand.clashes():
-                            if new_coor_set:
-                                delta = np.array(new_coor_set) - np.array(new_coor)
-                                if (
-                                    np.sqrt(
-                                        min(np.square((delta)).sum(axis=2).sum(axis=1))
-                                    )
-                                    >= self.options.rmsd_cutoff
-                                ):
-                                    new_coor_set.append(new_coor)
-                                    new_bs.append(b)
-                            else:
-                                new_coor_set.append(new_coor)
-                                new_bs.append(b)
-                self._coor_set = new_coor_set
-                self._bs = new_bs
-
-            self.ligand._active[selection] = False
-            active = np.zeros_like(self.ligand._active[selection], dtype=bool)
-            # Activate all the atoms of the ligand that have been sampled
-            # up until the bond we are currently sampling:
-            for cluster in self._rigid_clusters:
-                for sampled_bond in bonds[:nbonds_sampled]:
-                    if sampled_bond[0] in cluster or sampled_bond[1] in cluster:
-                        active[cluster] = True
-                        for atom in cluster:
-                            active[self.ligand.connectivity[atom]] = True
-            self.ligand._active[selection] = active
-            self.conformer = self.ligand
-
-            logger.info(f"Nconf: {len(self._coor_set)}")
-
-            if len(self._coor_set) < 1:
-                logger.warning(
-                    f"{self.ligand.resn[0]}: "
-                    f"DOF search cluster {self._cluster_index} iteration {iteration}: "
-                    f"{len(self._coor_set)} conformers."
-                )
-                return
-
-            # QP score conformer occupancy
-            self._convert()
-            self._solve_qp()
-            self._update_conformers()
-            if self.options.write_intermediate_conformers:
-                self._write_intermediate_conformers(
-                    prefix=f"sample_ligand_iter{iteration}_qp"
-                )
-            if len(self._coor_set) < 1:
-                logger.warning(
-                    f"{self.ligand.resn[0]}: "
-                    f"QP search cluster {self._cluster_index} iteration {iteration}: "
-                    f"{len(self._coor_set)} conformers"
-                )
-                return
-
-            # MIQP score conformer occupancy
-            self._convert()
-            self._solve_miqp(
-                threshold=self.options.threshold, cardinality=self.options.cardinality
-            )
-            self._update_conformers()
-            if self.options.write_intermediate_conformers:
-                self._write_intermediate_conformers(
-                    prefix=f"sample_ligand_iter{iteration}_miqp"
-                )
-
-            # Check if we are done
-            if end_bond_index == nbonds:
-                break
-
-            # Go to the next bonds to be sampled
-            if (
-                iteration == 1
-                and self.options.local_search
-                and self.options.dofs_per_iteration > 1
-            ):
-                starting_bond_index += self.options.dofs_per_iteration - 1
-            else:
-                starting_bond_index += self.options.dofs_per_iteration
-            iteration += 1
+        logger.info(f"Number of final conformers: {len(self._coor_set)}")
 
     def random_unconstrained(self):
         """
@@ -1923,24 +1635,38 @@ class QFitLigand(_BaseQFit):
         ligand = Chem.RemoveHs(ligand)
 
         # Check for internal/external clashes 
-        logger.info("Checking for clashes")
-        # Store the coordinates of each conformer into numpy array
-        new_conformer = mol.GetConformers()
-        new_coors = []
-        for i, conformer in enumerate(new_conformer):
-            coords = conformer.GetPositions()
-            new_coors.append(coords)
+        if mol.GetNumConformers() == 0:
+            print("NO CONF GENERATED")
 
-        new_idx_set = []
-        new_coor_set = []
-        new_bs = []
-        # loop through each rdkit generated conformer
-        for idx, conf in enumerate(new_coors):  
-            b = self._bs
-            self.ligand.coor = conf
-            self.ligand.b = [b[0]]
-            if self.options.external_clash:
-                if not self._cd():
+        if mol.GetNumConformers() != 0:
+            # Check for internal/external clashes 
+            logger.info("Checking for clashes")
+            # Store the coordinates of each conformer into numpy array
+            new_conformer = mol.GetConformers()
+            new_coors = []
+            for i, conformer in enumerate(new_conformer):
+                coords = conformer.GetPositions()
+                new_coors.append(coords)
+    
+            new_idx_set = []
+            new_coor_set = []
+            new_bs = []
+            # loop through each rdkit generated conformer
+            for idx, conf in enumerate(new_coors):  
+                b = self._bs
+                self.ligand.coor = conf
+                self.ligand.b = [b[0]]
+                if self.options.external_clash:
+                    if not self._cd():
+                        if new_idx_set:  # if there are already conformers in new_idx_set
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0])
+                        else:
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0]) 
+                elif not self.ligand.clashes():
                     if new_idx_set:  # if there are already conformers in new_idx_set
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
@@ -1949,31 +1675,22 @@ class QFitLigand(_BaseQFit):
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
                         new_bs.append(b[0]) 
-            elif not self.ligand.clashes():
-                if new_idx_set:  # if there are already conformers in new_idx_set
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0])
-                else:
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0]) 
-
-        
-        # Save new conformers to self
-        merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
-        merged_bs = np.concatenate((self._bs, new_bs), axis=0)
-
-        self._coor_set = merged_arr
-        self._bs = merged_bs
-
-        logger.info(f"Random search generated: {len(self._coor_set)} plausible conformers")          
-
-        if len(self._coor_set) < 1:
-            logger.warning(
-                f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
-            )
-            return
+    
+            
+            # Save new conformers to self
+            merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
+            merged_bs = np.concatenate((self._bs, new_bs), axis=0)
+    
+            self._coor_set = merged_arr
+            self._bs = merged_bs
+    
+            logger.info(f"Random search generated: {len(self._coor_set)} plausible conformers")          
+    
+            if len(self._coor_set) < 1:
+                logger.warning(
+                    f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
+                )
+                return
         
         return 
 
@@ -2151,25 +1868,37 @@ class QFitLigand(_BaseQFit):
         mol = Chem.RemoveHs(mol)
         ligand = Chem.RemoveHs(ligand)
 
-        # Check for internal/external clashes 
-        logger.info("Checking for clashes")
-        # Store the coordinates of each conformer into numpy array
-        new_conformer = mol.GetConformers()
-        new_coors = []
-        for i, conformer in enumerate(new_conformer):
-            coords = conformer.GetPositions()
-            new_coors.append(coords)
-
-        new_idx_set = []
-        new_coor_set = []
-        new_bs = []
-        # loop through each rdkit generated conformer
-        for idx, conf in enumerate(new_coors):  
-            b = self._bs
-            self.ligand.coor = conf
-            self.ligand.b = [b[0]]
-            if self.options.external_clash:
-                if not self._cd():
+        if mol.GetNumConformers() == 0:
+            print("NO CONF GENERATED")
+        if mol.GetNumConformers() != 0:
+            # Check for internal/external clashes 
+            logger.info("Checking for clashes")
+            # Store the coordinates of each conformer into numpy array
+            new_conformer = mol.GetConformers()
+            new_coors = []
+            for i, conformer in enumerate(new_conformer):
+                coords = conformer.GetPositions()
+                new_coors.append(coords)
+    
+            new_idx_set = []
+            new_coor_set = []
+            new_bs = []
+            # loop through each rdkit generated conformer
+            for idx, conf in enumerate(new_coors):  
+                b = self._bs
+                self.ligand.coor = conf
+                self.ligand.b = [b[0]]
+                if self.options.external_clash:
+                    if not self._cd():
+                        if new_idx_set:  # if there are already conformers in new_idx_set
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0])
+                        else:
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0]) 
+                elif not self.ligand.clashes():
                     if new_idx_set:  # if there are already conformers in new_idx_set
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
@@ -2178,34 +1907,25 @@ class QFitLigand(_BaseQFit):
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
                         new_bs.append(b[0]) 
-            elif not self.ligand.clashes():
-                if new_idx_set:  # if there are already conformers in new_idx_set
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0])
-                else:
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0]) 
-
+    
+            
+            # Save new conformers to self
+            merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
+            merged_bs = np.concatenate((self._bs, new_bs), axis=0)
+    
+    
+            self._coor_set = merged_arr
+            self._bs = merged_bs
+    
+            logger.info(f"Spherical search generated: {len(self._coor_set)} plausible conformers")  
+    
+            if len(self._coor_set) < 1:
+                logger.warning(
+                    f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
+                )
+                return
         
-        # Save new conformers to self
-        merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
-        merged_bs = np.concatenate((self._bs, new_bs), axis=0)
-
-
-        self._coor_set = merged_arr
-        self._bs = merged_bs
-
-        logger.info(f"Spherical search generated: {len(self._coor_set)} plausible conformers")  
-
-        if len(self._coor_set) < 1:
-            logger.warning(
-                f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
-            )
-            return
-        
-        return new_coor_set, new_bs
+        return 
 
     def branching_search(self):
         """
@@ -2260,25 +1980,37 @@ class QFitLigand(_BaseQFit):
         mol_copy = Chem.RemoveHs(mol_copy)
         branching_ligand = Chem.RemoveHs(branching_ligand)
 
-        # Check for internal/external clashes 
-        logger.info("Checking for clashes")
-        # Store the coordinates of each conformer into numpy array
-        new_conformer = mol_copy.GetConformers()
-        new_coors = []
-        for i, conformer in enumerate(new_conformer):
-            coords = conformer.GetPositions()
-            new_coors.append(coords)
-
-        new_idx_set = []
-        new_coor_set = []
-        new_bs = []
-        # loop through each rdkit generated conformer
-        for idx, conf in enumerate(new_coors):  
-            b = self._bs
-            self.ligand.coor = conf
-            self.ligand.b = [b[0]]
-            if self.options.external_clash:
-                if not self._cd():
+        # Check for internal/external clashes
+        if mol_copy.GetNumConformers() == 0:
+            print("NO CONF GENERATED")
+        if mol_copy.GetNumConformers() != 0:
+            logger.info("Checking for clashes")
+            # Store the coordinates of each conformer into numpy array
+            new_conformer = mol_copy.GetConformers()
+            new_coors = []
+            for i, conformer in enumerate(new_conformer):
+                coords = conformer.GetPositions()
+                new_coors.append(coords)
+    
+            new_idx_set = []
+            new_coor_set = []
+            new_bs = []
+            # loop through each rdkit generated conformer
+            for idx, conf in enumerate(new_coors):  
+                b = self._bs
+                self.ligand.coor = conf
+                self.ligand.b = [b[0]]
+                if self.options.external_clash:
+                    if not self._cd():
+                        if new_idx_set:  # if there are already conformers in new_idx_set
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0])
+                        else:
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0]) 
+                elif not self.ligand.clashes():
                     if new_idx_set:  # if there are already conformers in new_idx_set
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
@@ -2287,25 +2019,16 @@ class QFitLigand(_BaseQFit):
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
                         new_bs.append(b[0]) 
-            elif not self.ligand.clashes():
-                if new_idx_set:  # if there are already conformers in new_idx_set
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0])
-                else:
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0]) 
+    
+            # Save new conformers to self
+            merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
+            merged_bs = np.concatenate((self._bs, new_bs), axis=0)
+    
+            self._coor_set = merged_arr
+            self._bs = merged_bs
+            logger.info(f"Branched search generated: {len(new_coor_set)} plausible conformers")  
 
-        # Save new conformers to self
-        merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
-        merged_bs = np.concatenate((self._bs, new_bs), axis=0)
-
-        self._coor_set = merged_arr
-        self._bs = merged_bs
-        logger.info(f"Branched search generated: {len(new_coor_set)} plausible conformers")  
-
-        return 
+            return 
 
     def long_chain_search(self):
         """
@@ -2353,26 +2076,38 @@ class QFitLigand(_BaseQFit):
         mol = Chem.RemoveHs(mol)
         ligand = Chem.RemoveHs(ligand)
 
-        # Check for internal/external clashes 
-        logger.info("Checking for clashes")
-        # Store the coordinates of each conformer into numpy array
-        new_conformer = mol.GetConformers()
-        new_coors = []
-        for i, conformer in enumerate(new_conformer):
-            coords = conformer.GetPositions()
-            new_coors.append(coords)
-
-        new_idx_set = []
-        new_coor_set = []
-        new_bs = []
-        # loop through each rdkit generated conformer
-        for idx, conf in enumerate(new_coors):  
-            b = self._bs
-            self.ligand.coor = conf
-            self.ligand.b = [b[0]]
-            # self._cd()
-            if self.options.external_clash:
-                if not self._cd():
+        if mol.GetNumConformers() == 0:
+            print("NO CONF GENERATED")
+        if mol.GetNumConformers() != 0:
+            # Check for internal/external clashes 
+            logger.info("Checking for clashes")
+            # Store the coordinates of each conformer into numpy array
+            new_conformer = mol.GetConformers()
+            new_coors = []
+            for i, conformer in enumerate(new_conformer):
+                coords = conformer.GetPositions()
+                new_coors.append(coords)
+    
+            new_idx_set = []
+            new_coor_set = []
+            new_bs = []
+            # loop through each rdkit generated conformer
+            for idx, conf in enumerate(new_coors):  
+                b = self._bs
+                self.ligand.coor = conf
+                self.ligand.b = [b[0]]
+                # self._cd()
+                if self.options.external_clash:
+                    if not self._cd():
+                        if new_idx_set:  # if there are already conformers in new_idx_set
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0])
+                        else:
+                            new_idx_set.append(idx)
+                            new_coor_set.append(conf)
+                            new_bs.append(b[0]) 
+                elif not self.ligand.clashes():
                     if new_idx_set:  # if there are already conformers in new_idx_set
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
@@ -2381,42 +2116,33 @@ class QFitLigand(_BaseQFit):
                         new_idx_set.append(idx)
                         new_coor_set.append(conf)
                         new_bs.append(b[0]) 
-            elif not self.ligand.clashes():
-                if new_idx_set:  # if there are already conformers in new_idx_set
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0])
-                else:
-                    new_idx_set.append(idx)
-                    new_coor_set.append(conf)
-                    new_bs.append(b[0]) 
-
-        # Save new conformers to self
-        merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
-        merged_bs = np.concatenate((self._bs, new_bs), axis=0)
-
-
-        self._coor_set = merged_arr
-        self._bs = merged_bs
-        # self._bs = new_bs  
-
-        logger.info(f"Long chain search generated: {len(new_coor_set)} plausible conformers")  
-        logger.info(f"bfactor shape = {np.shape(self._bs)}")
-        
-        # self._convert() 
-        # logger.info("Solving QP after long chain search.")
-        # self._solve_qp()
-        # logger.debug("Updating conformers after long chain search.")
-        # self._update_conformers()
-        # self._write_intermediate_conformers(prefix="long_chain_sol")
-
-        # logger.info(f"After long chain QP there are {len(self._coor_set)} conformers")
-
-        if len(self._coor_set) < 1:
-            logger.warning(
-                f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
-            )
-            return
+    
+            # Save new conformers to self
+            merged_arr = np.concatenate((self._coor_set, new_coor_set), axis=0)
+            merged_bs = np.concatenate((self._bs, new_bs), axis=0)
+    
+    
+            self._coor_set = merged_arr
+            self._bs = merged_bs
+            # self._bs = new_bs  
+    
+            logger.info(f"Long chain search generated: {len(new_coor_set)} plausible conformers")  
+            logger.info(f"bfactor shape = {np.shape(self._bs)}")
+            
+            # self._convert() 
+            # logger.info("Solving QP after long chain search.")
+            # self._solve_qp()
+            # logger.debug("Updating conformers after long chain search.")
+            # self._update_conformers()
+            # self._write_intermediate_conformers(prefix="long_chain_sol")
+    
+            # logger.info(f"After long chain QP there are {len(self._coor_set)} conformers")
+    
+            if len(self._coor_set) < 1:
+                logger.warning(
+                    f"RDKit conformers not sufficiently diverse. Generated: {len(self._coor_set)} conformers"
+                )
+                return
         
         return 
 
