@@ -3,9 +3,9 @@
 
 qfit_usage() {
   echo >&2 "Usage:";
-  echo >&2 "  $0 mapfile.mtz [multiconformer_ligand_bound_with_protein.pdb] [qFit_occupancy.params]";
+  echo >&2 "  $0 mapfile.mtz [multiconformer_ligand_bound_with_protein.pdb]";
   echo >&2 "";
-  echo >&2 "mapfile.mtz, multiconformer_ligand_bound_with_protein.pdb, and qFit_occupancy.params MUST exist in this directory.";
+  echo >&2 "mapfile.mtz and multiconformer_ligand_bound_with_protein.pdb MUST exist in this directory.";
   echo >&2 "Outputs will be written to mapfile_qFit.{pdb|mtz|log}.";
   exit 1;
 }
@@ -60,7 +60,6 @@ fi
 
 #__________________________________DETERMINE FOBS v IOBS v FP__________________________________
 # List of Fo types we will check for
-# obstypes=("FP" "FOBS" "F-obs" "I" "IOBS" "I-obs" "F(+)" "I(+)")
 obstypes=("FP" "FOBS" "F-obs" "I" "IOBS" "I-obs" "F(+)" "I(+)" "FSIM")
 
 # Get amplitude fields
@@ -118,14 +117,20 @@ mv -v "${multiconf}.f_norm.pdb" "${multiconf}.fixed"
 phenix.pdbtools remove="element H" "${multiconf}.fixed"
 
 #__________________________________GET CIF FILE__________________________________
-echo "Getting the cif file with ready_set" 
+echo "Getting the cif file with ready_set/elbow" 
 phenix.ready_set hydrogens=false \
                  trust_residue_code_is_chemical_components_code=true \
                  pdb_file_name="${multiconf}.f_modified.pdb"
-# If there are no unknown ligands, ready_set doesn't output a file. We have to do it.
-if [ ! -f "${multiconf}.f_modified.updated.pdb" ]; then
-  cp -v "${multiconf}.f_modified.pdb" "${multiconf}.f_modified.updated.pdb";
+
+# If ready_set fails, use elbow.
+if [ ! -f "${multiconf}.f_modified.ligands.cif" ]; then
+  phenix.elbow multiconformer_ligand_only.pdb --output ${multiconf}.f_modified.ligands
 fi
+
+if [ ! -f "${multiconf}.f_modified.ligands.cif" ]; then
+  echo "CIF failed"
+fi
+
 if [ -f "${multiconf}.f_modified.ligands.cif" ]; then
   echo "refinement.input.monomers.file_name='${multiconf}.f_modified.ligands.cif'" >> ${pdb_name}_refine.params
 fi
@@ -150,29 +155,15 @@ if [ -f "${multiconf}.f_modified.ligands.cif" ]; then
   echo "refinement.input.monomers.file_name='${multiconf}.f_modified.ligands.cif'" >> ${pdb_name}_final_refine.params
 fi
 
-phenix.refine  "${multiconf}.f_modified.updated.pdb" \
+phenix.refine  "${multiconf}.f_modified.pdb" \
                "${pdb_name}.mtz" \
                "${pdb_name}_final_refine.params" \
+               "refinement.input.xray_data.r_free_flags.generate=True" \
+               "refinement.input.xray_data.labels=${xray_data_labels}" \
                --overwrite
 
-
-#________________________________CHECK FOR REDUCE ERRORS______________________________
-if [ -f "reduce_failure.pdb" ]; then
-  echo "refinement.refine.strategy=*individual_sites *individual_adp *occupancies"  > ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.output.prefix=${pdb_name}"      >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.output.serial=5"                >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.main.number_of_macro_cycles=5"  >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.main.nqh_flips=False"           >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.refine.${adp}"                  >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.output.write_maps=False"        >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.hydrogens.refine=riding"        >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.main.ordered_solvent=True"      >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.target_weights.optimize_xyz_weight=true"  >> ${pdb_name}_final_refine_noreduce.params
-  echo "refinement.target_weights.optimize_adp_weight=true"  >> ${pdb_name}_final_refine_noreduce.params
-
-
-  phenix.refine "${pdb_name}_002.pdb" "${pdb_name}_002.mtz" "${pdb_name}_final_refine_noreduce.params" --overwrite
-fi
+redistribute_cull_low_occupancies -occ 0.09 "${pdb_name}_002.pdb"
+mv -v "${pdb_name}_002_norm.pdb" "${pdb_name}_002.pdb"
 
 #__________________________________NAME FINAL FILES__________________________________
 cp -v "${pdb_name}_002.pdb" "${pdb_name}_qFit.pdb"
@@ -193,8 +184,4 @@ fi
 if [ "${too_many_loops_flag}" = true ]; then
   echo "[qfit_final_refine_ligand] WARNING: Refinement and low-occupancy rotamer culling was taking too long (${i} rounds).";
   echo "                         Some low-occupancy rotamers may remain. Please inspect your structure.";
-fi
-
-if [ -f "reduce_failure.pdb" ]; then
-  echo "Refinement was run without checking for flips in NQH residues due to memory constraints. Please inspect your structure."
 fi
