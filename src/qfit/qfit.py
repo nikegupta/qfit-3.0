@@ -262,7 +262,7 @@ class _BaseQFit:
         # Subtract the density:
         self.xmap.array -= self._subtransformer.xmap.array
 
-    def _convert(self, stride=1, pool_size=1):  # default is to manipulate the maps
+    def _convert(self):  # default is to manipulate the maps
         """Convert structures to densities and extract relevant values for (MI)QP."""
         logger.info("Converting conformers to density")
         logger.debug("Masking")
@@ -276,35 +276,15 @@ class _BaseQFit:
         nvalues = mask.sum()
         self._target = self.xmap.array[mask]
 
-        # For a 1D array, we adjust our pooling approach
-        pooled_values = []
-        for i in range(0, len(self._target), stride):
-            # Extract the current window for pooling
-            current_window = self._target[i : i + pool_size]
-            # Perform max pooling on the current window and append the max value to pooled_values
-            if len(current_window) > 0:  # Ensure the window is not empty
-                pooled_values.append(np.max(current_window))
-
-        # Convert pooled_values back to a numpy array
-        self._target = np.array(pooled_values)
-
         logger.debug("Density")
         nmodels = len(self._coor_set)
-        maxpool_size = len(range(0, nvalues, stride))
-        self._models = np.zeros((nmodels, maxpool_size), float)
+        self._models = np.zeros((nmodels, nvalues), float)
         for n, coor in enumerate(self._coor_set):
             self.conformer.coor = coor
             self.conformer.b = self._bs[n]
             self._transformer.density()
             model = self._models[n]
-            # Apply maxpooling to the map similar to self._target
-            map_values = self._transformer.xmap.array[mask]
-            pooled_map_values = []
-            for i in range(0, len(map_values), stride):
-                current_window = map_values[i : i + pool_size]
-                if len(current_window) > 0:
-                    pooled_map_values.append(np.max(current_window))
-            model[:] = np.array(pooled_map_values)
+            model[:] = self._transformer.xmap.array[mask]
             np.maximum(model, self.options.bulk_solvent_level, out=model)
             self._transformer.reset(full=True)
 
@@ -782,8 +762,7 @@ class QFitRotamericResidue(_BaseQFit):
             self._sample_angle()
 
         if self.residue.nchi >= 1 and self.options.sample_rotamers:
-            self._sample_sidechain(version=0)
-            self._sample_sidechain(version=1)
+            self._sample_sidechain()
 
         # Check that there are no self-clashes within a conformer
         self.residue.active = True
@@ -1034,27 +1013,11 @@ class QFitRotamericResidue(_BaseQFit):
         opt = self.options
         start_chi_index = 1
 
-        if self.residue.resn[0] != "PRO":
-            if version == 0:
-                stride_ = 2
-                pool_size_ = 2
-                sampling_window = np.arange(
-                    -opt.rotamer_neighborhood,
-                    opt.rotamer_neighborhood,
-                    24,
-                )
-            else:
-                stride_ = 1
-                pool_size_ = 1
-                sampling_window = np.arange(
-                    -opt.rotamer_neighborhood,
-                    opt.rotamer_neighborhood + opt.dihedral_stepsize,
-                    opt.dihedral_stepsize,
-                )
-        else:
-            sampling_window = [0]
-            stride_ = 1
-            pool_size_ = 1
+        sampling_window = np.arange(
+            -opt.rotamer_neighborhood,
+            opt.rotamer_neighborhood + opt.dihedral_stepsize,
+            opt.dihedral_stepsize,
+        )
 
         rotamers = self.residue.rotamers
         rotamers.append(
@@ -1063,16 +1026,13 @@ class QFitRotamericResidue(_BaseQFit):
         iteration = 0
         while True:
             chis_to_sample = opt.dofs_per_iteration
-            if iteration == 0 and (opt.sample_backbone or opt.sample_angle):
+            if (opt.sample_backbone or opt.sample_angle):
                 chis_to_sample = max(1, opt.dofs_per_iteration - 1)
 
-            if version == 0:
+            if self.residue.nchi < 2:
                 end_chi_index = start_chi_index + 1
             else:
-                if self.residue.nchi < 2:
-                    end_chi_index = start_chi_index + 1
-                else:
-                    end_chi_index = self.residue.nchi + 1
+                end_chi_index = self.residue.nchi + 1
 
             iter_coor_set = []
             iter_b_set = []
