@@ -1,4 +1,4 @@
-name: qfit
+name: qfit_placer
 
 channels:
   - conda-forge
