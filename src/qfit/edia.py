@@ -437,7 +437,7 @@ class _BaseEDIA:
                 key = ""
                 EDIAm = (ediasum[key] / length[key]) ** (-0.5) - 0.1
                 OPIA = self.calc_opia_residue(residue, edia, "")
-                print("{0} A 1.0 {2:.2f} {3:.2f}".format(residue.resi[0], EDIAm, OPIA))
+                print("{0} A 1.0 {1:.2f} {2:.2f}".format(residue.resi[0], EDIAm, OPIA))
 
         return EDIAm, OPIA
 
@@ -568,7 +568,7 @@ def main():
                 residue = res
                 break
     # Prepare X-ray map
-    xmap = XMap.fromfile(args.xmap)
+    xmap = XMap.fromfile(args.xmap, resolution=args.resolution)
 
     options = ediaOptions()
     options.apply_command_args(args)

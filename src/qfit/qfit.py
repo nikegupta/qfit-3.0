@@ -761,6 +761,7 @@ class QFitRotamericResidue(_BaseQFit):
         )
 
     def run(self):
+        print(self.__dict__)
         start_time = timeit.default_timer()
         if self.options.sample_backbone:
             self._sample_backbone()
@@ -1806,7 +1807,7 @@ class QFitLigand(_BaseQFit):
 
         # Output file path (same directory, new name)
         output_file_path = os.path.join(
-            os.path.dirname(self.placer_ligs), # the ensemble sampled by PLACER includes binding pocket residue, but we only want to extract the ligand coordinates
+            os.path.dirname(self.options.placer_ligs), # the ensemble sampled by PLACER includes binding pocket residue, but we only want to extract the ligand coordinates
             'placer_ligs.pdb'
         )
 
@@ -1820,7 +1821,7 @@ class QFitLigand(_BaseQFit):
         target_resnum = int(resi)
 
         # Read the original PLACER ensemble and write out a new PDB of just the ligands
-        with open(self.placer_ligs, 'r') as infile, open(output_file_path, 'w') as outfile:
+        with open(self.options.placer_ligs, 'r') as infile, open(output_file_path, 'w') as outfile:
             for line in infile:
                 if line.startswith("ATOM"):
                     continue
