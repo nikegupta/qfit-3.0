@@ -195,30 +195,30 @@ class _BaseQFit(ABC):
         self._rmask = 1.5
         self._cd = lambda: NotImplemented
         reso = None
-        # if self.xmap.resolution.high is not None:
-        #     reso = self.xmap.resolution.high
-        # elif self.options.resolution is not None:
-        #     reso = self.options.resolution
+        if self.xmap.resolution.high is not None:
+            reso = self.xmap.resolution.high
+        elif self.options.resolution is not None:
+            reso = self.options.resolution
 
-        # if reso is not None:
-        #     self._smax = 1 / (2 * reso)
-        #     self._simple = False
-        #     self._rmask = 0.5 + reso / 3.0
+        if reso is not None:
+            self._smax = 1 / (2 * reso)
+            self._simple = False
+            self._rmask = 0.5 + reso / 3.0
 
-        # self._smin = None
-        # if self.xmap.resolution.low is not None:
-        #     self._smin = 1 / (2 * self.xmap.resolution.low)
-        # elif self.options.resolution_min is not None:
-        #     self._smin = 1 / (2 * self.options.resolution_min)
+        self._smin = None
+        if self.xmap.resolution.low is not None:
+            self._smin = 1 / (2 * self.xmap.resolution.low)
+        elif self.options.resolution_min is not None:
+            self._smin = 1 / (2 * self.options.resolution_min)
 
-        # self._xmap_model = self.xmap.zeros_like(self.xmap)
-        # self._xmap_model2 = self.xmap.zeros_like(self.xmap)
+        self._xmap_model = self.xmap.zeros_like(self.xmap)
+        self._xmap_model2 = self.xmap.zeros_like(self.xmap)
 
-        # # To speed up the density creation steps, reduce symmetry to P1
-        # self._xmap_model.set_space_group("P1")
-        # self._xmap_model2.set_space_group("P1")
-        # self._voxel_volume = self.xmap.unit_cell.calc_volume()
-        # self._voxel_volume /= self.xmap.array.size
+        # To speed up the density creation steps, reduce symmetry to P1
+        self._xmap_model.set_space_group("P1")
+        self._xmap_model2.set_space_group("P1")
+        self._voxel_volume = self.xmap.unit_cell.calc_volume()
+        self._voxel_volume /= self.xmap.array.size
 
     @property
     def directory_name(self):
@@ -244,6 +244,20 @@ class _BaseQFit(ABC):
             conformer = conformer.extract(
                 f"resi {self.conformer.resi[0]} and " f"chain {self.conformer.chain[0]}"
             )
+            conformer.q = q
+            conformer.coor = coor
+            conformer.b = b
+            conformers.append(conformer)
+        return conformers
+    
+    ##This is a copy of get_conformers except it doesnt extract the first residue, it does the whole thing
+    def get_whole_conformers(self):
+        if len(self._occupancies) < len(self._coor_set):
+            # Generate an array filled with 1.0 to match the length of the coordinate set
+            self._occupancies = [1.0] * len(self._coor_set)
+        conformers = []
+        for q, coor, b in zip(self._occupancies, self._coor_set, self._bs):
+            conformer = self.conformer.copy()
             conformer.q = q
             conformer.coor = coor
             conformer.b = b
@@ -707,7 +721,9 @@ class QFitBindingSite(_BaseQFit):
         self.protein_chains = self._make_protein_chains_key()
         self.residues_in_binding_site_pdb, self.residues_in_binding_site_cif = self._determine_bindingsite()
         self._match_res_identity()
-        self.base_binding_site = self._get_base_bindingsite()
+        self.conformer = self._get_base_bindingsite()
+        self._initialize_properties()
+        self._update_transformer(self.conformer)
 
     def _make_protein_chains_key(self):
         """This function makes a list of tuples that store which protein chains we will be building the binding site from.
@@ -865,18 +881,58 @@ class QFitBindingSite(_BaseQFit):
         self._getBindingSiteConformers()
         print(f'built binding site conformers in {time.time() - time0}')
 
+        ###Make sure new coords and b factors will run smoothly
+        assert len(self._bs) == len(self._coor_set)
+        for i in range(len(self._bs)):
+            assert self._bs[i].shape[0] == self._coor_set[i].shape[0]
+
+        #Run QP/MIQP
+        time0=time.time()
+        self._convert()
+        self._solve_qp()
+        self._update_conformers()
+        # self._save_intermediate(prefix="qp_solution")
+        print(f'solved qp in {time.time() - time0}')
+
+        time0=time.time()
+        self.sample_b()
+        self._convert()
+        self._solve_miqp(
+            threshold=self.options.threshold, cardinality=self.options.cardinality
+        )
+        self._update_conformers()
+        # self._save_intermediate(prefix="miqp_solution")
+        print(f'solved miqp in {time.time() - time0}')
+
+
+        #Make multiconf model
+        altloc = ""
+        for i, conformer in enumerate(self.get_whole_conformers()):
+            if i > 1:
+                altloc = ascii_uppercase[i]
+            conformer.altloc = altloc
+            fname = os.path.join(self.options.directory, f"conformer_{i}.pdb")
+            conformer.tofile(fname)
+            try:
+                multiconformer = multiconformer.combine(conformer)
+            except:
+                multiconformer = Structure.fromstructurelike(conformer.copy())
+
+        return multiconformer
+
     def _getBindingSiteConformers(self):
         """This function gets the coors of all conformers of the binding site for each of the placer models
         Since not all placer models contain all residues of the binding site, if a binding site
         residue is not present in the placer model, it takes it from the base model instead."""
         
-        np.set_printoptions(threshold=np.inf)
         placer_model = Structure.fromfile(self.options.placer_ligs)
         placer_models = placer_model.split_models()
 
         placer_coor_sets = []
+        placer_b_sets = []
         for model in placer_models:
-            placer_coor_set = np.full(self.base_binding_site.coor.shape, np.nan)
+            placer_coor_set = np.full(self.conformer.coor.shape, np.nan)
+            placer_b_set = np.full(self.conformer.b.shape, np.nan)
             index = 0
 
             for protein_chain in self.protein_chains:
@@ -898,14 +954,15 @@ class QFitBindingSite(_BaseQFit):
                             residue = model.extract(f'chain {cif_chain_id} and resid {res.resseq}')
                             for i in range(residue.coor.shape[0]):
                                 placer_coor_set[(index + i),:] = residue.coor[i,:]
+                                placer_b_set[(index + i)] = residue.b[i]
                             index += residue.coor.shape[0]
-                            index -= 1
 
                         #else get coords from base structure
                         else:
                             residue = self.structure.extract(f"chain {pdb_chain_id} and resid {self.residues_in_binding_site_pdb[pdb_chain_id][res_index]}")
                             for i in range(residue.coor.shape[0]):
                                 placer_coor_set[(index + i),:] = residue.coor[i,:]
+                                placer_b_set[(index + i)] = residue.b[i]
                             index += residue.coor.shape[0]
 
                 #else get coords from base structure
@@ -914,6 +971,7 @@ class QFitBindingSite(_BaseQFit):
                         residue = self.structure.extract(f"chain {pdb_chain_id} and resid {self.residues_in_binding_site_pdb[pdb_chain_id][res_index]}")
                         for i in range(residue.coor.shape[0]):
                             placer_coor_set[(index + i),:] = residue.coor[i,:]
+                            placer_b_set[(index + i)] = residue.b[i]
                         index += residue.coor.shape[0]
                         
 
@@ -921,13 +979,90 @@ class QFitBindingSite(_BaseQFit):
             ligand = model.extract(f"chain {self.options.target_chain} and resid {self.options.selection.split(',')[1]}")
             for i in range(ligand.coor.shape[0]):
                 placer_coor_set[(index + i),:] = ligand.coor[i,:]
+                placer_b_set[(index + i)] = ligand.b[i]
 
             #Check for nans in coor set
             nan_flag = np.isnan(placer_coor_set).any()
             if nan_flag:
                 raise ValueError('Something went wrong building the placer conformers. At least 1 conformer has nan for a coor value.')
-            print(nan_flag)
+
             placer_coor_sets.append(placer_coor_set)
+            placer_b_sets.append(placer_b_set)
+
+        self._bs = placer_b_sets
+        self._coor_set = placer_coor_sets
+
+    def getNotBindingSite(self):
+        """This function makes a structure object of all residues not in the binding site. This is to add back to the multiconformer 
+        at the end to build the entire multiconformer model."""
+
+        #since residues in binding site pdb only has the residues, we have to add the ligand to it. I do this in a seperate copy variable
+        #as to not mess with the stored value. 
+        binding_site_residues = self.residues_in_binding_site_pdb
+        ligand_chain = self.options.selection.split(',')[0]
+        ligand_res_num = int(self.options.selection.split(',')[1])
+
+        if ligand_chain not in binding_site_residues:
+            binding_site_residues.update({ligand_chain: []})
+        binding_site_residues[ligand_chain].append(ligand_res_num)
+
+        rest_of_model = None
+        for chain in self.structure._pdb_hierarchy.only_model().chains():
+            chain_id = chain.id.strip()
+
+            if chain_id not in binding_site_residues:
+                for res in chain.residue_groups():
+                    res_num = int(res.resseq)
+                    residue = self.structure.extract(f"chain {chain_id} and resid {res_num}")
+
+                    if rest_of_model is None:
+                        rest_of_model = residue
+                    else:
+                        rest_of_model = rest_of_model.combine(residue)
+
+            else:
+                for res in chain.residue_groups():
+                    res_num = int(res.resseq)
+
+                    if res_num not in binding_site_residues[chain_id]:
+                        residue = self.structure.extract(f"chain {chain_id} and resid {res_num}")
+                        if rest_of_model is None:
+                            rest_of_model = residue
+                        else:
+                            rest_of_model = rest_of_model.combine(residue)
+
+        return rest_of_model
+
+    def reorder(self, multiconformer):
+        """During my Frankensteining of residues from placer models and the base structure,
+        the residues go out of order. This function puts them back in correct alphanumeric order."""
+
+        residue_dict = {}
+        for chain in multiconformer._pdb_hierarchy.only_model().chains():
+            chain_id = chain.id.strip()
+
+            if chain_id not in residue_dict:
+                residue_dict.update({chain_id: []})
+
+            for res in chain.residue_groups():
+                res_num = res.resseq
+                if res_num not in residue_dict[chain_id]:
+                    residue_dict[chain_id].append(res_num)
+
+        chains = sorted(list(residue_dict.keys()))
+        for chain in chains:
+            residue_dict[chain] = sorted(residue_dict[chain])
+
+        new_multiconf = None
+        for chain in chains:
+            for res_num in residue_dict[chain]:
+                residue = multiconformer.extract(f"chain {chain} and resid {res_num}")
+                if new_multiconf is None:
+                    new_multiconf = residue
+                else:
+                    new_multiconf = new_multiconf.combine(residue)
+
+        return new_multiconf
 
 
 

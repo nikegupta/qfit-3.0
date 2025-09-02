@@ -65,7 +65,7 @@ def prepare_qfit_bindingsite(options):
     structure = structure.extract("name", "OXT", "!=").combine(rename)
 
     xmap = None
-    # xmap = load_and_scale_map(options, structure)
+    xmap = load_and_scale_map(options, structure)
 
     if options.qscore is not None:
         with open(
@@ -116,6 +116,14 @@ def main():
 
     # Run the QFitProtein job
     time0 = time.time()
-    qfit.run()
+    multiconformer = qfit.run()
     logger.info(f"Total time: {time.time() - time0}s")
+
+    #Build whole multiconformer to output to file ala qfit ligand
+    time0 = time.time()
+    rest_of_model = qfit.getNotBindingSite()
+    multiconformer_model = multiconformer.combine(rest_of_model)
+    multiconformer_model2 = qfit.reorder(multiconformer_model)
+    multiconformer_model2.tofile('multiconformer_model2.pdb')
+    print(f'Build multiconformer file in {time.time() - time0}')
     
