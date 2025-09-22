@@ -20,11 +20,6 @@ def build_argparser():
     p = get_base_argparser(__doc__,
                            default_enable_external_clash=True,
     )
-    p.add_argument(
-        "selection",
-        type=str,
-        help="Chain, residue id, and optionally insertion code for residue in structure, e.g. A,105, or A,105:A.",
-    )
     ##PLACER SPECIFIC ARGS
     p.add_argument(
         "-placer",
@@ -33,23 +28,12 @@ def build_argparser():
         help="Path to the PDB file for the imported PLACER sampled ligand ensemble."
     )
     p.add_argument(
-        "--target_chain",
-        "-targ_chain",
+        "--ligand",
+        "-lig",
         type=str,
-        help="Chain of the ligand in the imported PLACER sampled ligand ensemble",
+        help="Name of the ligand in the placer ensemble",
     )
-    p.add_argument(
-        "--cif_protein_chains",
-        type=str,
-        help="A hyphenated list of the protein chains and their start residues in the cif file used to make the placer ensemble." \
-        "Example: A1-B32 for a protein with protein chains A and B starting at indexes 1 and 32 respectively",
-    )
-    p.add_argument(
-        "--pdb_protein_chains",
-        type=str,
-        help="A hyphenated list of the protein chains and their start residues in the pdb file input." \
-        "Example: A1-B32 for a protein with protein chains A and B starting at indexes 1 and 32 respectively",
-    )
+
     return p
 
 def prepare_qfit_bindingsite(options):
@@ -117,13 +101,17 @@ def main():
     # Run the QFitProtein job
     time0 = time.time()
     multiconformer = qfit.run()
+    multiconformer.tofile('multiconformer.pdb')
     logger.info(f"Total time: {time.time() - time0}s")
 
     #Build whole multiconformer to output to file ala qfit ligand
     time0 = time.time()
     rest_of_model = qfit.getNotBindingSite()
     multiconformer_model = multiconformer.combine(rest_of_model)
+    multiconformer.tofile('multiconformer_model.pdb')
+    print(f'Built multiconformer file in {time.time() - time0}')
+    time0 =time.time()
     multiconformer_model2 = qfit.reorder(multiconformer_model)
+    print(f'Reorganized multiconformer in {time.time() - time0}')
     multiconformer_model2.tofile('multiconformer_model2.pdb')
-    print(f'Build multiconformer file in {time.time() - time0}')
     

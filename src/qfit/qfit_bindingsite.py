@@ -26,6 +26,7 @@ from .xtal.transformer import get_transformer
 
 from scipy.spatial.transform import Rotation as R
 from scipy.linalg import svd
+import iotbx.pdb
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +145,7 @@ class QFitOptions:
 
         ## Placer stuff
         self.placer_ligs = None
-        self.target_chain = None
-        self.cif_protein_chains = None
-        self.pdb_protein_chains = None
+        self.ligand = None
 
     def apply_command_args(self, args):
         for key, value in vars(args).items():
@@ -718,28 +717,58 @@ class _BaseQFit(ABC):
 class QFitBindingSite(_BaseQFit):
     def __init__(self, conformer, structure, xmap, options):
         super().__init__(conformer, structure, xmap, options)
-        self.protein_chains = self._make_protein_chains_key()
-        self.residues_in_binding_site_pdb, self.residues_in_binding_site_cif = self._determine_bindingsite()
-        self._match_res_identity()
+        self.auth2label, self.label2auth = self._build_key()
+        self.residues_in_binding_site = self._determine_bindingsite()
+        print(self.residues_in_binding_site)
         self.conformer = self._get_base_bindingsite()
+        time0 = time.time()
         self._initialize_properties()
         self._update_transformer(self.conformer)
+        print(f'rebuilt transformer in {time.time() - time0}')
 
-    def _make_protein_chains_key(self):
-        """This function makes a list of tuples that store which protein chains we will be building the binding site from.
-        It relies on the cif_protein_chains and pdb_protein_chains arguments. It is necessary to do this because keeping
-        track of how chain information is stored in the pdb structure and the placer model (which follows the cif file)
-        is a pain in the ass and idk how to do it automatically.
-        
-        Getting rid of the need to specify this is an area of potential improvement"""
+    def _build_key(self):
+        """Placer reads chain/res info from the label_asym dict but qfit structure read it form the auth_asym loop.
+        we need to make a dictionary to translate between the two."""
 
-        protein_chains = []
-        for i in range(len(self.options.pdb_protein_chains.split('-'))):
-            pdb_chain = self.options.pdb_protein_chains.split('-')[i]
-            cif_chain = self.options.cif_protein_chains.split('-')[i]
-            protein_chains.append((pdb_chain[0], int(pdb_chain[1:]), cif_chain[0], int(cif_chain[1:])))
+        #get cif block for the structure (copied from write_mmcif)
+        atoms = [atom.fetch_labels() for atom in self.structure.get_selected_atoms()]
+        atom_lines = []
+        for atom in atoms:
+            line = atom.format_atom_record_group()
+            if isinstance(line, list):
+                atom_lines.extend(line)
+            else:
+                atom_lines.append(line)
 
-        return protein_chains
+        pdb_in = iotbx.pdb.pdb_input(source_info="qfit_structure", lines=atom_lines)
+        hierarchy = pdb_in.construct_hierarchy()
+        cif_block = hierarchy.as_cif_block(crystal_symmetry=self.structure.crystal_symmetry)
+
+        atom_site = cif_block.get("_atom_site")
+        if atom_site is None:
+            raise ValueError("No _atom_site loop found in CIF block")
+
+        #build dictionary. if label_seq_id is not an integer, we take it from auth_asym_id (this is how placer outputs it)
+        auth_asym_ids = atom_site.get("_atom_site.auth_asym_id", [])
+        auth_seq_ids  = atom_site.get("_atom_site.auth_seq_id", [])
+        label_asym_ids = atom_site.get("_atom_site.label_asym_id", [])
+        label_seq_ids  = atom_site.get("_atom_site.label_seq_id", [])
+
+        auth2label = {}
+        label2auth = {}
+        for auth_asym, auth_seq, label_asym, label_seq in zip(
+            auth_asym_ids, auth_seq_ids, label_asym_ids, label_seq_ids
+        ):
+            auth_key = (auth_asym.strip(), int(auth_seq))
+            try:
+                label_val = (label_asym.strip(), int(label_seq))
+            except Exception:
+                label_val = (label_asym.strip(), int(auth_seq))
+
+            auth2label[auth_key] = label_val
+            label2auth[label_val] = auth_key
+
+        return auth2label, label2auth
 
     def _determine_bindingsite(self):
         """Determines where binding site is.
@@ -750,129 +779,60 @@ class QFitBindingSite(_BaseQFit):
         time0 = time.time()
         placer_model = Structure.fromfile(self.options.placer_ligs)
         placer_models = placer_model.split_models()
-        residues_in_binding_site_pdb = {}
-        residues_in_binding_site_cif = {}
+        residues_in_binding_site = {}
 
         for model in placer_models:
-            for protein_chain in self.protein_chains:
-                pdb_chain_id = protein_chain[0]
-                pdb_chain_start = protein_chain[1]
-                cif_chain_id = protein_chain[2]
-                cif_chain_start = protein_chain[3]
+            for chain in model._pdb_hierarchy.only_model().chains():
+                chain_id = chain.id.strip()
 
-                chain = [ch for ch in model._pdb_hierarchy.only_model().chains() if ch.id.strip() == cif_chain_id]
+                if chain_id not in residues_in_binding_site:
+                    residues_in_binding_site.update({chain_id: []})
 
-                ###sometimes chains may not be in in all placer models. This filters all cases where than chain does not appear in placer models
-                if len(chain) > 0:
-                    chain = chain[0]
-
-                    if pdb_chain_id not in residues_in_binding_site_pdb:
-                        residues_in_binding_site_pdb.update({pdb_chain_id: []})
-
-                    if cif_chain_id not in residues_in_binding_site_cif:
-                        residues_in_binding_site_cif.update({cif_chain_id: []})
-
-                    for residue in chain.residue_groups():
-                        res_num = int(residue.resseq)
-                        if res_num not in residues_in_binding_site_cif[cif_chain_id]:
-                            residues_in_binding_site_cif[cif_chain_id].append(res_num)
-
-                        res_num = res_num + pdb_chain_start - cif_chain_start
-                        if res_num not in residues_in_binding_site_pdb[pdb_chain_id]:
-                            residues_in_binding_site_pdb[pdb_chain_id].append(res_num)
+                for residue in chain.residue_groups():
+                    res_num = int(residue.resseq)
+                    if res_num not in residues_in_binding_site[chain_id]:
+                        residues_in_binding_site[chain_id].append(res_num)
 
         print(f'found binding pocket in {time.time() - time0} seconds')
 
-        return residues_in_binding_site_pdb, residues_in_binding_site_cif
-
-    def _match_res_identity(self):
-        """This function determines if the residue identity for all residues in the binding
-        site match between the placer model and the base structure. It doesnt do anything
-        but is a valuable check than translating between the cif and pdb is working well."""
-
-        placer_model = Structure.fromfile(self.options.placer_ligs)
-        placer_models = placer_model.split_models()
-
-        base_structure_res_identities = {}
-        placer_structure_res_identities = {}
-
-        #build placer model res dict
-        for model in placer_models:
-            for protein_chain in self.protein_chains:
-                cif_chain_id = protein_chain[2]
-                placer_chain = [ch for ch in model._pdb_hierarchy.only_model().chains() if ch.id.strip() == cif_chain_id]
-
-                if cif_chain_id not in placer_structure_res_identities:
-                    placer_structure_res_identities.update({cif_chain_id: []})
-
-                if len(placer_chain) > 0:
-                    placer_chain = placer_chain[0]
-
-                    for res_index in range(len(self.residues_in_binding_site_cif[cif_chain_id])):
-                        res = [res for res in placer_chain.residue_groups() if int(res.resseq) == self.residues_in_binding_site_cif[cif_chain_id][res_index]]
-
-                        if len(res) > 0:
-                            res = res[0]
-                            res_info = int(res.resseq), res.only_atom_group().resname.strip()
-                            if res_info not in placer_structure_res_identities[cif_chain_id]:
-                                placer_structure_res_identities[cif_chain_id].append(res_info)
-
-        for key in list(placer_structure_res_identities.keys()):
-            placer_structure_res_identities[key] = sorted(placer_structure_res_identities[key])
-
-        #build base structure res dict
-        for protein_chain in self.protein_chains:
-            pdb_chain_id = protein_chain[0]
-            base_chain = [ch for ch in self.structure._pdb_hierarchy.only_model().chains() if ch.id.strip() == pdb_chain_id][0]
-
-            if pdb_chain_id not in base_structure_res_identities:
-                base_structure_res_identities.update({pdb_chain_id: []})
-
-            for res_index in range(len(self.residues_in_binding_site_pdb[pdb_chain_id])):
-                res = [res for res in base_chain.residue_groups() if int(res.resseq) == self.residues_in_binding_site_pdb[pdb_chain_id][res_index]][0]
-                res_info = int(res.resseq), res.only_atom_group().resname.strip()
-                if res_info not in base_structure_res_identities[pdb_chain_id]:
-                    base_structure_res_identities[pdb_chain_id].append(res_info)
-
-        for key in list(base_structure_res_identities.keys()):
-            base_structure_res_identities[key] = sorted(base_structure_res_identities[key])
-
-        ###Now assert that the res identities are the same
-        for protein_chain in self.protein_chains:
-            pdb_chain_id = protein_chain[0]
-            cif_chain_id = protein_chain[2]
-            try:
-                assert len(placer_structure_res_identities[cif_chain_id]) == len(base_structure_res_identities[pdb_chain_id])
-            except AssertionError:
-                print(f'length of placer residue identity dictionary and base structure residue identity dictionary are different for chain {key}')
-
-            for i in range(len(placer_structure_res_identities[cif_chain_id])):
-                try:
-                    assert placer_structure_res_identities[cif_chain_id][i][1] == base_structure_res_identities[pdb_chain_id][i][1]
-                except AssertionError:
-                    print(f'Miss matching residue at placer chain {cif_chain_id} residue {placer_structure_res_identities[cif_chain_id][i][0]} and base structure chain {pdb_chain_id} and residue {base_structure_res_identities[cif_chain_id][i][0]}')
-                    print(f'Placer model gives {placer_structure_res_identities[cif_chain_id][i][1]} and base structure gives {base_structure_res_identities[pdb_chain_id][i][1]}')
+        return residues_in_binding_site
 
     def _get_base_bindingsite(self):
         """Makes a substructure corresponding to all residues in the binding site
         from residues in the base structure.
         """
 
+        time0 = time.time()
+        
+        heavy_atom_dict = {'GLY': 4, 'ALA': 5, 'VAL': 7, 'LEU': 8, 'ILE': 8,
+                           'PRO': 7, 'PHE': 11, 'MET': 8, 'CYS': 6, 'TRP': 14,
+                           'SER': 6, 'THR': 7, 'GLN': 9, 'ASN': 8, 'TYR': 12,
+                           'HIS': 10, 'LYS': 9, 'ARG': 11, 'ASP': 8, 'GLU': 9}
+        
         base_bindingsite = None
-        for protein_chain in self.protein_chains:
-            pdb_chain_id = protein_chain[0]
 
-            for res_num in self.residues_in_binding_site_pdb[pdb_chain_id]:
-                residue = self.structure.extract(f"chain {pdb_chain_id} and resid {res_num}")
+        for chain_id in list(self.residues_in_binding_site.keys()):
+            for res_num in self.residues_in_binding_site[chain_id]:
+                auth_chain = self.label2auth[(chain_id,res_num)][0]
+                auth_res_num = self.label2auth[(chain_id,res_num)][1]
+                residue = self.structure.extract(f"chain {auth_chain} and resid {auth_res_num}")
+                    
+                #getting residue identity is annoyingly long winded
+                base_chain = [ch for ch in self.structure._pdb_hierarchy.only_model().chains() if ch.id.strip() == auth_chain][0]
+                res = [res for res in base_chain.residue_groups() if int(res.resseq) == auth_res_num][0]
+                res_identity = res.only_atom_group().resname.strip()
+
+                ##This checks if the residue has all the atoms it should in the supplied cif
+                if res_identity in heavy_atom_dict:
+                    if residue.natoms != heavy_atom_dict[res_identity]:
+                        print(f'{res_identity} {auth_chain}{auth_res_num} only has {residue.natoms} instead of an expected {heavy_atom_dict[res_identity]} atoms')
 
                 if base_bindingsite is None:
                     base_bindingsite = residue
                 else:
                     base_bindingsite = base_bindingsite.combine(residue)
 
-        ####Add in the ligand
-        ligand = self.structure.extract(f"chain {self.options.selection.split(',')[0]} and resid {self.options.selection.split(',')[1]}")
-        base_bindingsite = base_bindingsite.combine(ligand)
+        print(f'Built base binding site in {time.time() - time0}')
 
         return base_bindingsite
 
@@ -885,13 +845,131 @@ class QFitBindingSite(_BaseQFit):
         assert len(self._bs) == len(self._coor_set)
         for i in range(len(self._bs)):
             assert self._bs[i].shape[0] == self._coor_set[i].shape[0]
+        
+        return self._naive_solution()
+        # return self._per_residue_solution()
+        # return self._volumetric_solution()
+
+    def _volumetric_solution(self):
+        """This function MIQPs the binding site split into two conformers: one composing regions with high variability across models and 
+        one composing regions with low variability across models"""
+
+        class QfitVolume(_BaseQFit):
+            def __init__(self, conformer, structure, xmap, options):
+                super().__init__(conformer, structure, xmap, options)
+                self._update_transformer(self.conformer)
+
+        time0 = time.time()
+        index = 0
+        model = self.conformer._pdb_hierarchy.only_model()
+        for chain in model.chains():
+            chain_id = chain.id.strip()
+
+            for res in chain.residue_groups():
+                residue = self.conformer.extract(f"chain {chain_id} and resid {res.resseq}")
+                residue_coor_set = []
+                residue_b_set = []
+
+                for coor_set in self._coor_set:
+                    residue_coor_set.append(coor_set[index:(index + len(residue.coor))])
+                for b_set in self._bs:
+                    residue_b_set.append(b_set[index:(index + len(residue.coor))])
+                index += len(residue.coor)
+
+                coor_cube = np.stack(residue_coor_set, axis=0)
+                stdev = np.std(coor_cube, axis=0)
+                print(stdev)
+                avg_stdev = np.mean(stdev)
+                print(avg_stdev)
+
+                
+
+
+        print(f"solved volumetric_solution in {time.time() - time0}")
+        return 0
+
+    def _per_residue_solution(self):
+        """This function MIQPs the residues of the binding site individually"""
+        class QfitResidue(_BaseQFit):
+            def __init__(self, residue, structure, xmap, options):
+                super().__init__(residue, structure, xmap, options)
+                self._update_transformer(self.conformer)
+
+        time0 = time.time()
+        multiconformer = None
+
+        index = 0
+        model = self.conformer._pdb_hierarchy.only_model()
+        for chain in model.chains():
+            chain_id = chain.id.strip()
+
+            for res in chain.residue_groups():
+                residue = self.conformer.extract(f"chain {chain_id} and resid {res.resseq}")
+                residue_coor_set = []
+                residue_b_set = []
+
+                for coor_set in self._coor_set:
+                    residue_coor_set.append(coor_set[index:(index + len(residue.coor))])
+                for b_set in self._bs:
+                    residue_b_set.append(b_set[index:(index + len(residue.coor))])
+                index += len(residue.coor)
+
+                qfit_residue = QfitResidue(residue, self.structure, self.xmap, self.options)
+                qfit_residue._coor_set = residue_coor_set
+                qfit_residue._bs = residue_b_set
+
+                #solve qp
+                qfit_residue._convert()
+                qfit_residue._solve_qp()
+                qfit_residue._update_conformers()
+
+                #solve miqp
+                qfit_residue.sample_b()
+                qfit_residue._convert()
+                qfit_residue._solve_miqp(
+                    threshold=self.options.threshold, cardinality=self.options.cardinality
+                )
+                qfit_residue._update_conformers()
+
+                residue_multiconformer = None
+                conformers = qfit_residue.get_whole_conformers()
+                print(f'number of conformers left for residue {res.resseq}: {len(conformers)}')
+                if len(conformers) > 1:
+                    for i, conformer in enumerate(conformers):
+                        conformer.altloc = ascii_uppercase[i]
+                        fname = os.path.join(self.options.directory, f"conformer_{i}.pdb")
+                        conformer.tofile(fname)
+                        try:
+                            residue_multiconformer = residue_multiconformer.combine(conformer)
+                        except:
+                            residue_multiconformer = Structure.fromstructurelike(conformer.copy())
+                else:
+                    conformer = conformers[0]
+                    conformer.altloc = ""
+                    fname = os.path.join(self.options.directory, f"conformer_0.pdb")
+                    conformer.tofile(fname)
+                    residue_multiconformer = Structure.fromstructurelike(conformer.copy())
+
+                try:
+                    multiconformer = multiconformer.combine(residue_multiconformer)
+                except:
+                    multiconformer = residue_multiconformer
+
+
+        print(f"solved per_residue_solution in {time.time() - time0}")
+        
+
+        return multiconformer
+
+    def _naive_solution(self):
+        """This functions MIQPs the entire binding site as a conformer."""
 
         #Run QP/MIQP
         time0=time.time()
         self._convert()
         self._solve_qp()
         self._update_conformers()
-        # self._save_intermediate(prefix="qp_solution")
+        self._save_intermediate(prefix="qp_solution")
         print(f'solved qp in {time.time() - time0}')
 
         time0=time.time()
@@ -901,22 +979,32 @@ class QFitBindingSite(_BaseQFit):
             threshold=self.options.threshold, cardinality=self.options.cardinality
         )
         self._update_conformers()
-        # self._save_intermediate(prefix="miqp_solution")
+        self._save_intermediate(prefix="miqp_solution")
         print(f'solved miqp in {time.time() - time0}')
 
 
+        print('number of conformers post miqp')
+        print(len(self._coor_set))
+        # if len(self._coor_set) > 26:
+        #     self._coor_set = self._coor_set[:26]
+
         #Make multiconf model
-        altloc = ""
-        for i, conformer in enumerate(self.get_whole_conformers()):
-            if i > 1:
-                altloc = ascii_uppercase[i]
-            conformer.altloc = altloc
-            fname = os.path.join(self.options.directory, f"conformer_{i}.pdb")
+        conformers = self.get_whole_conformers()
+        if len(conformers) > 1:
+            for i, conformer in enumerate(conformers):
+                conformer.altloc = ascii_uppercase[i]
+                fname = os.path.join(self.options.directory, f"conformer_{i}.pdb")
+                conformer.tofile(fname)
+                try:
+                    multiconformer = multiconformer.combine(conformer)
+                except:
+                    multiconformer = Structure.fromstructurelike(conformer.copy())
+        else:
+            conformer = conformers[0]
+            conformer.altloc = ""
+            fname = os.path.join(self.options.directory, f"conformer_0.pdb")
             conformer.tofile(fname)
-            try:
-                multiconformer = multiconformer.combine(conformer)
-            except:
-                multiconformer = Structure.fromstructurelike(conformer.copy())
+            multiconformer = Structure.fromstructurelike(conformer.copy())
 
         return multiconformer
 
@@ -924,7 +1012,7 @@ class QFitBindingSite(_BaseQFit):
         """This function gets the coors of all conformers of the binding site for each of the placer models
         Since not all placer models contain all residues of the binding site, if a binding site
         residue is not present in the placer model, it takes it from the base model instead."""
-        
+
         placer_model = Structure.fromfile(self.options.placer_ligs)
         placer_models = placer_model.split_models()
 
@@ -935,51 +1023,21 @@ class QFitBindingSite(_BaseQFit):
             placer_b_set = np.full(self.conformer.b.shape, np.nan)
             index = 0
 
-            for protein_chain in self.protein_chains:
-                pdb_chain_id = protein_chain[0]
-                cif_chain_id = protein_chain[2]
+            for chain_id in list(self.residues_in_binding_site.keys()):
+                for res_num in self.residues_in_binding_site[chain_id]:
+                    auth_chain = self.label2auth[(chain_id,res_num)][0]
+                    auth_res_num = self.label2auth[(chain_id,res_num)][1]
 
-                placer_chain = [ch for ch in model._pdb_hierarchy.only_model().chains() if ch.id.strip() == cif_chain_id]
+                    #get residue from placer model if possible, else get it from the base model
+                    residue = model.extract(f'chain {chain_id} and resid {res_num}')
+                    if residue.natoms == 0:
+                        residue = self.structure.extract(f'chain {auth_chain} and resid {auth_res_num}')
 
-                #if this chain exists in this placer model, build with some placer residues
-                if len(placer_chain) > 0:
-                    placer_chain = placer_chain[0]
+                    for i in range(residue.coor.shape[0]):
+                        placer_coor_set[(index + i),:] = residue.coor[i,:]
+                        placer_b_set[(index + i)] = residue.b[i]
+                    index += residue.coor.shape[0]
 
-                    for res_index in range(len(self.residues_in_binding_site_cif[cif_chain_id])):
-                        res = [res for res in placer_chain.residue_groups() if int(res.resseq) == self.residues_in_binding_site_cif[cif_chain_id][res_index]]
-
-                        #if this residue exists in this placer model, use it
-                        if len(res) > 0:
-                            res = res[0]
-                            residue = model.extract(f'chain {cif_chain_id} and resid {res.resseq}')
-                            for i in range(residue.coor.shape[0]):
-                                placer_coor_set[(index + i),:] = residue.coor[i,:]
-                                placer_b_set[(index + i)] = residue.b[i]
-                            index += residue.coor.shape[0]
-
-                        #else get coords from base structure
-                        else:
-                            residue = self.structure.extract(f"chain {pdb_chain_id} and resid {self.residues_in_binding_site_pdb[pdb_chain_id][res_index]}")
-                            for i in range(residue.coor.shape[0]):
-                                placer_coor_set[(index + i),:] = residue.coor[i,:]
-                                placer_b_set[(index + i)] = residue.b[i]
-                            index += residue.coor.shape[0]
-
-                #else get coords from base structure
-                else:
-                    for res_index in range(len(self.residues_in_binding_site_pdb[pdb_chain_id])):
-                        residue = self.structure.extract(f"chain {pdb_chain_id} and resid {self.residues_in_binding_site_pdb[pdb_chain_id][res_index]}")
-                        for i in range(residue.coor.shape[0]):
-                            placer_coor_set[(index + i),:] = residue.coor[i,:]
-                            placer_b_set[(index + i)] = residue.b[i]
-                        index += residue.coor.shape[0]
-                        
-
-            ###Add ligand from placer model
-            ligand = model.extract(f"chain {self.options.target_chain} and resid {self.options.selection.split(',')[1]}")
-            for i in range(ligand.coor.shape[0]):
-                placer_coor_set[(index + i),:] = ligand.coor[i,:]
-                placer_b_set[(index + i)] = ligand.b[i]
 
             #Check for nans in coor set
             nan_flag = np.isnan(placer_coor_set).any()
@@ -996,17 +1054,22 @@ class QFitBindingSite(_BaseQFit):
         """This function makes a structure object of all residues not in the binding site. This is to add back to the multiconformer 
         at the end to build the entire multiconformer model."""
 
-        #since residues in binding site pdb only has the residues, we have to add the ligand to it. I do this in a seperate copy variable
-        #as to not mess with the stored value. 
-        binding_site_residues = self.residues_in_binding_site_pdb
-        ligand_chain = self.options.selection.split(',')[0]
-        ligand_res_num = int(self.options.selection.split(',')[1])
+        ####convert self.residues_in_binding_site which is in terms of label to being in terms of auth
+        binding_site_residues = {}
+        for chain_id in list(self.residues_in_binding_site.keys()):
+                for res_num in self.residues_in_binding_site[chain_id]:
+                    auth_chain = self.label2auth[(chain_id,res_num)][0]
+                    auth_res_num = self.label2auth[(chain_id,res_num)][1]
 
-        if ligand_chain not in binding_site_residues:
-            binding_site_residues.update({ligand_chain: []})
-        binding_site_residues[ligand_chain].append(ligand_res_num)
+                    if auth_chain not in binding_site_residues:
+                        binding_site_residues.update({auth_chain: []})
+
+                    if auth_res_num not in binding_site_residues[auth_chain]:
+                        binding_site_residues[auth_chain].append(auth_res_num)
 
         rest_of_model = None
+
+
         for chain in self.structure._pdb_hierarchy.only_model().chains():
             chain_id = chain.id.strip()
 
