@@ -3,8 +3,8 @@ import numpy as np
 import time
 from pathlib import Path
 
-from qfit import XMap
 from qfit import Structure
+from qfit import XMap
 from qfit.xtal.transformer import get_transformer
 
 def build_argparser():
@@ -25,15 +25,33 @@ def build_argparser():
         type=float,
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
+    p.add_argument(
+        "-n",
+        "--num_peaks",
+        default=5,
+        metavar="<int>",
+        type=int,
+        help="Number of peaks to find (default: 5)",
+    )
+    p.add_argument(
+        "-z",
+        "--z_threshold",
+        default=5,
+        metavar="<float>",
+        type=float,
+        help="Z-score threshold for peak detection (default: 5)",
+    )
     return p
 
-class LigandFit():
-    def __init__(self, dataset, ligand_file, resolution):
+class LigandPlacer():
+    def __init__(self, dataset, ligand_file, resolution, num_peaks=5, z_threshold=5):
         # Read in args
         self.dataset = dataset
         self.dataset_name = str(dataset).split('/')[-1]
         self.ligand_file = ligand_file
         self.resolution = resolution
+        self.num_peaks = num_peaks
+        self.z_threshold = z_threshold
         
         # Load structures and maps
         self.apo_structure = Structure.fromfile(f'{self.dataset}/{self.dataset_name}-aligned-structure.pdb')
@@ -44,17 +62,8 @@ class LigandFit():
         )
         self._load_event_maps()
 
-        # FIX THE ORIGIN
-        # The Z-map's origin should be shifted by one unit cell in z
-        #For some reason the origin is not what the file reader says it is.
-        self.zmap.origin = np.array([0, 0, -self.zmap.unit_cell.c])
-
-        #Initialize a transformer for cartesian/grid conversions
-        self.transformer = get_transformer("qfit",self.apo_structure,self.zmap)
-
-        #Other params
-        self.z_threshold=5
-        self.num_peaks=5
+        # Initialize a transformer for cartesian/grid conversions
+        self.transformer = get_transformer("qfit", self.apo_structure, self.zmap)
 
     def _load_event_maps(self):
         self.event_maps = {}
@@ -64,14 +73,11 @@ class LigandFit():
             # Use full filename as key instead of just event name
             event_name = str(event_file).split('/')[-1]  # e.g., "x01325-1-event_1_1-BDC_0.3_map.native.ccp4"
             self.event_maps[event_name] = XMap.fromfile(str(event_file), resolution=self.resolution)
-            #shift origin by z
-            self.event_maps[event_name].origin = np.array([0, 0, -self.event_maps[event_name].unit_cell.c])
 
-            #make copies for density steps
+            # make copies for density steps
             event_map_model = self.event_maps[event_name].zeros_like(self.event_maps[event_name])
             event_map_model.set_space_group("P1")
             self.event_maps_models[event_name] = event_map_model
-
 
     def run(self):
         """Fits a ligand to event maps guided by the zmap."""
@@ -80,20 +86,20 @@ class LigandFit():
         
         best_ligand_score = 10
         merged_structure = self.apo_structure.copy()
-        for i, (grid_idx, z_score) in enumerate(self.peaks):
-
-            # Convert grid to Cartesian
-            peak_coord = self._grid_to_cartesian(grid_idx)
-            
-            # Get ligand center
-            ligand_center = self.ligand_structure.coor.mean(axis=0)
+        
+        # Get ligand center (calculate once)
+        ligand_center = self.ligand_structure.coor.mean(axis=0)
+        
+        for i, (grid_idx, z_score, best_peak_coord) in enumerate(self.peaks):
+            print(f"\n=== Peak {i} (z={z_score:.2f}) ===")
+            print(f"Placing ligand at: {best_peak_coord}")
             
             # Place ligand center on zmap peak
             self.placed_ligand = self.ligand_structure.copy()
-            translation = peak_coord - ligand_center
-            self.placed_ligand.coor = self.ligand_structure.coor + translation #ligands will have Bfactor of 20 by default, can change later if necessary
+            translation = best_peak_coord - ligand_center
+            self.placed_ligand.coor = self.ligand_structure.coor + translation
     
-            #Broad geometric sampling of ligand positions and
+            # Broad geometric sampling of ligand positions
             placed_ligand_coor_set, placed_ligand_b_set = self._geometric_sampling(self.placed_ligand)
             
             # Detect clashes
@@ -110,9 +116,9 @@ class LigandFit():
             print(f"Peak {i}: Using {len(placed_ligand_coor_set)} clash-free conformers")
             print(f"detected clashes in {time.time() - time0}")
             
-            #convert ligands to density and score them against event map
+            # convert ligands to density and score them against event map
             time0 = time.time()
-            self._convert(placed_ligand_coor_set,placed_ligand_b_set)
+            self._convert(placed_ligand_coor_set, placed_ligand_b_set)
             best_coor_set, ligand_score = self._score_models()
             self.placed_ligand.coor = placed_ligand_coor_set[best_coor_set]
             print(f'converted and scored conformers in {time.time() - time0}')
@@ -120,7 +126,7 @@ class LigandFit():
             # Write out all conformers for this peak
             self._write_conformers(placed_ligand_coor_set, peak_index=i)
 
-            #Check if this ligand is better than all previous ligands
+            # Check if this ligand is better than all previous ligands
             print(f'{i}, {ligand_score}, {best_coor_set}')
             if ligand_score < best_ligand_score:
                 best_ligand_score = ligand_score
@@ -137,6 +143,77 @@ class LigandFit():
         output_path = f'{self.dataset}/{self.dataset_name}-ligand_fit.pdb'
         merged_structure.tofile(output_path)
         print(f"Saved to {output_path}")
+        print(f"\nSaved {len(self.peaks)} ligands to {output_path}")
+
+    def _grid_to_cartesian(self, grid_idx):
+        """
+        Converts grid indices to cartesian coordinates
+        """
+        # Convert tuple to array
+        grid_coor = np.array(grid_idx, dtype=float)
+        grid_coor += self.transformer.xmap.offset
+        grid_coor *= self.transformer.xmap.voxelspacing
+        cartesian = np.dot(grid_coor, self.transformer.lattice_to_cartesian.T)
+        if not np.allclose(self.transformer.xmap.origin, 0):
+            cartesian += self.transformer.xmap.origin
+        
+        return cartesian
+
+    def _find_symmetry_mate_near_protein(self, peak_coord, protein_center):
+        """
+        Apply P212121 symmetry operations and unit cell translations to find 
+        the symmetry mate closest to the protein.
+        
+        Args:
+            peak_coord: Cartesian coordinates of the peak
+            protein_center: Center of the protein structure
+            
+        Returns:
+            best_coord: Cartesian coordinates of the symmetry mate closest to protein
+        """
+        # Convert peak to fractional coordinates
+        peak_frac = self.zmap.unit_cell.orth_to_frac @ peak_coord
+        
+        # P212121 symmetry operations in fractional coordinates
+        symops_frac = [
+            lambda xyz: xyz,  # x, y, z
+            lambda xyz: np.array([-xyz[0] + 0.5, -xyz[1], xyz[2] + 0.5]),  # -x+1/2, -y, z+1/2
+            lambda xyz: np.array([-xyz[0], xyz[1] + 0.5, -xyz[2] + 0.5]),  # -x, y+1/2, -z+1/2
+            lambda xyz: np.array([xyz[0] + 0.5, -xyz[1] + 0.5, -xyz[2]])   # x+1/2, -y+1/2, -z
+        ]
+        
+        # Generate all combinations of translations (-1, 0, 1) in x, y, z
+        translations = []
+        for x in [-1, 0, 1]:
+            for y in [-1, 0, 1]:
+                for z in [-1, 0, 1]:
+                    translations.append(np.array([x, y, z]))
+        
+        best_distance = float('inf')
+        best_coord = None
+        best_symop_idx = None
+        best_translation = None
+        
+        # Try all combinations of symmetry operations and translations
+        for symop_idx, symop in enumerate(symops_frac):
+            # Apply symmetry operation
+            sym_frac = symop(peak_frac)
+            
+            for translation in translations:
+                # Apply unit cell translation
+                translated_frac = sym_frac + translation
+                
+                # Convert to Cartesian
+                sym_cart = self.zmap.unit_cell.frac_to_orth @ translated_frac
+                
+                # Calculate distance to protein center
+                distance = np.linalg.norm(sym_cart - protein_center)
+                
+                if distance < best_distance:
+                    best_distance = distance
+                    best_coord = sym_cart
+        
+        return best_coord
 
     def _detect_clashes(self, coor_set, clash_cutoff=0.75):
         """
@@ -231,9 +308,9 @@ class LigandFit():
                 f.write("ENDMDL\n")
 
     def _geometric_sampling(self, placed_ligand, 
-                        num_polar_trans=6, num_azimuthal_trans=12,
-                        num_polar_rot=9, num_azimuthal_rot=18,
-                        translation_range=5, translation_step=0.5):
+                        num_polar_trans=3, num_azimuthal_trans=3,
+                        num_polar_rot=3, num_azimuthal_rot=3,
+                        translation_range=5, translation_step=1):
         """
         Generate conformers by translating and rotating the ligand using spherical coordinates.
         
@@ -381,14 +458,14 @@ class LigandFit():
         """Scores the best ligand conformer using MSE against the target density"""
         best_mse = 10
         best_model = np.nan
-        for i,model in enumerate(self._models):
+        for i, model in enumerate(self._models):
             mse = np.mean((model - self._target) ** 2)
             
             if mse < best_mse:
                 best_mse = mse
                 best_model = i
 
-        return best_model,best_mse
+        return best_model, best_mse
     
     def _convert(self, placed_ligand_coor_set, placed_ligand_b_set):
         """This function converts the ligand to density for comparison against an event map
@@ -429,100 +506,103 @@ class LigandFit():
             model[:] = map_values
             np.maximum(model, scaled_bulk_solvent, out=model)
 
-    def _grid_to_cartesian(self, grid_idx):
-        """
-        Converts grid indices to cartesian coordinates
-        This is the inverse of _coor_to_grid_coor from the transformer
-        """
-        # Convert tuple to array
-        grid_coor = np.array(grid_idx, dtype=float)
-        grid_coor += self.transformer.xmap.offset
-        grid_coor *= self.transformer.xmap.voxelspacing
-        cartesian = np.dot(grid_coor, self.transformer.lattice_to_cartesian.T)
-        if not np.allclose(self.transformer.xmap.origin, 0):
-            cartesian += self.transformer.xmap.origin
-        
-        return cartesian
-    
-    def _cartesian_to_grid(self, cartesian_idx):
-        """Convert from cartesian coords to grid indices. Copied from _coor_to_grid_coor"""
-        if np.allclose(self.transformer.xmap.origin, 0):
-            cartesian_idx = cartesian_idx
-        else:
-            cartesian_idx = cartesian_idx - self.transformer.xmap.origin
-        grid_coor = np.dot(cartesian_idx, self.transformer.cartesian_to_lattice.T)
-        grid_coor /= self.transformer.xmap.voxelspacing
-        grid_coor -= self.transformer.xmap.offset
-
-        return grid_coor
-        
     def _find_peaks(self):
-        """Finds the n highest peaks in the zmap, removing symmetry-related duplicates"""
+        """
+        Finds the n highest peaks in the zmap.
+        - Removes symmetry-related duplicates (same z-score)
+        - Only includes peaks within 10 Å of Met243 or Leu308 (chain A or B)
+        - Continues searching until n_peaks found or no peaks left above threshold
+        """
         from scipy.ndimage import maximum_filter
-
+        
         # Find all local maxima above a threshold
         local_max_mask = maximum_filter(self.zmap.array, size=3) == self.zmap.array
         above_threshold_mask = self.zmap.array > self.z_threshold
         peak_mask = local_max_mask & above_threshold_mask
-
-        # Filter and score local maxima
+        
+        # Get peak indices and values
         peak_indices = np.argwhere(peak_mask)  # Returns (z, y, x) for CCP4 maps
         peak_values = self.zmap.array[peak_mask]
+        
+        # Sort by peak value (highest first)
         sorted_idx = np.argsort(peak_values)[::-1]
         
-        # Get protein center for distance calculations
+        print(f"Found {len(sorted_idx)} total peaks above threshold {self.z_threshold}")
+        
+        # Get binding site reference atoms (Met243 and Leu308 CA atoms, chains A and B)
+        # Build selection string for iotbx
+        selection_strings = []
+        for chain_id in ['A', 'B']:
+            for resseq in [243, 308]:
+                selection_strings.append(f"(chain {chain_id} and resseq {resseq} and name CA)")
+        
+        # Combine with OR
+        full_selection_string = " or ".join(selection_strings)
+        
+        try:
+            binding_site_selection = self.apo_structure.select(full_selection_string)
+            binding_site_structure = self.apo_structure.extract(binding_site_selection)
+            binding_site_coords = binding_site_structure.coor
+        except Exception as e:
+            binding_site_coords = None
+        
+        # Get protein center for symmetry mate selection
         protein_center = self.apo_structure.coor.mean(axis=0)
         
-        # Group peaks by z-score and keep only closest to protein
-        unique_peaks = []
+        # Track unique z-scores to remove symmetry duplicates
         used_zscores = set()
+        unique_peaks = []
         
+        # Iterate through ALL peaks until we find n_peaks or run out
         for i in sorted_idx:
             z_score = peak_values[i]
             
             # Round z-score to avoid floating point comparison issues
             z_score_rounded = round(z_score, 3)
             
-            # If we've already processed this z-score, skip it
+            # Skip if we've already processed this z-score (symmetry duplicate)
             if z_score_rounded in used_zscores:
                 continue
             
-            # Find all peaks with this same z-score (symmetry mates)
-            same_zscore_indices = sorted_idx[np.isclose(peak_values[sorted_idx], z_score, atol=0.001)]
+            # Convert peak to Cartesian
+            z, y, x = peak_indices[i]
+            grid_xyz = (x, y, z)
+            peak_coord = self._grid_to_cartesian(grid_xyz)
             
-            # Convert all symmetry-related peaks to Cartesian and find closest to protein
-            min_distance = float('inf')
-            best_peak = None
+            # Find the symmetry mate closest to protein
+            best_peak_coord = self._find_symmetry_mate_near_protein(peak_coord, protein_center)
             
-            for idx in same_zscore_indices:
-                z, y, x = peak_indices[idx]
-                grid_xyz = (x, y, z)
+            # Check if peak is within 10 Å of binding site
+            if binding_site_coords is not None:
+                distances = np.linalg.norm(binding_site_coords - best_peak_coord, axis=1)
+                min_distance = distances.min()
                 
-                # Convert to Cartesian
-                peak_cart = self._grid_to_cartesian(grid_xyz)
-                
-                # Calculate distance to protein center
-                distance = np.linalg.norm(peak_cart - protein_center)
-                
-                if distance < min_distance:
-                    min_distance = distance
-                    best_peak = (grid_xyz, z_score)
+                if min_distance > 10.0:
+                    print(f"  Skipping peak (z={z_score:.2f}): {min_distance:.2f} Å from binding site (> 10 Å)")
+                    continue
+                else:
+                    print(f"  Peak accepted: (z={z_score:.2f}): {min_distance:.2f} Å from binding site")
             
-            unique_peaks.append(best_peak)
+            # Add to unique peaks (store grid_xyz, z_score, and best_peak_coord)
+            unique_peaks.append((grid_xyz, z_score, best_peak_coord))
             used_zscores.add(z_score_rounded)
             
-            # Stop when we have enough unique peaks
+            # Stop when we have enough unique peaks in the binding site
             if len(unique_peaks) >= self.num_peaks:
                 break
-
+        
+        if len(unique_peaks) < self.num_peaks:
+            print(f"Only found {len(unique_peaks)} peaks (requested {self.num_peaks})")
+        
         return unique_peaks
 
 
 def main():
     p = build_argparser()
     args = p.parse_args()
-    ligandfitter = LigandFit(args.dataset,args.ligand,args.resolution)
-    ligandfitter.run()
+    placer = LigandPlacer(args.dataset, args.ligand, args.resolution, 
+                          args.num_peaks, args.z_threshold)
+    placer.run()
 
 if __name__ == '__main__':
     main()
