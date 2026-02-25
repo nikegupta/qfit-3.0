@@ -14,6 +14,8 @@ from .residue import Residue, RotamerResidue, residue_type
 from .rotamers import ROTAMERS
 from qfit.utils.normalize_to_precision import normalize_to_precision
 
+import iotbx
+
 
 class Structure(BaseStructure):
     """Class with access to underlying PDB hierarchy."""

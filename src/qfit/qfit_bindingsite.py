@@ -398,6 +398,7 @@ class _BaseQFit(ABC):
 
         # Threshold selection by BIC:
         if do_BIC_selection:
+            print('banana')
             # Iteratively test decreasing values of the threshold parameter tdmin (threshold)
             # to determine if the better fit (RSS) justifies the use of a more complex model (k)
             miqp_solutions = []
@@ -717,6 +718,7 @@ class _BaseQFit(ABC):
 class QFitBindingSite(_BaseQFit):
     def __init__(self, conformer, structure, xmap, options):
         super().__init__(conformer, structure, xmap, options)
+        self.options.bic_threshold = False
         self.auth2label, self.label2auth = self._build_key()
         self.residues_in_binding_site = self._determine_bindingsite()
         print(self.residues_in_binding_site)
@@ -756,8 +758,12 @@ class QFitBindingSite(_BaseQFit):
 
         auth2label = {}
         label2auth = {}
-        for auth_asym, auth_seq, label_asym, label_seq in zip(
-            auth_asym_ids, auth_seq_ids, label_asym_ids, label_seq_ids
+
+        ####THIS IS A TERRIBLE SOLUTION TO A Problem. For some reason
+        #the cif file reader doesn't read my cif files in properly and reads in the label_seq from the wrong column
+        #Fortunately the auth and label seq ids are the same so I'm just putting the auth_seq_ids twice.
+        for auth_asym, auth_seq, label_asym, label_seq in zip( 
+            auth_asym_ids, auth_seq_ids, label_asym_ids, auth_seq_ids
         ):
             auth_key = (auth_asym.strip(), int(auth_seq))
             try:
@@ -846,47 +852,9 @@ class QFitBindingSite(_BaseQFit):
         for i in range(len(self._bs)):
             assert self._bs[i].shape[0] == self._coor_set[i].shape[0]
         
-        return self._naive_solution()
-        # return self._per_residue_solution()
+        # return self._naive_solution()
+        return self._per_residue_solution()
         # return self._volumetric_solution()
-
-    def _volumetric_solution(self):
-        """This function MIQPs the binding site split into two conformers: one composing regions with high variability across models and 
-        one composing regions with low variability across models"""
-
-        class QfitVolume(_BaseQFit):
-            def __init__(self, conformer, structure, xmap, options):
-                super().__init__(conformer, structure, xmap, options)
-                self._update_transformer(self.conformer)
-
-        time0 = time.time()
-        index = 0
-        model = self.conformer._pdb_hierarchy.only_model()
-        for chain in model.chains():
-            chain_id = chain.id.strip()
-
-            for res in chain.residue_groups():
-                residue = self.conformer.extract(f"chain {chain_id} and resid {res.resseq}")
-                residue_coor_set = []
-                residue_b_set = []
-
-                for coor_set in self._coor_set:
-                    residue_coor_set.append(coor_set[index:(index + len(residue.coor))])
-                for b_set in self._bs:
-                    residue_b_set.append(b_set[index:(index + len(residue.coor))])
-                index += len(residue.coor)
-
-                coor_cube = np.stack(residue_coor_set, axis=0)
-                stdev = np.std(coor_cube, axis=0)
-                print(stdev)
-                avg_stdev = np.mean(stdev)
-                print(avg_stdev)
-
-                
-
-
-        print(f"solved volumetric_solution in {time.time() - time0}")
-        return 0
 
     def _per_residue_solution(self):
         """This function MIQPs the residues of the binding site individually"""
