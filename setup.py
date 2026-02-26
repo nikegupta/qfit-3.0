@@ -68,7 +68,9 @@ def main():
                 "remove_duplicates = qfit.command_line.remove_duplicates:main",
                 "create_rotamer_library = qfit.command_line.create_rot_lib:main",
                 "calc_chi = qfit.command_line.calc_chi:main",
+                "prep_placer = qfit.command_line.prep_placer:main",
                 "fit_ligand = qfit.command_line.fit_ligand:main",
+                "phenix_ligandfit = qfit.command_line.phenix_ligandfit:main",
             ]
         },
         scripts=[
