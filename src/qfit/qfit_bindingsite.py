@@ -398,7 +398,6 @@ class _BaseQFit(ABC):
 
         # Threshold selection by BIC:
         if do_BIC_selection:
-            print('banana')
             # Iteratively test decreasing values of the threshold parameter tdmin (threshold)
             # to determine if the better fit (RSS) justifies the use of a more complex model (k)
             miqp_solutions = []
@@ -718,7 +717,6 @@ class _BaseQFit(ABC):
 class QFitBindingSite(_BaseQFit):
     def __init__(self, conformer, structure, xmap, options):
         super().__init__(conformer, structure, xmap, options)
-        self.options.bic_threshold = False
         self.auth2label, self.label2auth = self._build_key()
         self.residues_in_binding_site = self._determine_bindingsite()
         print(self.residues_in_binding_site)
@@ -863,6 +861,36 @@ class QFitBindingSite(_BaseQFit):
                 super().__init__(residue, structure, xmap, options)
                 self._update_transformer(self.conformer)
 
+            def _score_models(self, res):
+                """Scores the best residue conformer using MSE against the target density"""
+                best_mse = 10
+                best_model = np.nan
+
+                #write mses to file for ligand
+                if res.only_atom_group().resname.strip() == 'LIG':
+                    print(f'writing output file for {res.resseq}, {res.only_atom_group().resname.strip()}')
+                    with open('ligand_mses.txt','w+') as f:
+                        for i, model in enumerate(self._models):
+                            mse = np.mean((model - self._target) ** 2)
+                            
+                            f.write(str(mse) + '\n')
+                            if mse < best_mse:
+                                best_mse = mse
+                                best_model = i
+
+                        f.write('best model:' + str(best_model) + ', Mse: ' + str(best_mse))
+                        return best_model, best_mse
+
+                else:
+                    for i, model in enumerate(self._models):
+                        mse = np.mean((model - self._target) ** 2)
+                        
+                        if mse < best_mse:
+                            best_mse = mse
+                            best_model = i
+
+                    return best_model, best_mse
+
         time0 = time.time()
         multiconformer = None
 
@@ -885,23 +913,26 @@ class QFitBindingSite(_BaseQFit):
                 qfit_residue = QfitResidue(residue, self.structure, self.xmap, self.options)
                 qfit_residue._coor_set = residue_coor_set
                 qfit_residue._bs = residue_b_set
+                qfit_residue._convert()
+                best_coor_set, ligand_score = qfit_residue._score_models(res)
+                qfit_residue._coor_set = [qfit_residue._coor_set[best_coor_set]]
 
                 #solve qp
-                qfit_residue._convert()
-                qfit_residue._solve_qp()
-                qfit_residue._update_conformers()
+                # qfit_residue._convert()
+                # qfit_residue._solve_qp()
+                # qfit_residue._update_conformers()
 
-                #solve miqp
-                qfit_residue.sample_b()
-                qfit_residue._convert()
-                qfit_residue._solve_miqp(
-                    threshold=self.options.threshold, cardinality=self.options.cardinality
-                )
-                qfit_residue._update_conformers()
+                # #solve miqp
+                # qfit_residue.sample_b()
+                # qfit_residue._convert()
+                # qfit_residue._solve_miqp(
+                #     threshold=self.options.threshold, cardinality=self.options.cardinality
+                # )
+                # qfit_residue._update_conformers()
 
                 residue_multiconformer = None
                 conformers = qfit_residue.get_whole_conformers()
-                print(f'number of conformers left for residue {res.resseq}: {len(conformers)}')
+                print(f'Score for residue {res.resseq}: {ligand_score}')
                 if len(conformers) > 1:
                     for i, conformer in enumerate(conformers):
                         conformer.altloc = ascii_uppercase[i]
@@ -928,7 +959,7 @@ class QFitBindingSite(_BaseQFit):
         
 
         return multiconformer
-
+    
     def _naive_solution(self):
         """This functions MIQPs the entire binding site as a conformer."""
 
@@ -984,9 +1015,54 @@ class QFitBindingSite(_BaseQFit):
         placer_model = Structure.fromfile(self.options.placer_ligs)
         placer_models = placer_model.split_models()
 
+        ##The pdb reader will reorder ligand atoms by alphabetical order. We need to undo this and match them to the input structure
+        #Practically, since all we care about is extracting the PLACER coordinates in the right order, we don't need to alter the pdb_hierarchy
+        #We just need to change the order of the _atoms for each placer model.
+        #We also have to do it for each placer model
+
+        # Get reference ligand atom order from target hierarchy traversal
+        ref_lig_atom_names = []
+        for chain in self.structure._pdb_hierarchy.only_model().chains():
+            for res in chain.residue_groups():
+                if res.only_atom_group().resname.strip() == 'LIG':
+                    for atom_group in res.atom_groups():
+                        for atom in atom_group.atoms():
+                            ref_lig_atom_names.append(atom.name.strip())
+
         placer_coor_sets = []
         placer_b_sets = []
-        for model in placer_models:
+        for j,model in enumerate(placer_models):
+
+            # Split placer model atoms into non-ligand and ligand
+            non_lig_atoms = []
+            lig_atom_dict = {}
+            for atom in model._atoms:
+                if atom.parent().resname.strip() == 'LIG':
+                    lig_atom_dict[atom.name.strip()] = atom
+                else:
+                    non_lig_atoms.append(atom)
+
+            # Reorder ligand atoms to match reference
+            lig_atoms_reordered = [lig_atom_dict[name] for name in ref_lig_atom_names]
+
+            # Remove last n atoms (the ligand) and reappend in correct order
+            n_lig = len(ref_lig_atom_names)
+
+            # Split the atom array
+            protein_atoms = model._atoms[:-n_lig]  # all but last n
+            lig_atom_dict = {atom.name.strip(): atom for atom in model._atoms[-n_lig:]}
+            assert len(lig_atom_dict) == n_lig
+
+            # Reorder ligand atoms to match reference
+            lig_atoms_reordered = [lig_atom_dict[name] for name in ref_lig_atom_names]
+
+            # Rebuild _atoms array
+            reordered_lig = iotbx.pdb.hierarchy.af_shared_atom(lig_atoms_reordered)
+            new_atoms = protein_atoms.deep_copy()
+            new_atoms.extend(reordered_lig)
+            model._atoms = new_atoms
+
+            #initialize new coor_sets
             placer_coor_set = np.full(self.conformer.coor.shape, np.nan)
             placer_b_set = np.full(self.conformer.b.shape, np.nan)
             index = 0
@@ -1006,6 +1082,9 @@ class QFitBindingSite(_BaseQFit):
                         placer_b_set[(index + i)] = residue.b[i]
                     index += residue.coor.shape[0]
 
+                if chain_id == 'C' and j == 539:
+                    for atom in residue._atoms:
+                        print(atom.name.strip())
 
             #Check for nans in coor set
             nan_flag = np.isnan(placer_coor_set).any()
