@@ -41,10 +41,15 @@ def build_argparser():
         type=float,
         help="Z-score threshold for peak detection (default: 5)",
     )
+    p.add_argument(
+        "--sampling",
+        required=True,
+        help='geometric sampling parameters as an underscore seperated list (ie 3_3_3_3_5_0.5)'
+    )
     return p
 
 class LigandPlacer():
-    def __init__(self, dataset, ligand_file, resolution, num_peaks=5, z_threshold=5):
+    def __init__(self, dataset, ligand_file, resolution, geom_params, num_peaks=5, z_threshold=5):
         # Read in args
         self.dataset = dataset
         self.dataset_name = str(dataset).split('/')[-1]
@@ -52,6 +57,12 @@ class LigandPlacer():
         self.resolution = resolution
         self.num_peaks = num_peaks
         self.z_threshold = z_threshold
+        self.geom_params = geom_params
+        self._rmask = 0.5 + self.resolution / 3.0
+
+        #make output folder
+        self.output_dir = self.dataset / self.geom_params
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Load structures and maps
         self.apo_structure = Structure.fromfile(f'{self.dataset}/{self.dataset_name}-aligned-structure.pdb')
@@ -82,7 +93,8 @@ class LigandPlacer():
     def run(self):
         """Fits a ligand to event maps guided by the zmap."""
         self.peaks = self._find_peaks()
-        print(self.peaks)
+        self.centroid_peaks = self._find_event_centroid()
+        print(self.centroid_peaks)
         
         best_ligand_score = 10
         merged_structure = self.apo_structure.copy()
@@ -90,8 +102,8 @@ class LigandPlacer():
         # Get ligand center (calculate once)
         ligand_center = self.ligand_structure.coor.mean(axis=0)
         
-        for i, (grid_idx, z_score, best_peak_coord) in enumerate(self.peaks):
-            print(f"\n=== Peak {i} (z={z_score:.2f}) ===")
+        for i, (grid_idx, best_peak_coord) in enumerate(self.centroid_peaks):
+            print(f"\n=== Peak {i} ===")
             print(f"Placing ligand at: {best_peak_coord}")
             
             # Place ligand center on zmap peak
@@ -100,7 +112,7 @@ class LigandPlacer():
             self.placed_ligand.coor = self.ligand_structure.coor + translation
     
             # Broad geometric sampling of ligand positions
-            placed_ligand_coor_set, placed_ligand_b_set = self._geometric_sampling(self.placed_ligand)
+            placed_ligand_coor_set, placed_ligand_b_set = self._geometric_sampling(self.placed_ligand, self.geom_params)
             
             # Detect clashes
             time0 = time.time()
@@ -124,7 +136,8 @@ class LigandPlacer():
             print(f'converted and scored conformers in {time.time() - time0}')
 
             # Write out all conformers for this peak
-            self._write_conformers(placed_ligand_coor_set, peak_index=i)
+            #commented out because it creates massive files at high sampling rates
+            # self._write_conformers(placed_ligand_coor_set, peak_index=i)
 
             # Check if this ligand is better than all previous ligands
             print(f'{i}, {ligand_score}, {best_coor_set}')
@@ -140,7 +153,7 @@ class LigandPlacer():
         merged_structure = merged_structure.combine(best_ligand)
             
         # Save merged structure
-        output_path = f'{self.dataset}/{self.dataset_name}-ligand_fit.pdb'
+        output_path = f'{self.output_dir}/{self.dataset_name}-ligand_fit.pdb'
         merged_structure.tofile(output_path)
         print(f"Saved to {output_path}")
         print(f"\nSaved {len(self.peaks)} ligands to {output_path}")
@@ -275,7 +288,7 @@ class LigandPlacer():
             coor_set: 3D numpy array (N_conformers, N_atoms, 3)
             peak_index: Index of the peak being sampled
         """
-        output_path = f'{self.dataset}/{self.dataset_name}-peak_{peak_index}_conformers.pdb'
+        output_path = f'{self.output_dir}/{self.dataset_name}-peak_{peak_index}_conformers.pdb'
         
         num_conformers = coor_set.shape[0]
         
@@ -307,151 +320,245 @@ class LigandPlacer():
                 # Write ENDMDL record
                 f.write("ENDMDL\n")
 
-    def _geometric_sampling(self, placed_ligand, 
-                        num_polar_trans=3, num_azimuthal_trans=3,
-                        num_polar_rot=3, num_azimuthal_rot=3,
-                        translation_range=5, translation_step=1):
+    # def _geometric_sampling(self, placed_ligand, geom_params):
+    #     """
+    #     Generate conformers by translating and rotating the ligand using spherical coordinates.
+        
+    #     For each translation direction, apply all possible rotations.
+        
+    #     Args:
+    #         placed_ligand: Structure object with ligand already positioned at peak
+    #         geom params splits into:
+    #         num_polar_trans: Number of polar angle steps for translation (0 to 180 degrees)
+    #         num_azimuthal_trans: Number of azimuthal angle steps for translation (0 to 360 degrees)
+    #         num_polar_rot: Number of polar angle steps for rotation (0 to 180 degrees)
+    #         num_azimuthal_rot: Number of azimuthal angle steps for rotation (0 to 360 degrees)
+    #         translation_range: Max translation in Angstroms
+    #         translation_step: Translation increment in Angstroms
+        
+    #     Returns:
+    #         coor_set: 3D numpy array (N_conformers, N_atoms, 3)
+    #         b_set: 2D numpy array (N_conformers, N_atoms)
+    #     """
+    #     import scipy.spatial.transform as sptrans
+        
+    #     vals = geom_params.split('_')
+    #     num_polar_trans, num_azimuthal_trans, num_polar_rot, num_azimuthal_rot = [int(x) for x in vals[:4]]
+    #     translation_range, translation_step = float(vals[4]), float(vals[5])
+
+    #     # Get ligand center
+    #     ligand_center = placed_ligand.coor.mean(axis=0)
+        
+    #     # Generate translation distances
+    #     translations = np.arange(0, translation_range + translation_step, translation_step)
+        
+    #     # Calculate number of unique orientations (accounting for pole optimization)
+    #     num_trans_orientations = 2 + (num_polar_trans - 2) * num_azimuthal_trans
+    #     num_rot_orientations = 2 + (num_polar_rot - 2) * num_azimuthal_rot
+        
+    #     # Calculate max possible conformers (upper bound)
+    #     max_conformers = len(translations) * num_trans_orientations * num_rot_orientations
+    #     num_atoms = placed_ligand.coor.shape[0]
+        
+    #     # Pre-allocate arrays with upper bound
+    #     coor_set = np.zeros((max_conformers, num_atoms, 3), dtype=np.float64)
+    #     b_set = np.zeros((max_conformers, num_atoms), dtype=np.float64)
+        
+    #     # Sample polar angles for translation
+    #     polar_trans_step = 180.0 / (num_polar_trans - 1) if num_polar_trans > 1 else 180.0
+    #     azimuthal_trans_step = 360.0 / num_azimuthal_trans
+        
+    #     # Sample polar angles for rotation
+    #     polar_rot_step = 180.0 / (num_polar_rot - 1) if num_polar_rot > 1 else 180.0
+    #     azimuthal_rot_step = 360.0 / num_azimuthal_rot
+        
+    #     idx = 0
+        
+    #     # Loop over translation directions
+    #     for i_trans in range(num_polar_trans):
+    #         theta_trans = i_trans * polar_trans_step
+    #         theta_trans_rad = np.deg2rad(theta_trans)
+            
+    #         # At poles, only sample once for translation
+    #         if i_trans == 0 or i_trans == num_polar_trans - 1:
+    #             azimuthal_trans_samples = 1
+    #         else:
+    #             azimuthal_trans_samples = num_azimuthal_trans
+            
+    #         for j_trans in range(azimuthal_trans_samples):
+    #             phi_trans = j_trans * azimuthal_trans_step if azimuthal_trans_samples > 1 else 0
+    #             phi_trans_rad = np.deg2rad(phi_trans)
+                
+    #             # Translation direction vector
+    #             translation_direction = np.array([
+    #                 np.sin(theta_trans_rad) * np.cos(phi_trans_rad),
+    #                 np.sin(theta_trans_rad) * np.sin(phi_trans_rad),
+    #                 np.cos(theta_trans_rad)
+    #             ])
+                
+    #             # Apply each translation distance along this direction
+    #             for distance in translations:
+    #                 # Skip redundant translation directions when distance is 0
+    #                 if distance == 0 and not (i_trans == 0 and j_trans == 0):
+    #                     continue
+                    
+    #                 translation_vector = translation_direction * distance
+    #                 translated_coor = placed_ligand.coor + translation_vector
+                    
+    #                 # Now rotate the translated ligand in all orientations
+    #                 for i_rot in range(num_polar_rot):
+    #                     theta_rot = i_rot * polar_rot_step
+    #                     theta_rot_rad = np.deg2rad(theta_rot)
+                        
+    #                     # At poles, only sample once for rotation
+    #                     if i_rot == 0 or i_rot == num_polar_rot - 1:
+    #                         azimuthal_rot_samples = 1
+    #                     else:
+    #                         azimuthal_rot_samples = num_azimuthal_rot
+                        
+    #                     for j_rot in range(azimuthal_rot_samples):
+    #                         phi_rot = j_rot * azimuthal_rot_step if azimuthal_rot_samples > 1 else 0
+    #                         phi_rot_rad = np.deg2rad(phi_rot)
+                            
+    #                         # Rotation direction vector
+    #                         rotation_direction = np.array([
+    #                             np.sin(theta_rot_rad) * np.cos(phi_rot_rad),
+    #                             np.sin(theta_rot_rad) * np.sin(phi_rot_rad),
+    #                             np.cos(theta_rot_rad)
+    #                         ])
+                            
+    #                         # Create rotation matrix to align Z-axis with rotation direction
+    #                         z_axis = np.array([0, 0, 1])
+                            
+    #                         if not np.allclose(rotation_direction, z_axis) and not np.allclose(rotation_direction, -z_axis):
+    #                             rotation_axis = np.cross(z_axis, rotation_direction)
+    #                             rotation_axis_norm = np.linalg.norm(rotation_axis)
+                                
+    #                             if rotation_axis_norm > 1e-6:
+    #                                 rotation_axis = rotation_axis / rotation_axis_norm
+    #                                 rotation_angle = np.arccos(np.clip(np.dot(z_axis, rotation_direction), -1.0, 1.0))
+    #                                 rotation = sptrans.Rotation.from_rotvec(rotation_axis * rotation_angle)
+    #                                 rotation_matrix = rotation.as_matrix()
+    #                             else:
+    #                                 rotation_matrix = np.eye(3)
+    #                         elif np.allclose(rotation_direction, -z_axis):
+    #                             rotation_matrix = np.array([
+    #                                 [1, 0, 0],
+    #                                 [0, -1, 0],
+    #                                 [0, 0, -1]
+    #                             ])
+    #                         else:
+    #                             rotation_matrix = np.eye(3)
+                            
+    #                         # Center the translated coordinates
+    #                         translated_center = translated_coor.mean(axis=0)
+    #                         centered_coor = translated_coor - translated_center
+                            
+    #                         # Rotate around the new center
+    #                         rotated_coor = centered_coor @ rotation_matrix.T
+    #                         rotated_coor += translated_center
+                            
+    #                         # Store the final coordinates
+    #                         coor_set[idx] = rotated_coor
+    #                         b_set[idx] = placed_ligand.b
+    #                         idx += 1
+        
+    #     print(f"Generated {idx} conformers "
+    #         f"({len(translations)} translations × {num_trans_orientations} translation directions × {num_rot_orientations} rotations)")
+        
+    #     # Trim to actual size and return
+    #     return coor_set[:idx].copy(), b_set[:idx].copy()
+
+    def _geometric_sampling(self, placed_ligand, geom_params): #new version within translation
         """
-        Generate conformers by translating and rotating the ligand using spherical coordinates.
-        
-        For each translation direction, apply all possible rotations.
-        
+        Generate conformers by rotating the ligand using spherical coordinates.
+
         Args:
             placed_ligand: Structure object with ligand already positioned at peak
-            num_polar_trans: Number of polar angle steps for translation (0 to 180 degrees)
-            num_azimuthal_trans: Number of azimuthal angle steps for translation (0 to 360 degrees)
+            geom_params splits into:
             num_polar_rot: Number of polar angle steps for rotation (0 to 180 degrees)
             num_azimuthal_rot: Number of azimuthal angle steps for rotation (0 to 360 degrees)
-            translation_range: Max translation in Angstroms
-            translation_step: Translation increment in Angstroms
-        
+
         Returns:
             coor_set: 3D numpy array (N_conformers, N_atoms, 3)
             b_set: 2D numpy array (N_conformers, N_atoms)
         """
         import scipy.spatial.transform as sptrans
-        
-        # Get ligand center
-        ligand_center = placed_ligand.coor.mean(axis=0)
-        
-        # Generate translation distances
-        translations = np.arange(0, translation_range + translation_step, translation_step)
-        
+
+        vals = geom_params.split('_')
+        num_polar_rot, num_azimuthal_rot = int(vals[0]), int(vals[1])
+
         # Calculate number of unique orientations (accounting for pole optimization)
-        num_trans_orientations = 2 + (num_polar_trans - 2) * num_azimuthal_trans
         num_rot_orientations = 2 + (num_polar_rot - 2) * num_azimuthal_rot
-        
-        # Calculate max possible conformers (upper bound)
-        max_conformers = len(translations) * num_trans_orientations * num_rot_orientations
+
         num_atoms = placed_ligand.coor.shape[0]
-        
-        # Pre-allocate arrays with upper bound
-        coor_set = np.zeros((max_conformers, num_atoms, 3), dtype=np.float64)
-        b_set = np.zeros((max_conformers, num_atoms), dtype=np.float64)
-        
-        # Sample polar angles for translation
-        polar_trans_step = 180.0 / (num_polar_trans - 1) if num_polar_trans > 1 else 180.0
-        azimuthal_trans_step = 360.0 / num_azimuthal_trans
-        
+
+        # Pre-allocate arrays
+        coor_set = np.zeros((num_rot_orientations, num_atoms, 3), dtype=np.float64)
+        b_set = np.zeros((num_rot_orientations, num_atoms), dtype=np.float64)
+
         # Sample polar angles for rotation
         polar_rot_step = 180.0 / (num_polar_rot - 1) if num_polar_rot > 1 else 180.0
         azimuthal_rot_step = 360.0 / num_azimuthal_rot
-        
+
         idx = 0
-        
-        # Loop over translation directions
-        for i_trans in range(num_polar_trans):
-            theta_trans = i_trans * polar_trans_step
-            theta_trans_rad = np.deg2rad(theta_trans)
-            
-            # At poles, only sample once for translation
-            if i_trans == 0 or i_trans == num_polar_trans - 1:
-                azimuthal_trans_samples = 1
+
+        for i_rot in range(num_polar_rot):
+            theta_rot = i_rot * polar_rot_step
+            theta_rot_rad = np.deg2rad(theta_rot)
+
+            # At poles, only sample once for rotation
+            if i_rot == 0 or i_rot == num_polar_rot - 1:
+                azimuthal_rot_samples = 1
             else:
-                azimuthal_trans_samples = num_azimuthal_trans
-            
-            for j_trans in range(azimuthal_trans_samples):
-                phi_trans = j_trans * azimuthal_trans_step if azimuthal_trans_samples > 1 else 0
-                phi_trans_rad = np.deg2rad(phi_trans)
-                
-                # Translation direction vector
-                translation_direction = np.array([
-                    np.sin(theta_trans_rad) * np.cos(phi_trans_rad),
-                    np.sin(theta_trans_rad) * np.sin(phi_trans_rad),
-                    np.cos(theta_trans_rad)
+                azimuthal_rot_samples = num_azimuthal_rot
+
+            for j_rot in range(azimuthal_rot_samples):
+                phi_rot = j_rot * azimuthal_rot_step if azimuthal_rot_samples > 1 else 0
+                phi_rot_rad = np.deg2rad(phi_rot)
+
+                # Rotation direction vector
+                rotation_direction = np.array([
+                    np.sin(theta_rot_rad) * np.cos(phi_rot_rad),
+                    np.sin(theta_rot_rad) * np.sin(phi_rot_rad),
+                    np.cos(theta_rot_rad)
                 ])
-                
-                # Apply each translation distance along this direction
-                for distance in translations:
-                    # Skip redundant translation directions when distance is 0
-                    if distance == 0 and not (i_trans == 0 and j_trans == 0):
-                        continue
-                    
-                    translation_vector = translation_direction * distance
-                    translated_coor = placed_ligand.coor + translation_vector
-                    
-                    # Now rotate the translated ligand in all orientations
-                    for i_rot in range(num_polar_rot):
-                        theta_rot = i_rot * polar_rot_step
-                        theta_rot_rad = np.deg2rad(theta_rot)
-                        
-                        # At poles, only sample once for rotation
-                        if i_rot == 0 or i_rot == num_polar_rot - 1:
-                            azimuthal_rot_samples = 1
-                        else:
-                            azimuthal_rot_samples = num_azimuthal_rot
-                        
-                        for j_rot in range(azimuthal_rot_samples):
-                            phi_rot = j_rot * azimuthal_rot_step if azimuthal_rot_samples > 1 else 0
-                            phi_rot_rad = np.deg2rad(phi_rot)
-                            
-                            # Rotation direction vector
-                            rotation_direction = np.array([
-                                np.sin(theta_rot_rad) * np.cos(phi_rot_rad),
-                                np.sin(theta_rot_rad) * np.sin(phi_rot_rad),
-                                np.cos(theta_rot_rad)
-                            ])
-                            
-                            # Create rotation matrix to align Z-axis with rotation direction
-                            z_axis = np.array([0, 0, 1])
-                            
-                            if not np.allclose(rotation_direction, z_axis) and not np.allclose(rotation_direction, -z_axis):
-                                rotation_axis = np.cross(z_axis, rotation_direction)
-                                rotation_axis_norm = np.linalg.norm(rotation_axis)
-                                
-                                if rotation_axis_norm > 1e-6:
-                                    rotation_axis = rotation_axis / rotation_axis_norm
-                                    rotation_angle = np.arccos(np.clip(np.dot(z_axis, rotation_direction), -1.0, 1.0))
-                                    rotation = sptrans.Rotation.from_rotvec(rotation_axis * rotation_angle)
-                                    rotation_matrix = rotation.as_matrix()
-                                else:
-                                    rotation_matrix = np.eye(3)
-                            elif np.allclose(rotation_direction, -z_axis):
-                                rotation_matrix = np.array([
-                                    [1, 0, 0],
-                                    [0, -1, 0],
-                                    [0, 0, -1]
-                                ])
-                            else:
-                                rotation_matrix = np.eye(3)
-                            
-                            # Center the translated coordinates
-                            translated_center = translated_coor.mean(axis=0)
-                            centered_coor = translated_coor - translated_center
-                            
-                            # Rotate around the new center
-                            rotated_coor = centered_coor @ rotation_matrix.T
-                            rotated_coor += translated_center
-                            
-                            # Store the final coordinates
-                            coor_set[idx] = rotated_coor
-                            b_set[idx] = placed_ligand.b
-                            idx += 1
-        
-        print(f"Generated {idx} conformers "
-            f"({len(translations)} translations × {num_trans_orientations} translation directions × {num_rot_orientations} rotations)")
-        
-        # Trim to actual size and return
+
+                # Create rotation matrix to align Z-axis with rotation direction
+                z_axis = np.array([0, 0, 1])
+
+                if not np.allclose(rotation_direction, z_axis) and not np.allclose(rotation_direction, -z_axis):
+                    rotation_axis = np.cross(z_axis, rotation_direction)
+                    rotation_axis_norm = np.linalg.norm(rotation_axis)
+
+                    if rotation_axis_norm > 1e-6:
+                        rotation_axis = rotation_axis / rotation_axis_norm
+                        rotation_angle = np.arccos(np.clip(np.dot(z_axis, rotation_direction), -1.0, 1.0))
+                        rotation = sptrans.Rotation.from_rotvec(rotation_axis * rotation_angle)
+                        rotation_matrix = rotation.as_matrix()
+                    else:
+                        rotation_matrix = np.eye(3)
+                elif np.allclose(rotation_direction, -z_axis):
+                    rotation_matrix = np.array([
+                        [1, 0, 0],
+                        [0, -1, 0],
+                        [0, 0, -1]
+                    ])
+                else:
+                    rotation_matrix = np.eye(3)
+
+                # Center, rotate, and restore coordinates
+                ligand_center = placed_ligand.coor.mean(axis=0)
+                centered_coor = placed_ligand.coor - ligand_center
+                rotated_coor = centered_coor @ rotation_matrix.T
+                rotated_coor += ligand_center
+
+                coor_set[idx] = rotated_coor
+                b_set[idx] = placed_ligand.b
+                idx += 1
+
+        print(f"Generated {idx} conformers ({num_rot_orientations} rotations)")
+
         return coor_set[:idx].copy(), b_set[:idx].copy()
 
     def _score_models(self):
@@ -490,7 +597,7 @@ class LigandPlacer():
                                                 self.event_maps_models[first_event_map_name])
         
         # Get ligand mask
-        mask = self.ligand_transformer.get_conformers_mask(placed_ligand_coor_set, rmax=1)  # default rmask is 1
+        mask = self.ligand_transformer.get_conformers_mask(placed_ligand_coor_set, self._rmask) 
         nvalues = mask.sum()
 
         # Get target
@@ -505,6 +612,58 @@ class LigandPlacer():
             map_values = density[mask]
             model[:] = map_values
             np.maximum(model, scaled_bulk_solvent, out=model)
+
+    def _find_event_centroid(self):
+        event_map = self.event_maps[list(self.event_maps.keys())[0]]
+        centroid_peaks = []
+        protein_center = self.apo_structure.coor.mean(axis=0)
+        protein_mask = self.transformer.get_conformers_mask([self.apo_structure.coor],self._rmask)
+
+        for peak in self.peaks:
+            peak_coords = peak[0][::-1]  # xyz -> zyx for numpy indexing
+
+            # Flood-fill to find all connected voxels above average density
+            # seeded from the peak coordinate
+            visited = set()
+            queue = [tuple(peak_coords)]
+
+            while queue:
+                current = queue.pop()
+                if current in visited:
+                    continue
+                z, y, x = current
+
+                # Bounds check
+                if not (0 <= z < event_map.array.shape[0] and
+                        0 <= y < event_map.array.shape[1] and
+                        0 <= x < event_map.array.shape[2]):
+                    continue
+                # Threshold check
+
+                if event_map.array[z, y, x] < 0.5 or protein_mask[z, y, x] == True:
+                    continue
+                visited.add(current)
+
+                # Add 6-connected neighbours
+                for dz, dy, dx in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]:
+                    neighbour = (z + dz, y + dy, x + dx)
+                    if neighbour not in visited:
+                        queue.append(neighbour)
+
+            if not visited:
+                continue
+
+            # Centroid as simple mean of zyx coords, returned as xyz
+            coords_array = np.array(list(visited))  # shape (N, 3), columns are z, y, x
+            centroid_zyx = coords_array.mean(axis=0)
+            centroid_xyz = centroid_zyx[::-1]
+
+            centroid_cartesian = self._grid_to_cartesian(centroid_xyz)
+            best_centroid_cartesian = self._find_symmetry_mate_near_protein(centroid_cartesian, protein_center)
+            centroid_peaks.append((centroid_xyz,best_centroid_cartesian))
+
+        return centroid_peaks
+
 
     def _find_peaks(self):
         """
@@ -601,7 +760,7 @@ def main():
     p = build_argparser()
     args = p.parse_args()
     placer = LigandPlacer(args.dataset, args.ligand, args.resolution, 
-                          args.num_peaks, args.z_threshold)
+                          args.sampling, args.num_peaks, args.z_threshold)
     placer.run()
 
 if __name__ == '__main__':
