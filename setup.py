@@ -71,6 +71,7 @@ def main():
                 "prep_placer = qfit.command_line.prep_placer:main",
                 "fit_ligand = qfit.command_line.fit_ligand:main",
                 "phenix_ligandfit = qfit.command_line.phenix_ligandfit:main",
+                "filter = qfit.command_line.filter:main",
             ]
         },
         scripts=[
