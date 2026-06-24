@@ -72,6 +72,7 @@ def main():
                 "fit_ligand = qfit.command_line.fit_ligand:main",
                 "phenix_ligandfit = qfit.command_line.phenix_ligandfit:main",
                 "filter = qfit.command_line.filter:main",
+                "rotamer_optimize = qfit.command_line.rotamer_optimize:main"
             ]
         },
         scripts=[
