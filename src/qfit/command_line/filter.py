@@ -42,10 +42,18 @@ def build_argparser():
         type=float,
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
+    p.add_argument(
+        "-n",
+        "--filter_number",
+        default=100,
+        metavar="<float>",
+        type=int,
+        help="number of residues to filter down to",
+    )
     return p
 
 class Filter():
-    def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder, resolution):
+    def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder, resolution, filter_number):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.fit_ligand_files = fit_ligand_files
@@ -53,7 +61,7 @@ class Filter():
         self.resolution = resolution
 
         self._rmask = 0.5 + self.resolution / 3.0 #from qfit
-        self.n = 10 #number of models to filter down to
+        self.n = filter_number #number of models to filter down to
         self._load_event_maps()
 
         # print(self.__dict__)
@@ -105,7 +113,7 @@ class Filter():
             # self.all_scores.update({placer_file: self._convertAndScoreLigandAllEvents(placer_file)})
 
                                   
-
+        print(self.scores)
         #get top N
         top_n = heapq.nsmallest(self.n,((val, key, idx) for key, lst in self.scores.items() for idx, val in enumerate(lst)))
         
@@ -387,7 +395,7 @@ def main():
         fit_ligand_files.append(file)
     fit_ligand_files.sort()
 
-    filter = Filter(args.dataset, placer_files, fit_ligand_files, args.output_folder, args.resolution)
+    filter = Filter(args.dataset, placer_files, fit_ligand_files, args.output_folder, args.resolution, args.filter_number)
     filter.run()
 
 

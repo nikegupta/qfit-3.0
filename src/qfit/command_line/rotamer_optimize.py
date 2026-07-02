@@ -47,7 +47,7 @@ def _get_coordinate_rmsd(reference_coordinates, new_coordinate_set, atom_names=N
     
     return min(rmsds)
 
-DEFAULT_RMSD_CUTOFF = 0.3
+DEFAULT_RMSD_CUTOFF = 0.2
 
 def build_argparser():
     p = argparse.ArgumentParser()
@@ -92,7 +92,7 @@ class QFitOptions: #copypasted from qfit.py
         self.clash_scaling_factor = 0.75
         self.external_clash = False
         self.dofs_per_iteration = 1
-        self.dihedral_stepsize = 24
+        self.dihedral_stepsize = 6
         self.hydro = False
         self.rmsd_cutoff = DEFAULT_RMSD_CUTOFF
 
@@ -109,12 +109,12 @@ class QFitOptions: #copypasted from qfit.py
 
         # N-CA-CB angle sampling
         self.sample_angle = True
-        self.sample_angle_range = 7.5
+        self.sample_angle_range = 90
         self.sample_angle_step = 3.75
 
         # Rotamer sampling
         self.sample_rotamers = True
-        self.rotamer_neighborhood = 24
+        self.rotamer_neighborhood = 90
         self.remove_conformers_below_cutoff = False
 
 class Rotamer_Optimizer():
@@ -135,8 +135,10 @@ class Rotamer_Optimizer():
         rename.name = "O"
         self.base_structure = self.base_structure.extract("name", "OXT", "!=").combine(rename)
 
-        self.trim = 1
+        self.trim = 5
         self.accept = 1
+
+        self.rscc_cutoff = 0.6
 
     def _load_event_maps(self):
         self.event_maps = {}
@@ -156,8 +158,12 @@ class Rotamer_Optimizer():
         models = Structure.fromfile(self.model_file).split_models()
         self.bs_residues = self._determineBindingSite(models)
         print(self.__dict__)
+        # rsccs_all_events = {}
+        rsccs = {}
+        base_rsccs = {}
 
         residue_coor_sets = {}
+        base_coor_sets = {}
         for chain_id in self.bs_residues:
             for resnum in self.bs_residues[chain_id]:
                 current_residue = Uninitialized()
@@ -189,23 +195,63 @@ class Rotamer_Optimizer():
                     conformer = chain.conformers[0]
                     self.current_residue = conformer[current_residue.id]
 
-                    #sample sidechains
+                    #get rscc/coors for base residue
+                    self._coor_set = [self.current_residue.coor]
+                    base_rsccs.update({(chainid,resi): self._calc_rscc_all_events()})
+                    base_coor_sets.update({(chain_id,resi): self._coor_set})
+
+                    #sample ca-b-y for aromatics
+                    self._sample_angle()
+
+                    #sample sidechains chi
                     self._sample_sidechains()
                     
                     #score sidecains to top 1
                     self._convert_and_score_rotamer(self.accept)
                     residue_coor_sets.update({(chain_id,resi): self._coor_set})
-
                     print(f'residue scored in {time.time() - time0}')
+
+                    #get rscc for top residue
+                    rsccs.update({(chainid,resi): self._calc_rscc_all_events()})
+
+                    #legacy code for different evaluations
+                    # rsccs = self._calc_rscc_all_events()
+                    # rsccs_all_events.update({(chainid, resi): rsccs})
                     # self._write_multimodel_pdb_residue(self.current_residue, self._coor_set, self.output_path + '/test.pdb')
 
         for model in models:
-            self._update_coords(model, residue_coor_sets)
+            self._update_coords(model, residue_coor_sets, base_coor_sets, rsccs)
 
         output = self.output_path + '/rotamer_optimized.pdb'
         self._write_multimodel_pdb(models, output)
+
+        rscc_output = self.output_path + '/rscc.csv'
+        with open(rscc_output,'w+') as f:
+            f.write('residue,optimized_rscc,base_rscc,optmized?')
+            f.write('\n')
+            for residue_tuple in list(rsccs.keys()):
+                f.write(f'{residue_tuple[0]}{residue_tuple[1]},')
+                f.write(f'{rsccs[residue_tuple]},')
+                f.write(f'{base_rsccs[residue_tuple]},')
+                if rsccs[residue_tuple] >= self.rscc_cutoff:
+                    f.write('yes')
+                else:
+                    f.write('no')
+                f.write('\n')
+
+        # rscc_output = self.output_path + '/rscc.csv'
+        # with open(rscc_output,'w+') as f:
+        #     f.write('residue,rsccs')
+        #     f.write('\n')
+        #     for residue_tuple in list(rsccs_all_events.keys()):
+        #         f.write(f'{residue_tuple[0]}{residue_tuple[1]},')
+        #         for rscc in rsccs_all_events[residue_tuple]:
+        #             f.write(f'{rscc}_')
+        #         f.write('\n')
+
+
     
-    def _update_coords(self, model, residue_coor_sets):
+    def _update_coords(self, model, residue_coor_sets, base_coor_sets, rsccs):
         new_coor = model.coor.copy()
         atom_index = 0
         for chain in model._pdb_hierarchy.only_model().chains():
@@ -217,7 +263,11 @@ class Rotamer_Optimizer():
                 )
                 key = (chain_id, resi)
                 if key in residue_coor_sets:
-                    new_coor[atom_index: atom_index + n_atoms] = residue_coor_sets[key][0]
+                    rscc = rsccs.get(key, 0)
+                    if rscc >= self.rscc_cutoff:
+                        new_coor[atom_index: atom_index + n_atoms] = residue_coor_sets[key][0]
+                    elif key in base_coor_sets:
+                        new_coor[atom_index: atom_index + n_atoms] = base_coor_sets[key][0]
                 atom_index += n_atoms
         model.coor = new_coor
 
@@ -246,7 +296,6 @@ class Rotamer_Optimizer():
     def _sample_sidechains(self):
         print(f"{self.current_residue.resn[0]}, {self.current_residue.resi[0]}")
         opt = self.options
-        self._coor_set = [self.current_residue.coor]
 
         if self.current_residue.resn[0] != "PRO":
             sampling_window = np.arange(
@@ -261,16 +310,12 @@ class Rotamer_Optimizer():
         rotamers.append([self.current_residue.get_chi(i) for i in range(1, self.current_residue.nchi + 1)])
 
         for chi_index in range(1, self.current_residue.nchi + 1):
-            self.current_residue.active = True
-            self.current_residue.update_clash_mask()
 
             new_coor_set = []
             for coor in self._coor_set:
                 self.current_residue.coor = coor
                 chis = [self.current_residue.get_chi(i) for i in range(1, chi_index)]
-                # print(f"chi_index={chi_index}, chis={chis}")
                 for rotamer in rotamers:
-                    # print(f"  rotamer={rotamer}, same={self.is_same_rotamer(rotamer, chis)}")
 
                 # for rotamer in rotamers:
                     if not self.is_same_rotamer(rotamer, chis):
@@ -290,6 +335,44 @@ class Rotamer_Optimizer():
             print(f'number of conformers to score: {len(new_coor_set)}')
             self._coor_set = new_coor_set
             self._convert_and_score_rotamer(self.trim)
+
+    #this function is largely copy pasted from qfit_rotameric_residue with edits to work with my objects
+    def _sample_angle(self):
+        # Only operate on aromatics!
+        if self.current_residue.resn[0] not in ("TRP", "TYR", "PHE", "HIS"):
+            return
+
+        # Define sampling range
+        angles = np.arange(
+            -self.options.sample_angle_range,
+            self.options.sample_angle_range + self.options.sample_angle_step,
+            self.options.sample_angle_step,
+        )
+
+        # Commence sampling, building on each existing conformer in self._coor_set
+        new_coor_set = []
+        for coor in self._coor_set:
+            self.current_residue.coor = coor
+            # Initialize rotator
+            perp_rotator = CBAngleRotator(self.current_residue)
+            # Rotate about the axis perpendicular to CB-CA and CB-CG vectors
+            for perp_angle in angles:
+                perp_rotator(perp_angle)
+                coor_rotated = self.current_residue.coor
+                # Initialize rotator
+                bisec_rotator = BisectingAngleRotator(self.current_residue)
+                # Rotate about the axis bisecting the CA-CA-CG angle for each angle you sample across the perpendicular axis
+                for bisec_angle in angles:
+                    self.current_residue.coor = coor_rotated  # Ensure that the second rotation is applied to the updated coordinates from first rotation
+                    bisec_rotator(bisec_angle)
+                    coor = self.current_residue.coor
+
+                    # Valid, non-clashing conformer found!
+                    new_coor_set.append(self.current_residue.coor)
+
+        # Update sampled coords
+        self._coor_set = new_coor_set
+        self._convert_and_score_rotamer(self.trim)
 
     def is_same_rotamer(self, rotamer, chis):
         dchi_max = 360 - self.options.rotamer_neighborhood
@@ -319,18 +402,58 @@ class Rotamer_Optimizer():
         
         #convert and score this set of rotamers
         scores = []
+        rsccs = []
         mask = transformer.get_conformers_mask(self._coor_set, self._rmask)
         target = self.event_maps[first_event_map_name].array[mask]
-        for density in transformer.get_conformers_densities(self._coor_set,bfactor_array):
+        for density in transformer.get_conformers_densities(self._coor_set, bfactor_array):
             model = density[mask]
-            np.maximum(model,scaled_bulk_solvent,out=model)
+            np.maximum(model, scaled_bulk_solvent, out=model)
             mse = np.mean((model - target) ** 2)
             scores.append(mse)
+            
+            correlation_matrix = np.corrcoef(model, target)
+            rscc = correlation_matrix[0, 1]
+            rsccs.append(rscc)
 
         # Sort by score ascending and filter down
         sorted_indices = np.argsort(scores)
         top_indices = sorted_indices[:n]
         self._coor_set = [self._coor_set[i] for i in top_indices]
+        self._rsccs = [rsccs[i] for i in top_indices]
+
+    def _calc_rscc_all_events(self):
+        scaled_bulk_solvent = 0 #from qfit, maybe should be different
+        rsccs = []
+        for event_map_name in list(self.event_maps.keys()): 
+
+            (chainid, resi, icode) = self.current_residue.identifier_tuple
+            
+            #get residue from base structure
+            residue = self.base_structure.extract(f"chain {chainid} and resi {resi}")
+            
+            #make bfactor array
+            default_bfactor = 20
+            bfactor_array = []
+            for i in range(len(self._coor_set)):
+                bfactor_array.append(default_bfactor)
+
+            #initialize transformer
+            transformer = get_transformer("qfit", residue, self.event_maps_models[event_map_name])
+            
+            #convert and score this set of rotamers
+            mask = transformer.get_conformers_mask(self._coor_set, self._rmask)
+            target = self.event_maps[event_map_name].array[mask]
+            for density in transformer.get_conformers_densities(self._coor_set, bfactor_array):
+                model = density[mask]         
+                np.maximum(model, scaled_bulk_solvent, out=model)  
+                correlation_matrix = np.corrcoef(model, target)
+                rscc = correlation_matrix[0, 1]
+                rsccs.append(rscc)
+
+        top_rscc = max(rsccs)
+
+        return top_rscc
+        # return rsccs
 
     def _determineBindingSite(self, models):
         """Determines where binding site is.
