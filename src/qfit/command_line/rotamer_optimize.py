@@ -109,12 +109,12 @@ class QFitOptions: #copypasted from qfit.py
 
         # N-CA-CB angle sampling
         self.sample_angle = True
-        self.sample_angle_range = 90
+        self.sample_angle_range = 7.5
         self.sample_angle_step = 3.75
 
         # Rotamer sampling
         self.sample_rotamers = True
-        self.rotamer_neighborhood = 90
+        self.rotamer_neighborhood = 24
         self.remove_conformers_below_cutoff = False
 
 class Rotamer_Optimizer():
@@ -138,7 +138,7 @@ class Rotamer_Optimizer():
         self.trim = 5
         self.accept = 1
 
-        self.rscc_cutoff = 0.6
+        self.rscc_cutoff = 0.4
 
     def _load_event_maps(self):
         self.event_maps = {}
