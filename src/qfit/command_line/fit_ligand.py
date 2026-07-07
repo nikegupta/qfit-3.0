@@ -31,7 +31,7 @@ def build_argparser():
         default=100,
         metavar="<int>",
         type=int,
-        help="Number of peaks to find (default: 5)",
+        help="Number of peaks to find",
     )
     p.add_argument(
         "-z",
@@ -60,6 +60,7 @@ class LigandPlacer():
         self.z_threshold = z_threshold
         self.geom_params = geom_params
         self._rmask = 0.5 + self.resolution / 3.0
+        self.rmsd_cutoff = 8
 
         #make output folder
         self.output_dir = self.dataset / self.geom_params
@@ -105,7 +106,7 @@ class LigandPlacer():
             merged_structure = self.apo_structure.copy()
 
             # Skip if too close to a previously processed coordinate
-            if any(np.linalg.norm(best_peak_coord - seen) < 0.1 for seen in seen_coords):
+            if any(np.linalg.norm(best_peak_coord - seen) < self.rmsd_cutoff for seen in seen_coords):
                 print(f'skipping peak {i}, ligand at {best_peak_coord}')
                 continue
             seen_coords.append(best_peak_coord)
