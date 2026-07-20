@@ -6,6 +6,12 @@ import numpy as np
 import heapq
 import tempfile
 import os
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.spatial.distance import squareform
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+ 
 
 from qfit import Structure
 from qfit import XMap
@@ -112,8 +118,6 @@ class Filter():
             # #look at all event map scores
             # self.all_scores.update({placer_file: self._convertAndScoreLigandAllEvents(placer_file)})
 
-                                  
-        print(self.scores)
         #get top N
         top_n = heapq.nsmallest(self.n,((val, key, idx) for key, lst in self.scores.items() for idx, val in enumerate(lst)))
         
@@ -149,7 +153,7 @@ class Filter():
             f.write('\n')
             bs_models = []
             for entry in top_n:
-                print(entry)
+                # print(entry)
                 score = entry[0]
                 placer_file = entry[1]
                 index = entry[2]
@@ -166,6 +170,153 @@ class Filter():
         os.makedirs(output_folder, exist_ok=True)
         output_path = output_folder + '/filtered_models.pdb'
         self._write_multimodel_pdb(bs_models, output_path)   
+
+        #now write out spatially clustered models
+        self._spatialClustering(top_n)
+        self._calcRSCCofClusters()
+        
+        #output cluster models
+        cluster_summary = output_folder + '/cluster_reps.csv'
+        with open(cluster_summary, 'w+') as f:
+            f.write('placer_file,index,mse,cluster,rscc,num_members')
+            f.write('\n')
+            cluster_models = []
+            for cluster_id in self.cluster_reps:
+                mse = self.cluster_reps[cluster_id][0]
+                placer_file = self.cluster_reps[cluster_id][1]
+                index = self.cluster_reps[cluster_id][2]
+                rscc = self.cluster_rsccs[cluster_id]
+                num_members = self.cluster_reps[cluster_id][4]
+
+                f.write(f'{placer_file},{index},{mse},{cluster_id},{rscc},{num_members}')
+                f.write(f'\n')
+
+                cluster_model = self.base_binding_sites[placer_file].copy()
+                cluster_model.coor = self.coor_sets[placer_file][index]
+                cluster_model.b = 20
+                cluster_models.append(cluster_model)
+
+        cluster_model_path = output_folder + '/cluster_rep_models.pdb'
+        self._write_multimodel_pdb(cluster_models,cluster_model_path)
+
+    def _calcRSCCofClusters(self):
+        self.cluster_rsccs = {}
+        for cluster_id in self.cluster_reps:
+            placer_file = self.cluster_reps[cluster_id][1]
+            ligand_coor = self.cluster_reps[cluster_id][3]
+
+            scaled_bulk_solvent = 0 #from qfit, maybe should be different
+
+            #extract ligand from binding site and coor sets
+            ligand = self.base_binding_sites[placer_file].extract('resname LIG')
+
+            #make bfactor array
+            default_bfactor = 20 #can change 
+
+            rsccs = []
+            for event_map_name in  list(self.event_maps.keys()):
+                #make a transformer for this structure
+                transformer = get_transformer("qfit", ligand, self.event_maps_models[event_map_name])
+
+                #convert and score this set of rotamers
+                mask = transformer.get_conformers_mask([ligand_coor], self._rmask)
+                target = self.event_maps[event_map_name].array[mask]
+
+                for density in transformer.get_conformers_densities([ligand_coor],[default_bfactor]):
+                    model = density[mask]         
+                    np.maximum(model, scaled_bulk_solvent, out=model)  
+                    correlation_matrix = np.corrcoef(model, target)
+                    rscc = correlation_matrix[0, 1]
+                    rsccs.append(rscc)
+            
+            best_rscc = max(rsccs)
+            self.cluster_rsccs.update({cluster_id: best_rscc})
+        
+    def _spatialClustering(self, top_n):
+        """Spatially clusters the ligands of the top_n models based on RMSD.
+        """
+
+        # extract just the ligand coordinates for every entry, tracking provenance
+        ligand_coor_sets = []
+        entry_labels = []       # human readable "placer_file, index" for dendrogram leaves
+        entry_info = []   
+
+        for score, placer_file, index in top_n:
+            coor_set = self.coor_sets[placer_file][index]
+            ligand_coor = coor_set[-self.ligand_size:, :]
+
+            ligand_coor_sets.append(ligand_coor)
+            entry_labels.append(f'{Path(placer_file).stem}_{index}')
+            entry_info.append((score,placer_file,index,ligand_coor))
+
+        n_entries = len(ligand_coor_sets)
+
+        # build the pairwise RMSD distance matrix between ligand conformers
+        dist_matrix = np.zeros((n_entries, n_entries))
+        for i in range(n_entries):
+            for j in range(i + 1, n_entries):
+                diff = ligand_coor_sets[i] - ligand_coor_sets[j]
+                rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
+                dist_matrix[i, j] = rmsd
+                dist_matrix[j, i] = rmsd
+
+        condensed_dist = squareform(dist_matrix, checks=False)
+        linkage_matrix = linkage(condensed_dist, method='average')
+
+        # cut the tree at a 2 A RMSD cutoff: any two leaves are in the same
+        # cluster if the RMSD at which their branches merge is <= 2 A.
+        rmsd_cutoff = 2.0
+        cluster_ids = fcluster(linkage_matrix, t=rmsd_cutoff, criterion='distance')
+        self.cluster_assignments = cluster_ids  # 1-indexed cluster id per entry, same order as entry_labels/entry_provenance
+
+        # write out the dendrogram
+        output_folder = str(self.dir) + '/' + self.output_folder
+        os.makedirs(output_folder, exist_ok=True)
+        dendrogram_path = output_folder + '/ligand_dendrogram.png'
+
+        fig, ax = plt.subplots(figsize=(max(8, n_entries * 0.3), 6))
+        dendrogram(
+            linkage_matrix,
+            labels=entry_labels,
+            ax=ax,
+            leaf_rotation=90,
+            color_threshold=rmsd_cutoff,      # color links below this distance by cluster
+            above_threshold_color='lightgray' # links merging above cutoff (between clusters)
+        )
+
+        ax.set_xlabel('placer_file, index')
+        ax.set_ylabel('RMSD (\u00c5)')
+        ax.set_title('Hierarchical clustering of top ligand conformers (average linkage, RMSD)')
+        fig.tight_layout()
+        fig.savefig(dendrogram_path, dpi=200)
+        plt.close(fig)
+
+        clusters = {}
+        for i,cluster_id in enumerate(cluster_ids):
+            if cluster_id not in clusters:
+                clusters.update({cluster_id: []})
+            clusters[cluster_id].append(entry_info[i])
+
+        clusters = {}
+        for i, cluster_id in enumerate(cluster_ids):
+            if cluster_id not in clusters:
+                clusters.update({cluster_id: []})
+            clusters[cluster_id].append(entry_info[i])
+
+        self.cluster_reps = {}
+        for cluster_id in clusters:
+            cluster_size = len(clusters[cluster_id])
+
+            best_score = 100
+            for entry in clusters[cluster_id]:
+                if cluster_id not in self.cluster_reps:
+                    self.cluster_reps.update({cluster_id: entry + (cluster_size,)})
+
+                current_score = entry[0]
+                if current_score < best_score:
+                    best_score = current_score
+                    self.cluster_reps[cluster_id] = entry + (cluster_size,)
+
 
     def _determineBindingSite(self, models):
         """Determines where binding site is.
@@ -321,8 +472,8 @@ class Filter():
 
         #extract ligand from binding site and coor sets
         ligand = self.base_binding_sites[placer_file].extract('resname LIG')
-        ligand_size = ligand.natoms
-        ligand_coor_set = [arr[-ligand_size:, :] for arr in coor_set]
+        self.ligand_size = ligand.natoms
+        ligand_coor_set = [arr[-self.ligand_size:, :] for arr in coor_set]
 
         #make bfactor array
         default_bfactor = 20 #can change 
@@ -354,8 +505,8 @@ class Filter():
 
             #extract ligand from binding site and coor sets
             ligand = self.base_binding_sites[placer_file].extract('resname LIG')
-            ligand_size = ligand.natoms
-            ligand_coor_set = [arr[-ligand_size:, :] for arr in coor_set]
+            self.ligand_size = ligand.natoms
+            ligand_coor_set = [arr[-self.ligand_size:, :] for arr in coor_set]
 
             #make bfactor array
             default_bfactor = 20 #can change 
