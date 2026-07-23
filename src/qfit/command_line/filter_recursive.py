@@ -129,7 +129,9 @@ class Filter():
 
         All print() output produced during this method (including from every
         iteration's _runIteration call) is mirrored to
-        output_folder/log.txt in addition to the console.
+        output_folder/log.txt in addition to the console. Each iteration also
+        gets its own iteration_N/log.txt containing just that iteration's
+        output, in addition to (not instead of) the combined top-level log.
         """
         self.output_folder_base = str(self.dir) + '/' + self.output_folder
         os.makedirs(self.output_folder_base, exist_ok=True)
@@ -163,10 +165,21 @@ class Filter():
                 iter_output_folder = os.path.join(self.output_folder_base, f'iteration_{iteration}')
                 os.makedirs(iter_output_folder, exist_ok=True)
 
-                (accepted_cluster_reps, accepted_rsccs, cluster_placer_file_map, accepted_models,
-                 unfiltered_cluster_reps, unfiltered_rsccs) = self._runIteration(
-                    remaining_placer_files, remaining_fit_ligand_files, iter_output_folder
-                )
+                # mirror this iteration's output into its own iteration_N/log.txt
+                # as well as the combined top-level log already in sys.stdout
+                iter_log_path = iter_output_folder + '/log.txt'
+                iter_log_file = open(iter_log_path, 'w')
+                stdout_before_iteration = sys.stdout
+                sys.stdout = _Tee(stdout_before_iteration, iter_log_file)
+
+                try:
+                    (accepted_cluster_reps, accepted_rsccs, cluster_placer_file_map, accepted_models,
+                     unfiltered_cluster_reps, unfiltered_rsccs) = self._runIteration(
+                        remaining_placer_files, remaining_fit_ligand_files, iter_output_folder
+                    )
+                finally:
+                    sys.stdout = stdout_before_iteration
+                    iter_log_file.close()
 
                 for cluster_id, entry in unfiltered_cluster_reps.items():
                     global_id = f'{iteration}_{cluster_id}'
@@ -324,6 +337,7 @@ class Filter():
             if self.cluster_rsccs[cluster_id] > RSCC_CUTOFF:
                 rscc_cluster_reps.update({cluster_id: self.cluster_reps[cluster_id]})
         self.cluster_reps = rscc_cluster_reps
+        passed_rscc_ids = set(rscc_cluster_reps.keys())
 
         print(f'number of reps after rscc filtering: {len(self.cluster_reps)}')
 
@@ -346,6 +360,7 @@ class Filter():
 
                 filtered_cluster_reps.update({best_cluster_id: self.cluster_reps[best_cluster_id]})
         self.cluster_reps = filtered_cluster_reps
+        accepted_ids = set(filtered_cluster_reps.keys())
 
         print(f'number of reps after file filtering: {len(self.cluster_reps)}')
 
@@ -362,6 +377,32 @@ class Filter():
         #output cluster models
         cluster_summary = output_folder + '/cluster_reps.csv'
         self._write_cluster_reps_csv(self.cluster_reps, self.cluster_rsccs, cluster_summary)
+
+        # record, for every raw cluster produced this iteration (not just
+        # accepted ones), whether it was rejected at the rscc-cutoff stage,
+        # rejected at the per-placer_file de-duplication stage, or accepted -
+        # so members of rejected clusters can show *why* their cluster's
+        # representative was rejected
+        cluster_status = {}
+        for cluster_id in unfiltered_cluster_reps:
+            if cluster_id not in passed_rscc_ids:
+                cluster_status[cluster_id] = 'failed_rscc_cutoff'
+            elif cluster_id not in accepted_ids:
+                cluster_status[cluster_id] = 'lost_per_placer_file_dedup'
+            else:
+                cluster_status[cluster_id] = 'accepted'
+
+        # write out full clustering information for every placer_file/index
+        # conformer that made this iteration's top-N cut (the only conformers
+        # _spatialClustering ever saw); each row also shows that conformer's
+        # cluster representative and why that representative was ultimately
+        # accepted or rejected
+        cluster_members_csv = output_folder + '/cluster_members.csv'
+        self._write_cluster_members_csv(
+            self.clusters, self.scores, unfiltered_cluster_reps, unfiltered_rsccs,
+            cluster_status, cluster_members_csv
+        )
+        print(f'cluster membership for this iteration written to {cluster_members_csv}')
 
         accepted_models = {}
         cluster_models = []
@@ -428,6 +469,69 @@ class Filter():
 
                 f.write(f'{placer_file},{index},{mse},{cluster_id},{rscc},{num_members}')
                 f.write('\n')
+
+    def _write_cluster_members_csv(self, clusters, scores, cluster_reps, cluster_rsccs, cluster_status, path):
+        """
+        Writes a csv covering every placer_file/index conformer that was
+        scored in this iteration, with its cluster assignment and enough
+        information to trace *why* that cluster's representative was
+        accepted or rejected:
+
+          cluster                  : the spatial cluster this conformer belongs
+                                      to. Blank if this conformer didn't make
+                                      the top-N score cut for this iteration,
+                                      since _spatialClustering only ever sees
+                                      the top-N subset (unlike a version of
+                                      this pipeline that clusters everything).
+          cluster_rep_placer_file,
+          cluster_rep_index        : identifies the model that represents (and
+                                      effectively supersedes) this conformer's
+                                      cluster - i.e. the best-scoring member,
+                                      which is what actually gets carried
+                                      forward into RSCC scoring and filtering
+          cluster_rscc             : the RSCC computed for that representative
+          cluster_status           : 'accepted', 'failed_rscc_cutoff', or
+                                      'lost_per_placer_file_dedup' - why the
+                                      representative (and therefore every
+                                      member of this cluster) did or didn't
+                                      make it into this iteration's
+                                      cluster_reps.csv
+
+        `clusters` is self.clusters (cluster_id -> list of
+        (score, placer_file, index, ligand_coor) tuples), scoped to this
+        iteration's top-N subset. `scores` is self.scores (placer_file -> list
+        of mse scores, one per conformer index) for every placer_file
+        considered in this iteration. `cluster_reps`/`cluster_rsccs` should be
+        the *unfiltered* snapshots covering every raw cluster_id produced this
+        iteration. `cluster_status` maps every raw cluster_id to its final
+        disposition for this iteration.
+        """
+        cluster_of = {}
+        for cluster_id, members in clusters.items():
+            for score, placer_file, index, ligand_coor in members:
+                cluster_of[(placer_file, index)] = cluster_id
+
+        with open(path, 'w+') as f:
+            f.write('placer_file,index,mse,cluster,cluster_rep_placer_file,'
+                    'cluster_rep_index,cluster_rscc,cluster_status')
+            f.write('\n')
+            for placer_file, score_list in scores.items():
+                for index, mse in enumerate(score_list):
+                    cluster_id = cluster_of.get((placer_file, index), '')
+                    if cluster_id == '':
+                        rep_placer_file = ''
+                        rep_index = ''
+                        rscc = ''
+                        status = ''
+                    else:
+                        rep_placer_file = cluster_reps[cluster_id][1]
+                        rep_index = cluster_reps[cluster_id][2]
+                        rscc = cluster_rsccs[cluster_id]
+                        status = cluster_status[cluster_id]
+
+                    f.write(f'{placer_file},{index},{mse},{cluster_id},{rep_placer_file},'
+                            f'{rep_index},{rscc},{status}')
+                    f.write('\n')
 
     def _calcRSCCofClusters(self):
         self.cluster_rsccs = {}

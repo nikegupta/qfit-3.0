@@ -208,15 +208,6 @@ class Filter():
 
             #now write out spatially clustered models
             self._spatialClustering(top_n)
-
-            #write out every member (placer_file/index) of every spatial cluster,
-            #not just the representative - this reflects cluster membership as
-            #determined by _spatialClustering and is independent of any later
-            #RSCC or per-placer_file filtering
-            cluster_members_csv = output_folder + '/cluster_members.csv'
-            self._write_cluster_members_csv(self.clusters, cluster_members_csv)
-            print(f'cluster membership written to {cluster_members_csv}')
-
             self._calcRSCCofClusters()
 
             print(f'number of reps before filtering: {len(self.cluster_reps)}')
@@ -259,9 +250,19 @@ class Filter():
 
             print(f'number of reps after file filtering: {len(self.cluster_reps)}')
 
-            #output cluster models
+            #output cluster models - this csv contains only the final,
+            #filtered/accepted cluster representatives
             cluster_summary = output_folder + '/cluster_reps.csv'
             self._write_cluster_reps_csv(self.cluster_reps, self.cluster_rsccs, cluster_summary)
+
+            #write out full clustering information for every input placer model
+            #conformer (every placer_file/index pair that was scored), not just
+            #the ones that made the top-N cut and were actually clustered -
+            #conformers outside the top N get an empty 'cluster' value since
+            #_spatialClustering never considered them
+            cluster_members_csv = output_folder + '/cluster_members.csv'
+            self._write_cluster_members_csv(self.clusters, self.scores, cluster_members_csv)
+            print(f'full cluster membership for every input placer model written to {cluster_members_csv}')
 
             cluster_models = []
             for cluster_id in self.cluster_reps:
@@ -300,23 +301,37 @@ class Filter():
                 f.write(f'{placer_file},{index},{mse},{cluster_id},{rscc},{num_members}')
                 f.write('\n')
 
-    def _write_cluster_members_csv(self, clusters, path):
+    def _write_cluster_members_csv(self, clusters, scores, path):
         """
-        Writes a cluster,placer_file,index,mse csv listing every member of every
-        spatial cluster (not just the cluster representative), so the full
-        membership - which placer_file/index pairs were grouped together, and
-        how many - stays inspectable independent of any later RSCC or
-        per-placer_file filtering.
+        Writes a cluster,placer_file,index,mse csv covering every input placer
+        model conformer that was scored (every placer_file/index pair in
+        `scores`), not just the ones that made the top-N cut and were actually
+        spatially clustered.
+
+        Conformers that were part of a spatial cluster get that cluster's id
+        in the 'cluster' column; conformers that were never passed to
+        _spatialClustering (because they didn't make the top-N score cut) get
+        an empty 'cluster' value, so the full set of input conformers and
+        their scores stays inspectable in one place, with cluster membership
+        shown wherever it applies.
 
         `clusters` is self.clusters as built by _spatialClustering: a dict of
         cluster_id -> list of (score, placer_file, index, ligand_coor) tuples.
+        `scores` is self.scores: a dict of placer_file -> list of mse scores,
+        one per conformer index, covering every input placer model.
         """
+        cluster_of = {}
+        for cluster_id, members in clusters.items():
+            for score, placer_file, index, ligand_coor in members:
+                cluster_of[(placer_file, index)] = cluster_id
+
         with open(path, 'w+') as f:
-            f.write('cluster,placer_file,index,mse')
+            f.write('placer_file,index,mse,cluster')
             f.write('\n')
-            for cluster_id in clusters:
-                for score, placer_file, index, ligand_coor in clusters[cluster_id]:
-                    f.write(f'{cluster_id},{placer_file},{index},{score}')
+            for placer_file, score_list in scores.items():
+                for index, mse in enumerate(score_list):
+                    cluster_id = cluster_of.get((placer_file, index), '')
+                    f.write(f'{placer_file},{index},{mse},{cluster_id}')
                     f.write('\n')
 
     def _calcRSCCofClusters(self):
