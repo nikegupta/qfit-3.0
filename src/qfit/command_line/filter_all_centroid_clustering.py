@@ -20,11 +20,8 @@ from qfit.xtal.transformer import get_transformer
 
 import iotbx.pdb
 
-RSCC_CUTOFF = 0.6
-COUNT_CUTOFF = 0.01
+RSCC_CUTOFF = 0
 rmsd_cutoff = 2.0
-VDW_CUTOFF = 0.75
-
 
 
 class _Tee:
@@ -179,12 +176,8 @@ class Filter():
                 return
 
             #spatially cluster the full scored set
-            time0 = time.time()
             self._spatialClustering(all_scored, output_folder)
-            print(f'spatially clustered in {time.time() - time0}')
-            time0 = time.time()
             self._calcRSCCofClusters()
-            print(f'calced RSCC in {time.time() - time0}')
 
             print(f'number of reps before filtering: {len(self.cluster_reps)}')
 
@@ -201,24 +194,6 @@ class Filter():
             #the final filtered set
             unfiltered_cluster_reps = dict(self.cluster_reps)
             unfiltered_cluster_rsccs = dict(self.cluster_rsccs)
-
-            #filter cluster_reps by num_in_cluster
-            total_models = 0
-            for placer_file in self.coor_sets:
-                total_models += len(self.coor_sets[placer_file])
-
-            filtered_cluster_reps = {}
-            for cluster_id in self.cluster_reps:
-                num_cluster_members = self.cluster_reps[cluster_id][4]
-                if num_cluster_members > total_models * COUNT_CUTOFF:
-                    filtered_cluster_reps.update({cluster_id: self.cluster_reps[cluster_id]})
-            self.cluster_reps = filtered_cluster_reps
-            passed_count_ids = set(self.cluster_reps.keys())
-
-            print(f'number of reps after count filtering: {len(self.cluster_reps)}')
-
-            print(f'number of reps after count filtering: {len(self.cluster_reps)}')
-                
 
             #filter cluster_reps by rscc
             rscc_cluster_reps = {}
@@ -253,23 +228,21 @@ class Filter():
 
             print(f'number of reps after file filtering: {len(self.cluster_reps)}')
 
-            #filter based on clashes
-            self._filter_clashes()
+            filtered_cluster_reps = {}
+            print(self.cluster_reps)
 
+            #record, for every raw cluster (not just the ones that survive),
+            #whether it was rejected at the rscc-cutoff stage, rejected at the
+            #per-placer_file de-duplication stage (i.e. a different cluster
+            #from the same placer_file had a higher rscc), or accepted - so
+            #members of rejected clusters can show *why* their cluster's
+            #representative was rejected
             cluster_status = {}
             for cluster_id in unfiltered_cluster_reps:
-                if cluster_id not in passed_count_ids:
-                    cluster_status[cluster_id] = 'failed_count_cutoff'
-                elif cluster_id not in passed_rscc_ids:
+                if cluster_id not in passed_rscc_ids:
                     cluster_status[cluster_id] = 'failed_rscc_cutoff'
                 elif cluster_id not in accepted_ids:
                     cluster_status[cluster_id] = 'lost_per_placer_file_dedup'
-                elif cluster_id in self.clash_rejected_ids:
-                    partner_id = self.clash_partners[cluster_id]
-                    partner_placer_file = unfiltered_cluster_reps[partner_id][1]
-                    cluster_status[cluster_id] = (
-                        f'failed_clash_filter (vs {partner_placer_file})'
-                    )
                 else:
                     cluster_status[cluster_id] = 'accepted'
 
@@ -305,93 +278,6 @@ class Filter():
         finally:
             sys.stdout = original_stdout
             log_file.close()
-
-    def _filter_clashes(self):
-        """
-        Performs pairwise clash detection between every ligand conformer in
-        self.cluster_reps (the current filtered set of cluster
-        representatives - i.e. those that already passed the rscc cutoff and
-        per-placer_file dedup).
-
-        Whenever two cluster reps clash, the one with the lower RSCC
-        (self.cluster_rsccs) is rejected. This is resolved greedily: the
-        remaining rep with the highest RSCC is kept, everything that clashes
-        with it is rejected, and this repeats among what's left - so a
-        rejection by a higher-RSCC neighbor can never be "un-rejected" by a
-        separate pairwise comparison against a lower-RSCC one.
-
-        Two ligand atoms are considered clashing if the distance between them
-        is less than VDW_CUTOFF * (vdw_radius_i + vdw_radius_j). Two ligand
-        conformers clash if any pair of atoms (one from each) clash. All
-        ligand_coor arrays share the same atom ordering, so a single VDW
-        radius list (pulled from any base binding site's ligand) applies to
-        every conformer.
-
-        Records, for every cluster_id that entered this method, whether it
-        was kept or rejected due to clashing:
-        self.clash_rejected_ids : set of cluster_ids dropped because a
-                                    higher-RSCC rep clashed with them
-        self.clash_partners     : cluster_id -> the single kept cluster_id
-                                    that caused its rejection (populated only
-                                    for rejected cluster_ids)
-        """
-        self.clash_rejected_ids = set()
-        self.clash_partners = {}
-
-        if not self.cluster_reps:
-            return
-
-        # VDW radii for the ligand atoms - order matches ligand_coor ordering
-        # since all ligand coordinate sets were reordered to match this same
-        # reference atom order.
-        first_key = list(self.base_binding_sites.keys())[0]
-        ligand = self.base_binding_sites[first_key].extract("resname LIG")
-        vdw_radii = np.asarray(ligand.vdw_radius)
-
-        cluster_ids = list(self.cluster_reps.keys())
-        n = len(cluster_ids)
-        ligand_coors = [self.cluster_reps[cid][3] for cid in cluster_ids]
-
-        # sum of radii for every pair of atoms, scaled by the cutoff -> clash
-        # distance threshold matrix (n_atoms x n_atoms)
-        radii_sum = vdw_radii[:, None] + vdw_radii[None, :]
-        clash_threshold = VDW_CUTOFF * radii_sum
-
-        # build the clash graph: an edge between two cluster reps if ANY pair
-        # of atoms (one from each ligand) is closer than its clash threshold
-        clash_matrix = np.zeros((n, n), dtype=bool)
-        for i in range(n):
-            for j in range(i + 1, n):
-                diff = ligand_coors[i][:, None, :] - ligand_coors[j][None, :, :]
-                dists = np.linalg.norm(diff, axis=-1)
-                if np.any(dists < clash_threshold):
-                    clash_matrix[i, j] = True
-                    clash_matrix[j, i] = True
-
-        n_clashing_pairs = int(clash_matrix.sum() / 2)
-        print(f'found {n_clashing_pairs} clashing pairs among {n} cluster reps')
-
-        # greedy resolution: repeatedly keep the highest-rscc remaining rep,
-        # reject everything that clashes with it, and continue among the rest
-        remaining = set(range(n))
-        kept_indices = set()
-
-        while remaining:
-            best_i = max(remaining, key=lambda i: self.cluster_rsccs[cluster_ids[i]])
-            kept_indices.add(best_i)
-            remaining.discard(best_i)
-
-            clashing_with_best = [i for i in remaining if clash_matrix[best_i, i]]
-            for i in clashing_with_best:
-                rejected_id = cluster_ids[i]
-                self.clash_rejected_ids.add(rejected_id)
-                self.clash_partners[rejected_id] = cluster_ids[best_i]
-                remaining.discard(i)
-
-        kept_ids = {cluster_ids[i] for i in kept_indices}
-        self.cluster_reps = {cid: self.cluster_reps[cid] for cid in kept_ids}
-
-        print(f'number of reps after clash filtering: {len(self.cluster_reps)}')
 
     def _write_cluster_reps_csv(self, cluster_reps, cluster_rsccs, path):
         """
