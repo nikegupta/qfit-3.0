@@ -369,13 +369,16 @@ class RSCC_Comparator():
         print(f'Pooled {len(all_results)} residues across {len(dataset_dirs)} datasets ({n_workers} workers)')
 
         self._write_csv(all_results, all_mismatches)
+
+        # Only the best (highest) conformer RSCC is plotted against the reference. When a
+        # residue has multiple rotamer conformers across the refined-backbone files (e.g. a
+        # ligand clashes with one rotamer in some models and not others, so those models
+        # settle into different local minima), that's expected behavior -- the correct
+        # comparison to the reference is whichever conformer fits the density best, not an
+        # average across conformers that were never meant to agree with each other.
         self._plot_scatter(
             [r[4] for r in all_results], [r[5] for r in all_results],
             'Best Refined-Backbone RSCC', 'Reference vs Best Refined-Backbone RSCC', 'rscc_scatter_best.png'
-        )
-        self._plot_scatter(
-            [r[4] for r in all_results], [r[6] for r in all_results],
-            'Median Refined-Backbone RSCC', 'Reference vs Median Refined-Backbone RSCC', 'rscc_scatter_median.png'
         )
 
     def _write_csv(self, results, mismatches):

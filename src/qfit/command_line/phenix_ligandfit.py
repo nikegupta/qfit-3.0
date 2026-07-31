@@ -139,7 +139,7 @@ class PhenixLigandFitter:
         self._save_ligand_results()
         self._cleanup_run_dirs()
 
-        print(f'ran in {time.time()} - {time0}')
+        print(f'ran in {time.time() - time0}')
 
     # ------------------------------------------------------------------
     # Private methods
@@ -244,7 +244,7 @@ class PhenixLigandFitter:
             ligand={self.ligand} \\
             map_in={e_map} \\
             resolution={self.resolution} \\
-            number_of_ligands=4 \\
+            number_of_ligands=10 \\
             ligand_cc_min=0.5 \\
             cif_def_file_list={self.ligand_restraints} \\
             cif_already_generated=True \\

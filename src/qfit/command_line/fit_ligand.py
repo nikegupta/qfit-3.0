@@ -1,4 +1,7 @@
 import argparse
+import csv
+import os
+import fcntl
 import numpy as np
 import time
 from itertools import product
@@ -67,7 +70,18 @@ class LigandPlacer():
         #make output folder
         self.output_dir = self.dataset / self.geom_params
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # Per-dataset manifest linking every fit_ligand output pdb directly to
+        # the ligand name/file that produced it. This is the first step
+        # toward replacing filename-parsing (e.g. "strip the dataset prefix,
+        # strip the trailing _{integer}") as the way downstream pipeline
+        # steps (filtering, CIF restraint lookup, etc.) recover which ligand
+        # a given output belongs to. Multiple LigandPlacer invocations (one
+        # per candidate ligand) can target the same dataset/geom_params
+        # output directory, so entries are appended under a file lock rather
+        # than each invocation overwriting the others' rows.
+        self.manifest_path = self.output_dir / 'fit_ligand_manifest.csv'
+
         # Load structures and maps.
         #
         # NOTE: "-aligned-structure.pdb", not "-pandda-input.pdb". In
@@ -133,6 +147,35 @@ class LigandPlacer():
             event_map_model.set_space_group("P1")
             self.event_maps_models[event_name] = event_map_model
 
+    def _record_manifest_entry(self, peak_index, output_path):
+        """
+        Appends one row to this dataset's fit_ligand_manifest.csv, linking a
+        specific output pdb directly to the ligand name and ligand file path
+        that produced it (columns: dataset, ligand_name, ligand_file,
+        peak_index, output_pdb).
+
+        Because several LigandPlacer runs (one per candidate ligand) can
+        write into the same dataset/geom_params directory, this appends
+        under an exclusive lock (fcntl.flock) rather than each invocation
+        managing its own file, and determines whether a header is needed by
+        checking the actual file size under the lock (not a separate
+        existence check beforehand, which would race against another
+        process's first write).
+        """
+        header = ['dataset', 'ligand_name', 'ligand_file', 'peak_index', 'output_pdb']
+        row = [self.dataset_name, self.ligand_name, str(self.ligand_file), peak_index, str(output_path)]
+
+        with open(self.manifest_path, 'a', newline='') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                write_header = os.fstat(f.fileno()).st_size == 0
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(header)
+                writer.writerow(row)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
     def run(self):
         """Fits a ligand to event maps guided by the zmap."""
         self.peaks = self._find_peaks()
@@ -172,6 +215,8 @@ class LigandPlacer():
             output_path = f'{self.output_dir}/{self.dataset_name}-{self.ligand_name}_{i}.pdb'
             merged_structure.tofile(output_path)
             print(f"Saved to {output_path}")
+
+            self._record_manifest_entry(i, output_path)
 
     def _grid_to_cartesian(self, grid_idx):
         """
@@ -294,7 +339,7 @@ class LigandPlacer():
             # Clash detection: only reject the peak outright for clashing
             # with the immovable backbone, not for merely sitting near a
             # sidechain (which may not be there once the ligand binds).
-            if backbone_mask[peak_coords] == True:
+            if protein_mask[peak_coords] == True:
                 print(f"peak {i} failed centroid check. Reason: peak clashes with protein backbone")
                 continue
             if event_map.array[peak_coords] < threshold:

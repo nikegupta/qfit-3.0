@@ -92,7 +92,7 @@ class QFitOptions: #copypasted from qfit.py
         self.clash_scaling_factor = 0.75
         self.external_clash = False
         self.dofs_per_iteration = 1
-        self.dihedral_stepsize = 6
+        self.dihedral_stepsize = 12
         self.hydro = False
         self.rmsd_cutoff = DEFAULT_RMSD_CUTOFF
 
@@ -110,7 +110,7 @@ class QFitOptions: #copypasted from qfit.py
         # N-CA-CB angle sampling
         self.sample_angle = True
         self.sample_angle_range = 7.5
-        self.sample_angle_step = 3.75
+        self.sample_angle_step = 7.5
 
         # Rotamer sampling
         self.sample_rotamers = True
@@ -135,7 +135,7 @@ class Rotamer_Optimizer():
         rename.name = "O"
         self.base_structure = self.base_structure.extract("name", "OXT", "!=").combine(rename)
 
-        self.trim = 5
+        self.trim = 100
         self.accept = 1
 
         self.rscc_cutoff = 0.4
@@ -175,11 +175,12 @@ class Rotamer_Optimizer():
                         try:
                             chain = model[chain_id]
                             current_residue = chain.conformers[0][resnum]
-                            print(f'retrieved residue {chain_id},{resnum} from model {i}: {current_residue}')
+                            # print(f'retrieved residue {chain_id},{resnum} from model {i}: {current_residue}')
                             retrieved_flag = True
                             from_model = i
                         except:
-                            print(f'couldnt get residue {chain_id},{resnum} from model {i}, trying model {i+1}')
+                            pass
+                            # print(f'couldnt get residue {chain_id},{resnum} from model {i}, trying model {i+1}')
 
                 time0 = time.time()
 

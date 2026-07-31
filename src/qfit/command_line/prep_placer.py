@@ -165,6 +165,7 @@ def main():
         print("Usage: python script.py <cif_file> <ligand_resname>")
         sys.exit(1)
 
+    print('sup')
     cif_file = sys.argv[1]
     ligand_name = sys.argv[2]
 

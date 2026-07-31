@@ -125,16 +125,49 @@ class LigRSCC_Comparator():
         return structure
 
     def _find_lig_keys(self, structure):
-        """Returns [(chain_id, resi), ...] for every residue named 'LIG' in a single-model structure."""
+        """
+        Returns [(chain_id, resi, altloc), ...] for every residue named 'LIG' in a single-model
+        structure.
+
+        A LIG residue group that contains two or more distinct non-blank altlocs (e.g. 'A' and
+        'B') is split into one key per altloc, since each altloc represents a physically distinct
+        ligand conformer that should be matched, scored, and counted independently rather than
+        collapsed into a single ligand. altloc is '' for residues with no altloc disorder (a
+        single conformer, whether its atoms carry a blank altloc code or no altloc at all).
+        """
         keys = []
         for chain in structure._pdb_hierarchy.only_model().chains():
             chain_id = chain.id.strip()
             for residue_group in chain.residue_groups():
                 resn = residue_group.atom_groups()[0].resname.strip()
-                if resn == 'LIG':
-                    resi = int(residue_group.resseq)
-                    keys.append((chain_id, resi))
+                if resn != 'LIG':
+                    continue
+                resi = int(residue_group.resseq)
+                altlocs = sorted({ag.altloc.strip() for ag in residue_group.atom_groups()})
+                non_blank_altlocs = [a for a in altlocs if a != '']
+                if len(non_blank_altlocs) >= 2:
+                    for altloc in non_blank_altlocs:
+                        keys.append((chain_id, resi, altloc))
+                else:
+                    keys.append((chain_id, resi, ''))
         return keys
+
+    def _extract_lig_residue(self, model, chain_id, resi, altloc):
+        """
+        Extracts a single LIG ligand conformer's atoms from a model.
+
+        When altloc is non-empty (the residue has two or more altloc conformers), restricts to
+        that altloc's atoms plus any blank-altloc atoms of the same residue (atoms shared across
+        all of its conformers, e.g. a ligand that is only partially disordered), so each altloc
+        yields one complete, physically distinct conformer rather than a mix of conformers.
+        """
+        resi_selstr = f"chain {chain_id} and resi {resi}"
+        lig_structure = model.extract(resi_selstr)
+        if altloc:
+            alt_structure = lig_structure.extract("altloc", altloc, "==")
+            blank_structure = lig_structure.extract("altloc", "", "==")
+            lig_structure = alt_structure.combine(blank_structure)
+        return lig_structure
 
     def _get_model_serials(self, pdb_path):
         """
@@ -179,27 +212,30 @@ class LigRSCC_Comparator():
     def _find_all_lig_instances(self, models, model_serials):
         """
         Walks every model of a split multimodel structure and collects every residue named
-        'LIG', regardless of which model or (chain_id, resi) it came from. This includes every
-        repeat of a cluster representative across models used to encode its cluster size
-        (num_members) - those repeats are collapsed later by _get_unique_lig_instances.
+        'LIG', regardless of which model or (chain_id, resi, altloc) it came from. This includes
+        every repeat of a cluster representative across models used to encode its cluster size
+        (num_members) - those repeats are collapsed later by _get_unique_lig_instances. A LIG
+        residue with multiple altloc conformers contributes one instance per altloc (see
+        _find_lig_keys), so each altloc is tracked as its own distinct ligand.
 
         model_serials must be the PLACER-file MODEL serial number for each entry in models
         (same length, same order), as returned by _get_model_serials, so that every instance
         can be traced back to its exact MODEL block in the original multimodel PDB.
 
-        Returns a list of dicts: {model_serial, chain_id, resi, structure, coor, names, centroid}
+        Returns a list of dicts:
+        {model_serial, chain_id, resi, altloc, structure, coor, names, centroid}
         """
         instances = []
         for model_serial, model in zip(model_serials, models):
-            for chain_id, resi in self._find_lig_keys(model):
-                resi_selstr = f"chain {chain_id} and resi {resi}"
-                lig_structure = model.extract(resi_selstr)
+            for chain_id, resi, altloc in self._find_lig_keys(model):
+                lig_structure = self._extract_lig_residue(model, chain_id, resi, altloc)
                 coor = lig_structure.coor.copy()
                 names = list(lig_structure.name)
                 instances.append({
                     'model_serial': model_serial,
                     'chain_id': chain_id,
                     'resi': resi,
+                    'altloc': altloc,
                     'structure': lig_structure,
                     'coor': coor,
                     'names': names,
@@ -323,7 +359,12 @@ class LigRSCC_Comparator():
 
     def _score_single_lig(self, lig_structure, coor, event_maps, event_maps_models, rmask):
         """Converts a single LIG conformer's coordinates to density and returns its highest RSCC
-        against any event map for this dataset."""
+        against any event map for this dataset, using that conformer's own mask.
+
+        Used only for LIG instances that have no match to pair with (unmatched reference LIGs
+        and excess multimodel LIGs) - see _score_lig_pair for matched pairs, which are scored
+        with a shared mask instead.
+        """
         scaled_bulk_solvent = 0
         coor_set = [coor]
         bfactor_array = [self.default_bfactor]
@@ -342,6 +383,59 @@ class LigRSCC_Comparator():
                 rsccs.append(rscc)
 
         return max(rsccs)
+
+    def _score_lig_pair(self, ref_lig_structure, ref_coor, mm_lig_structure, mm_coor,
+                         event_maps, event_maps_models, rmask):
+        """
+        Scores a matched reference/multimodel LIG pair's RSCC using a shared mask - the union
+        of each ligand's own mask - rather than each ligand's independent mask as
+        _score_single_lig does. Using each ligand's own footprint separately means the two
+        RSCCs are computed over different sets of grid points, which confounds "how well does
+        this pose explain the density" with "how much of the density each footprint happens to
+        cover". Scoring both against the same combined mask makes the reference and multimodel
+        RSCC directly comparable, since both are correlated against the identical set of voxels.
+
+        For each event map, a transformer/mask/density is built per ligand (since each ligand's
+        pose determines its own model density and mask), the two per-ligand masks are combined
+        with a boolean OR, and both ligands' model densities are compared against the target
+        restricted to that combined mask. The best (max) RSCC across event maps is returned for
+        each ligand independently, matching the max-over-event-maps behavior of
+        _score_single_lig.
+
+        Returns (reference_rscc, multimodel_rscc).
+        """
+        scaled_bulk_solvent = 0
+        bfactor_array = [self.default_bfactor]
+
+        ref_coor_set = [ref_coor]
+        mm_coor_set = [mm_coor]
+
+        ref_rsccs = []
+        mm_rsccs = []
+        for event_map_name in list(event_maps.keys()):
+            event_map_model = event_maps_models[event_map_name]
+            ref_transformer = get_transformer("qfit", ref_lig_structure, event_map_model)
+            mm_transformer = get_transformer("qfit", mm_lig_structure, event_map_model)
+
+            ref_mask = ref_transformer.get_conformers_mask(ref_coor_set, rmask)
+            mm_mask = mm_transformer.get_conformers_mask(mm_coor_set, rmask)
+            combined_mask = ref_mask | mm_mask
+
+            target = event_maps[event_map_name].array[combined_mask]
+
+            for density in ref_transformer.get_conformers_densities(ref_coor_set, bfactor_array):
+                model = density[combined_mask]
+                np.maximum(model, scaled_bulk_solvent, out=model)
+                correlation_matrix = np.corrcoef(model, target)
+                ref_rsccs.append(correlation_matrix[0, 1])
+
+            for density in mm_transformer.get_conformers_densities(mm_coor_set, bfactor_array):
+                model = density[combined_mask]
+                np.maximum(model, scaled_bulk_solvent, out=model)
+                correlation_matrix = np.corrcoef(model, target)
+                mm_rsccs.append(correlation_matrix[0, 1])
+
+        return max(ref_rsccs), max(mm_rsccs)
 
     def _process_dataset(self, dataset, dataset_dir):
         resolution = self.resolutions.get(dataset)
@@ -407,42 +501,51 @@ class LigRSCC_Comparator():
         results = []
         unmatched = []
         used_instance_keys = set()
-        for chain_id, resi in ref_lig_keys:
-            resi_selstr = f"chain {chain_id} and resi {resi}"
-            ref_lig_structure = reference_structure.extract(resi_selstr)
+        for chain_id, resi, altloc in ref_lig_keys:
+            ref_lig_structure = self._extract_lig_residue(reference_structure, chain_id, resi, altloc)
             ref_coor = ref_lig_structure.coor.copy()
             ref_names = list(ref_lig_structure.name)
             ref_centroid = ref_coor.mean(axis=0)
 
-            # scored regardless of match outcome, so unmatched reference LIGs can still be
-            # included in the unmatched-RSCC histogram
-            reference_rscc = self._score_single_lig(
-                ref_lig_structure, ref_coor, event_maps, event_maps_models, rmask
-            )
-
             if not multimodel_lig_instances:
-                unmatched.append((dataset, chain_id, resi, 'no_candidates', None, reference_rscc))
+                # No candidates to pair with, so fall back to scoring the reference LIG alone
+                # against its own mask for the unmatched-RSCC histogram.
+                reference_rscc = self._score_single_lig(
+                    ref_lig_structure, ref_coor, event_maps, event_maps_models, rmask
+                )
+                unmatched.append((dataset, chain_id, resi, altloc, 'no_candidates', None, reference_rscc))
                 continue
 
             best_instance, match_rmsd, centroid_dist = self._find_nearest_multimodel_lig(
                 ref_names, ref_coor, ref_centroid, multimodel_lig_instances
             )
             if best_instance is None:
-                unmatched.append((dataset, chain_id, resi, 'no_shared_atoms', None, reference_rscc))
+                reference_rscc = self._score_single_lig(
+                    ref_lig_structure, ref_coor, event_maps, event_maps_models, rmask
+                )
+                unmatched.append((dataset, chain_id, resi, altloc, 'no_shared_atoms', None, reference_rscc))
                 continue
 
             if centroid_dist > self.centroid_cutoff:
-                unmatched.append((dataset, chain_id, resi, 'centroid_too_far', centroid_dist, reference_rscc))
+                reference_rscc = self._score_single_lig(
+                    ref_lig_structure, ref_coor, event_maps, event_maps_models, rmask
+                )
+                unmatched.append((dataset, chain_id, resi, altloc, 'centroid_too_far', centroid_dist, reference_rscc))
                 continue
-            multimodel_rscc = self._score_single_lig(
-                best_instance['structure'], best_instance['coor'], event_maps, event_maps_models, rmask
+
+            # Matched pair: score both ligands against a shared (unioned) mask so the two
+            # RSCCs are directly comparable, rather than each against its own footprint.
+            reference_rscc, multimodel_rscc = self._score_lig_pair(
+                ref_lig_structure, ref_coor, best_instance['structure'], best_instance['coor'],
+                event_maps, event_maps_models, rmask
             )
 
             results.append((
-                dataset, chain_id, resi, reference_rscc, multimodel_rscc, match_rmsd, centroid_dist
+                dataset, chain_id, resi, altloc, reference_rscc, multimodel_rscc, match_rmsd, centroid_dist
             ))
             used_instance_keys.add(
-                (best_instance['model_serial'], best_instance['chain_id'], best_instance['resi'])
+                (best_instance['model_serial'], best_instance['chain_id'], best_instance['resi'],
+                 best_instance['altloc'])
             )
 
         # Excess ligands: unique multimodel LIG cluster representatives (post-dedup) that were
@@ -450,20 +553,22 @@ class LigRSCC_Comparator():
         # legitimately be the best match for more than one reference LIG, so this counts unique
         # unclaimed representatives rather than unmatched attempts - and, since duplicates from
         # cluster-size repeats were already collapsed, it gives 1 per unmatched representative
-        # regardless of its num_members. Each is also scored so its RSCC can go in the
-        # excess-ligand histogram, and each carries the model_serial of its exact MODEL block in
-        # multimodel_pdb so it can be traced directly back to the PLACER file.
+        # regardless of its num_members. Each is also scored (against its own mask, since it has
+        # no matched reference LIG to pair with) so its RSCC can go in the excess-ligand
+        # histogram, and each carries the model_serial of its exact MODEL block in multimodel_pdb
+        # so it can be traced directly back to the PLACER file.
         excess_ligands = []
         for instance in multimodel_lig_instances:
-            instance_key = (instance['model_serial'], instance['chain_id'], instance['resi'])
+            instance_key = (instance['model_serial'], instance['chain_id'], instance['resi'],
+                             instance['altloc'])
             if instance_key in used_instance_keys:
                 continue
             excess_rscc = self._score_single_lig(
                 instance['structure'], instance['coor'], event_maps, event_maps_models, rmask
             )
             excess_ligands.append((
-                dataset, instance['chain_id'], instance['resi'], instance['model_serial'],
-                str(multimodel_pdb), excess_rscc
+                dataset, instance['chain_id'], instance['resi'], instance['altloc'],
+                instance['model_serial'], str(multimodel_pdb), excess_rscc
             ))
 
         print(f'Completed {dataset}: {len(results)} LIG(s) scored, {len(unmatched)} unmatched, '
@@ -508,48 +613,59 @@ class LigRSCC_Comparator():
 
         self._write_csv(all_results, all_unmatched, all_excess_ligands, dataset_summaries)
         self._plot_scatter(
-            [r[3] for r in all_results], [r[4] for r in all_results],
+            [r[4] for r in all_results], [r[5] for r in all_results],
             'Reference LIG RSCC', 'Multimodel LIG RSCC',
             'Reference vs Nearest-Matched Multimodel LIG RSCC',
-            len(all_unmatched), total_excess_ligands, 'lig_rscc_scatter.png'
+            len(all_unmatched), total_excess_ligands, 'lig_rscc_scatter_combined.png'
         )
         self._plot_histograms(
-            [u[5] for u in all_unmatched], [e[5] for e in all_excess_ligands],
-            'unmatched_excess_rscc_histogram.png'
+            [u[6] for u in all_unmatched], [e[6] for e in all_excess_ligands],
+            'unmatched_excess_rscc_histogram_combined.png'
         )
 
+    def _ligand_label(self, chain_id, resi, altloc):
+        """Formats a (chain_id, resi, altloc) key as a readable ligand label for CSV output,
+        e.g. 'A100' with no altloc disorder, or 'A100-B' for the 'B' altloc conformer."""
+        label = f'{chain_id}{resi}'
+        if altloc:
+            label += f'-{altloc}'
+        return label
+
     def _write_csv(self, results, unmatched, excess_ligands, dataset_summaries):
-        rscc_output = self.output_path / 'lig_rscc_comparison.csv'
+        rscc_output = self.output_path / 'lig_rscc_comparison_combined.csv'
         with open(rscc_output, 'w+') as f:
             f.write('dataset,ligand,reference_rscc,multimodel_rscc,delta,match_rmsd,centroid_dist')
             f.write('\n')
-            for dataset, chain_id, resi, ref_rscc, mm_rscc, match_rmsd, centroid_dist in results:
-                f.write(f'{dataset},{chain_id}{resi},{ref_rscc},{mm_rscc},{mm_rscc - ref_rscc},'
+            for dataset, chain_id, resi, altloc, ref_rscc, mm_rscc, match_rmsd, centroid_dist in results:
+                ligand_label = self._ligand_label(chain_id, resi, altloc)
+                f.write(f'{dataset},{ligand_label},{ref_rscc},{mm_rscc},{mm_rscc - ref_rscc},'
                          f'{match_rmsd},{centroid_dist}')
                 f.write('\n')
 
         if unmatched:
-            unmatched_output = self.output_path / 'unmatched_ligs.csv'
+            unmatched_output = self.output_path / 'unmatched_ligs_combined.csv'
             with open(unmatched_output, 'w+') as f:
                 f.write('dataset,ligand,reason,centroid_dist,rscc')
                 f.write('\n')
-                for dataset, chain_id, resi, reason, centroid_dist, rscc in unmatched:
+                for dataset, chain_id, resi, altloc, reason, centroid_dist, rscc in unmatched:
+                    ligand_label = self._ligand_label(chain_id, resi, altloc)
                     centroid_str = '' if centroid_dist is None else f'{centroid_dist}'
-                    f.write(f'{dataset},{chain_id}{resi},{reason},{centroid_str},{rscc}')
+                    f.write(f'{dataset},{ligand_label},{reason},{centroid_str},{rscc}')
                     f.write('\n')
             print(f'{len(unmatched)} unmatched LIG(s) written to {unmatched_output}')
 
         if excess_ligands:
-            excess_output = self.output_path / 'excess_ligs.csv'
+            excess_output = self.output_path / 'excess_ligs_combined.csv'
             with open(excess_output, 'w+') as f:
                 f.write('dataset,ligand,model_serial,source_multimodel_pdb,rscc')
                 f.write('\n')
-                for dataset, chain_id, resi, model_serial, source_pdb, rscc in excess_ligands:
-                    f.write(f'{dataset},{chain_id}{resi},{model_serial},{source_pdb},{rscc}')
+                for dataset, chain_id, resi, altloc, model_serial, source_pdb, rscc in excess_ligands:
+                    ligand_label = self._ligand_label(chain_id, resi, altloc)
+                    f.write(f'{dataset},{ligand_label},{model_serial},{source_pdb},{rscc}')
                     f.write('\n')
             print(f'{len(excess_ligands)} excess LIG(s) written to {excess_output}')
 
-        summary_output = self.output_path / 'lig_match_summary.csv'
+        summary_output = self.output_path / 'lig_match_summary_combined.csv'
         with open(summary_output, 'w+') as f:
             f.write('dataset,n_reference_ligs,n_matched,n_unmatched,n_excess')
             f.write('\n')

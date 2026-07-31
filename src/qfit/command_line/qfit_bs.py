@@ -40,6 +40,7 @@ def prepare_qfit_bindingsite(options):
     """Loads files to build a QFitBindingSite job."""
     # Load structure and prepare it
     structure = Structure.fromfile(options.structure).reorder()
+
     if not options.hydro:
         structure = structure.extract("e", "H", "!=")
 

@@ -21,6 +21,9 @@ from qfit.xtal.transformer import get_transformer
 import iotbx.pdb
 
 RSCC_CUTOFF = 0.6
+rmsd_cutoff = 2.0
+VDW_CUTOFF = 0.75
+
 
 
 class _Tee:
@@ -72,10 +75,24 @@ def build_argparser():
         type=float,
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
+    p.add_argument(
+        "--min_cluster_proportion",
+        default=0.1,
+        metavar="<float>",
+        type=float,
+        help="Count filtering: minimum number of member conformers a spatial "
+             "cluster must have to be kept, expressed as a proportion of the "
+             "number of conformers in a single placer_file's coor_set "
+             "(assumed to be the same for every placer_file). e.g. with 100 "
+             "conformers per placer_file, 0.1 means a cluster needs more than "
+             "10 members to be accepted. Runs before RSCC filtering; clusters "
+             "below this are treated as noise and discarded. (default: 0.1)",
+    )
     return p
 
 class Filter():
-    def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder, resolution):
+    def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder, resolution,
+                 min_cluster_proportion=0.1):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.fit_ligand_files = fit_ligand_files
@@ -83,6 +100,13 @@ class Filter():
         self.resolution = resolution
 
         self._rmask = 0.5 + self.resolution / 3.0 #from qfit
+
+        # Count filtering: minimum number of conformers required to support a
+        # spatial cluster for it to be kept, expressed as a proportion of the
+        # number of conformers in a single placer_file's coor_set (assumed to
+        # be the same for every placer_file). Runs before RSCC filtering.
+        self.min_cluster_proportion = min_cluster_proportion
+
         self._load_event_maps()
 
         # print(self.__dict__)
@@ -146,9 +170,12 @@ class Filter():
                 self.binding_site_residues.update({placer_file: self._determineBindingSite(models)})
                 self.base_binding_sites.update({placer_file: self._getBaseBindingSite(placer_file)})
                 self.coor_sets.update({placer_file: self._getBindingSiteConformers(models, placer_file)})
+                print(len(self.coor_sets))
 
                 #convert to density
                 self.scores.update({placer_file: self._convertAndScoreLigand(placer_file)})
+
+            print(self.scores)
 
             # the full set of scored ligand conformers - every (placer_file, index)
             # pair goes straight into clustering, with no top-N subsetting first
@@ -175,8 +202,12 @@ class Filter():
                 return
 
             #spatially cluster the full scored set
+            time0 = time.time()
             self._spatialClustering(all_scored, output_folder)
+            print(f'spatially clustered in {time.time() - time0}')
+            time0 = time.time()
             self._calcRSCCofClusters()
+            print(f'calced RSCC in {time.time() - time0}')
 
             print(f'number of reps before filtering: {len(self.cluster_reps)}')
 
@@ -187,12 +218,40 @@ class Filter():
             self._write_cluster_reps_csv(self.cluster_reps, self.cluster_rsccs, all_cluster_reps_csv)
             print(f'all (unfiltered) cluster reps written to {all_cluster_reps_csv}')
 
+            #snapshot the unfiltered cluster reps/rsccs - covering every raw
+            #cluster produced by _spatialClustering - so we can later work out,
+            #for each cluster, exactly why it either did or didn't make it into
+            #the final filtered set
+            unfiltered_cluster_reps = dict(self.cluster_reps)
+            unfiltered_cluster_rsccs = dict(self.cluster_rsccs)
+
+            #count filtering: drop clusters that are only supported by a small
+            #number of conformers, relative to the number of conformers in a
+            #single placer_file's coor_set (assumed to be the same for every
+            #placer_file). e.g. with the default min_cluster_proportion of 0.1
+            #and 100 conformers per placer_file, a cluster needs more than
+            #0.1 * 100 = 10 members to survive; smaller clusters are treated
+            #as noise. This runs before the RSCC filter.
+            n_per_placer_file = len(next(iter(self.coor_sets.values())))
+
+            filtered_cluster_reps = {}
+            for cluster_id in self.cluster_reps:
+                num_cluster_members = self.cluster_reps[cluster_id][4]
+                if num_cluster_members > n_per_placer_file * self.min_cluster_proportion:
+                    filtered_cluster_reps.update({cluster_id: self.cluster_reps[cluster_id]})
+            self.cluster_reps = filtered_cluster_reps
+            passed_count_ids = set(self.cluster_reps.keys())
+
+            print(f'number of reps after count filtering: {len(self.cluster_reps)}')
+                
+
             #filter cluster_reps by rscc
             rscc_cluster_reps = {}
             for cluster_id in self.cluster_reps:
                 if self.cluster_rsccs[cluster_id] > RSCC_CUTOFF:
                     rscc_cluster_reps.update({cluster_id: self.cluster_reps[cluster_id]})
             self.cluster_reps = rscc_cluster_reps
+            passed_rscc_ids = set(self.cluster_reps.keys())
 
             print(f'number of reps after rscc filtering: {len(self.cluster_reps)}')
 
@@ -215,12 +274,46 @@ class Filter():
 
                     filtered_cluster_reps.update({best_cluster_id: self.cluster_reps[best_cluster_id]})
             self.cluster_reps = filtered_cluster_reps
+            accepted_ids = set(self.cluster_reps.keys())
 
             print(f'number of reps after file filtering: {len(self.cluster_reps)}')
 
-            #output cluster models
+            #filter based on clashes
+            self._filter_clashes()
+
+            cluster_status = {}
+            for cluster_id in unfiltered_cluster_reps:
+                if cluster_id not in passed_count_ids:
+                    cluster_status[cluster_id] = 'failed_count_cutoff'
+                elif cluster_id not in passed_rscc_ids:
+                    cluster_status[cluster_id] = 'failed_rscc_cutoff'
+                elif cluster_id not in accepted_ids:
+                    cluster_status[cluster_id] = 'lost_per_placer_file_dedup'
+                elif cluster_id in self.clash_rejected_ids:
+                    partner_id = self.clash_partners[cluster_id]
+                    partner_placer_file = unfiltered_cluster_reps[partner_id][1]
+                    cluster_status[cluster_id] = (
+                        f'failed_clash_filter (vs {partner_placer_file})'
+                    )
+                else:
+                    cluster_status[cluster_id] = 'accepted'
+
+            #output cluster models - this csv contains only the final,
+            #filtered/accepted cluster representatives
             cluster_summary = output_folder + '/cluster_reps.csv'
             self._write_cluster_reps_csv(self.cluster_reps, self.cluster_rsccs, cluster_summary)
+
+            #write out full clustering information for every input placer model
+            #conformer (every placer_file/index pair that was scored) - not just
+            #the final accepted representatives - so every conformer can be
+            #traced to its cluster, that cluster's representative, and the
+            #reason the cluster was accepted or rejected
+            cluster_members_csv = output_folder + '/cluster_members.csv'
+            self._write_cluster_members_csv(
+                self.clusters, self.scores, unfiltered_cluster_reps,
+                unfiltered_cluster_rsccs, cluster_status, cluster_members_csv
+            )
+            print(f'full cluster membership and rejection reasons written to {cluster_members_csv}')
 
             cluster_models = []
             for cluster_id in self.cluster_reps:
@@ -237,6 +330,93 @@ class Filter():
         finally:
             sys.stdout = original_stdout
             log_file.close()
+
+    def _filter_clashes(self):
+        """
+        Performs pairwise clash detection between every ligand conformer in
+        self.cluster_reps (the current filtered set of cluster
+        representatives - i.e. those that already passed the rscc cutoff and
+        per-placer_file dedup).
+
+        Whenever two cluster reps clash, the one with the lower RSCC
+        (self.cluster_rsccs) is rejected. This is resolved greedily: the
+        remaining rep with the highest RSCC is kept, everything that clashes
+        with it is rejected, and this repeats among what's left - so a
+        rejection by a higher-RSCC neighbor can never be "un-rejected" by a
+        separate pairwise comparison against a lower-RSCC one.
+
+        Two ligand atoms are considered clashing if the distance between them
+        is less than VDW_CUTOFF * (vdw_radius_i + vdw_radius_j). Two ligand
+        conformers clash if any pair of atoms (one from each) clash. All
+        ligand_coor arrays share the same atom ordering, so a single VDW
+        radius list (pulled from any base binding site's ligand) applies to
+        every conformer.
+
+        Records, for every cluster_id that entered this method, whether it
+        was kept or rejected due to clashing:
+        self.clash_rejected_ids : set of cluster_ids dropped because a
+                                    higher-RSCC rep clashed with them
+        self.clash_partners     : cluster_id -> the single kept cluster_id
+                                    that caused its rejection (populated only
+                                    for rejected cluster_ids)
+        """
+        self.clash_rejected_ids = set()
+        self.clash_partners = {}
+
+        if not self.cluster_reps:
+            return
+
+        # VDW radii for the ligand atoms - order matches ligand_coor ordering
+        # since all ligand coordinate sets were reordered to match this same
+        # reference atom order.
+        first_key = list(self.base_binding_sites.keys())[0]
+        ligand = self.base_binding_sites[first_key].extract("resname LIG")
+        vdw_radii = np.asarray(ligand.vdw_radius)
+
+        cluster_ids = list(self.cluster_reps.keys())
+        n = len(cluster_ids)
+        ligand_coors = [self.cluster_reps[cid][3] for cid in cluster_ids]
+
+        # sum of radii for every pair of atoms, scaled by the cutoff -> clash
+        # distance threshold matrix (n_atoms x n_atoms)
+        radii_sum = vdw_radii[:, None] + vdw_radii[None, :]
+        clash_threshold = VDW_CUTOFF * radii_sum
+
+        # build the clash graph: an edge between two cluster reps if ANY pair
+        # of atoms (one from each ligand) is closer than its clash threshold
+        clash_matrix = np.zeros((n, n), dtype=bool)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = ligand_coors[i][:, None, :] - ligand_coors[j][None, :, :]
+                dists = np.linalg.norm(diff, axis=-1)
+                if np.any(dists < clash_threshold):
+                    clash_matrix[i, j] = True
+                    clash_matrix[j, i] = True
+
+        n_clashing_pairs = int(clash_matrix.sum() / 2)
+        print(f'found {n_clashing_pairs} clashing pairs among {n} cluster reps')
+
+        # greedy resolution: repeatedly keep the highest-rscc remaining rep,
+        # reject everything that clashes with it, and continue among the rest
+        remaining = set(range(n))
+        kept_indices = set()
+
+        while remaining:
+            best_i = max(remaining, key=lambda i: self.cluster_rsccs[cluster_ids[i]])
+            kept_indices.add(best_i)
+            remaining.discard(best_i)
+
+            clashing_with_best = [i for i in remaining if clash_matrix[best_i, i]]
+            for i in clashing_with_best:
+                rejected_id = cluster_ids[i]
+                self.clash_rejected_ids.add(rejected_id)
+                self.clash_partners[rejected_id] = cluster_ids[best_i]
+                remaining.discard(i)
+
+        kept_ids = {cluster_ids[i] for i in kept_indices}
+        self.cluster_reps = {cid: self.cluster_reps[cid] for cid in kept_ids}
+
+        print(f'number of reps after clash filtering: {len(self.cluster_reps)}')
 
     def _write_cluster_reps_csv(self, cluster_reps, cluster_rsccs, path):
         """
@@ -258,6 +438,67 @@ class Filter():
 
                 f.write(f'{placer_file},{index},{mse},{cluster_id},{rscc},{num_members}')
                 f.write('\n')
+
+    def _write_cluster_members_csv(self, clusters, scores, cluster_reps, cluster_rsccs, cluster_status, path):
+        """
+        Writes a csv covering every input placer model conformer that was
+        scored (every placer_file/index pair in `scores`), with its cluster
+        assignment and enough information to trace *why* that cluster's
+        representative was accepted or rejected:
+
+          cluster                  : the spatial cluster this conformer belongs to
+          cluster_rep_placer_file,
+          cluster_rep_index        : identifies the model that represents (and
+                                      effectively supersedes) this conformer's
+                                      cluster - i.e. the best-scoring member,
+                                      which is what actually gets carried
+                                      forward into RSCC scoring and filtering
+          cluster_rscc             : the RSCC computed for that representative
+          cluster_status           : 'accepted', 'failed_count_cutoff',
+                                      'failed_rscc_cutoff', or
+                                      'lost_per_placer_file_dedup' - why the
+                                      representative (and therefore every
+                                      member of this cluster) did or didn't
+                                      make it into the final cluster_reps.csv
+
+        Since clustering is run over every scored conformer (all_scored), every
+        row should get a real cluster assignment; the 'not_clustered' fallback
+        below only fires if a conformer was somehow scored but never handed to
+        _spatialClustering.
+
+        `clusters` is self.clusters (cluster_id -> list of
+        (score, placer_file, index, ligand_coor) tuples). `scores` is
+        self.scores (placer_file -> list of mse scores, one per conformer
+        index). `cluster_reps`/`cluster_rsccs` should be the *unfiltered*
+        snapshots covering every raw cluster_id. `cluster_status` maps every
+        raw cluster_id to its final disposition.
+        """
+        cluster_of = {}
+        for cluster_id, members in clusters.items():
+            for score, placer_file, index, ligand_coor in members:
+                cluster_of[(placer_file, index)] = cluster_id
+
+        with open(path, 'w+') as f:
+            f.write('placer_file,index,mse,cluster,cluster_rep_placer_file,'
+                    'cluster_rep_index,cluster_rscc,cluster_status')
+            f.write('\n')
+            for placer_file, score_list in scores.items():
+                for index, mse in enumerate(score_list):
+                    cluster_id = cluster_of.get((placer_file, index), '')
+                    if cluster_id == '':
+                        rep_placer_file = ''
+                        rep_index = ''
+                        rscc = ''
+                        status = 'not_clustered'
+                    else:
+                        rep_placer_file = cluster_reps[cluster_id][1]
+                        rep_index = cluster_reps[cluster_id][2]
+                        rscc = cluster_rsccs[cluster_id]
+                        status = cluster_status[cluster_id]
+
+                    f.write(f'{placer_file},{index},{mse},{cluster_id},{rep_placer_file},'
+                            f'{rep_index},{rscc},{status}')
+                    f.write('\n')
 
     def _calcRSCCofClusters(self):
         self.cluster_rsccs = {}
@@ -293,7 +534,12 @@ class Filter():
             self.cluster_rsccs.update({cluster_id: best_rscc})
         
     def _spatialClustering(self, scored_entries, output_folder):
-        """Spatially clusters ligand conformers based on RMSD.
+        """Spatially clusters ligand conformers based on centroid distance.
+
+        Instead of an all-atom RMSD between ligand conformers, each conformer
+        is reduced to its centroid (the mean position of its ligand atoms),
+        and the pairwise distance matrix used for clustering is simply the
+        Euclidean distance between those centroids.
 
         `scored_entries` is the full list of (score, placer_file, index)
         tuples to cluster - typically every scored conformer from every
@@ -315,21 +561,23 @@ class Filter():
 
         n_entries = len(ligand_coor_sets)
 
-        # build the pairwise RMSD distance matrix between ligand conformers
+        # reduce each ligand conformer to its centroid (mean atom position)
+        centroids = np.array([coor.mean(axis=0) for coor in ligand_coor_sets])
+
+        # build the pairwise centroid-distance matrix between ligand conformers
         dist_matrix = np.zeros((n_entries, n_entries))
         for i in range(n_entries):
             for j in range(i + 1, n_entries):
-                diff = ligand_coor_sets[i] - ligand_coor_sets[j]
-                rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-                dist_matrix[i, j] = rmsd
-                dist_matrix[j, i] = rmsd
+                centroid_dist = np.linalg.norm(centroids[i] - centroids[j])
+                dist_matrix[i, j] = centroid_dist
+                dist_matrix[j, i] = centroid_dist
 
         condensed_dist = squareform(dist_matrix, checks=False)
         linkage_matrix = linkage(condensed_dist, method='average')
 
-        # cut the tree at a 2 A RMSD cutoff: any two leaves are in the same
-        # cluster if the RMSD at which their branches merge is <= 2 A.
-        rmsd_cutoff = 4.0
+        # cut the tree at a 2 A centroid-distance cutoff: any two leaves are in
+        # the same cluster if the centroid distance at which their branches
+        # merge is <= 2 A.
         cluster_ids = fcluster(linkage_matrix, t=rmsd_cutoff, criterion='distance')
         self.cluster_assignments = cluster_ids  # 1-indexed cluster id per entry, same order as entry_labels/entry_provenance
 
@@ -348,8 +596,8 @@ class Filter():
         )
 
         ax.set_xlabel('placer_file, index')
-        ax.set_ylabel('RMSD (\u00c5)')
-        ax.set_title('Hierarchical clustering of ligand conformers (average linkage, RMSD)')
+        ax.set_ylabel('Centroid distance (\u00c5)')
+        ax.set_title('Hierarchical clustering of ligand conformers (average linkage, centroid distance)')
         fig.tight_layout()
         fig.savefig(dendrogram_path, dpi=200)
         plt.close(fig)
@@ -604,7 +852,8 @@ def main():
         fit_ligand_files.append(file)
     fit_ligand_files.sort()
 
-    filter = Filter(args.dataset, placer_files, fit_ligand_files, args.output_folder, args.resolution)
+    filter = Filter(args.dataset, placer_files, fit_ligand_files, args.output_folder,
+                     args.resolution, args.min_cluster_proportion)
     filter.run()
 
 
