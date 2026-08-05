@@ -12,7 +12,7 @@ from qfit.xtal.transformer import get_transformer
 
 import iotbx.pdb
 
-DISTANCE_CUTOFF = 10.0  # Å, from any ligand atom in the multimodel pdb
+CLASH_VDW_SCALE = 0.75  # fraction of summed VDW radii below which two atoms are considered clashing
 
 
 class _Tee:
@@ -53,6 +53,14 @@ def build_argparser():
              'conformations (e.g. cluster_rep_models.pdb as output by filter_all.py)'
     )
     p.add_argument(
+        'apo_structure',
+        type=Path,
+        help='Path to the apo (ligand-free) PANDDA structure. Used as the fallback '
+             'conformation for a residue when no PLACER conformer is '
+             'found for it, or when every PLACER conformer of it clashes with a '
+             'ligand pose in the multimodel pdb.'
+    )
+    p.add_argument(
         'output_folder',
         type=str,
         help='name of the output folder.'
@@ -66,29 +74,31 @@ def build_argparser():
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
     p.add_argument(
-        "--distance_cutoff",
-        default=DISTANCE_CUTOFF,
+        "--clash_vdw_scale",
+        default=CLASH_VDW_SCALE,
         metavar="<float>",
         type=float,
-        help="Distance (Å) from any ligand atom in the multimodel pdb within which a "
-             f"protein residue is included for re-scoring (default: {DISTANCE_CUTOFF})",
+        help="Fraction of the summed VDW radii of two atoms below which they are "
+             f"considered clashing (default: {CLASH_VDW_SCALE})",
     )
     return p
 
 
 class FinalModelBuilder():
-    def __init__(self, dataset_dir, placer_files, multimodel_pdb, output_folder, resolution,
-                 distance_cutoff=DISTANCE_CUTOFF):
+    def __init__(self, dataset_dir, placer_files, multimodel_pdb, apo_structure, output_folder,
+                 resolution, clash_vdw_scale=CLASH_VDW_SCALE):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.multimodel_pdb = multimodel_pdb
+        self.apo_structure = apo_structure
         self.output_folder = output_folder
         self.resolution = resolution
-        self.distance_cutoff = distance_cutoff
+        self.clash_vdw_scale = clash_vdw_scale
 
         self._rmask = 0.5 + self.resolution / 3.0 #from qfit
 
         self._load_event_maps()
+        self._load_apo_structure()
 
         # print(self.__dict__)
 
@@ -106,12 +116,16 @@ class FinalModelBuilder():
             event_map_model.set_space_group("P1")
             self.event_maps_models[event_name] = event_map_model
 
+    def _load_apo_structure(self):
+        self.apo_model = Structure.fromfile(str(self.apo_structure))
+
     def run(self):
         """Rescores the protein binding-site residues around the ligand(s) in a
         multimodel pdb (e.g. filter_all.py's cluster_rep_models.pdb), pooling
         every conformation of each residue across all input placer models, and
-        writes out a single merged structure - the best-scoring conformation of
-        each residue, plus every ligand pose from the multimodel pdb - to
+        writes out a single merged structure - the best-scoring, non-clashing
+        conformation of each residue (falling back to the apo conformation when
+        needed), plus every ligand pose from the multimodel pdb - to
         output_folder/final_model.pdb.
 
         All print() output is mirrored to output_folder/log.txt in addition to
@@ -129,13 +143,22 @@ class FinalModelBuilder():
             self.multimodel_models = Structure.fromfile(str(self.multimodel_pdb)).split_models()
             print(f'{len(self.multimodel_models)} model(s) in multimodel pdb')
 
-            #find every protein residue within distance_cutoff of any ligand atom,
-            #pooled across every model in the multimodel pdb
+            #pool every ligand pose's atoms across every model of the multimodel pdb;
+            #every one of these poses ends up in the final model together, so a
+            #candidate protein residue conformation has to be clash-checked against
+            #all of them, not just the pose from its own model
+            self._gatherLigandAtoms()
+
+            #find every protein residue in the apo structure. A residue only
+            #actually goes through scoring/clash-checking below if PLACER
+            #produced at least one conformer of it (see _gatherResidueConformers
+            #/ _scoreAndSelectBest); residues with no PLACER conformer are
+            #included here too so they end up in the final model, taken
+            #directly from the apo structure.
             time0 = time.time()
-            self.binding_site_residues = self._determineBindingSiteByDistance(self.multimodel_models)
-            n_residues = sum(len(res_nums) for res_nums in self.binding_site_residues.values())
-            print(f'found {n_residues} binding site residue(s) within {self.distance_cutoff} '
-                  f'\u00c5 of any ligand pose in {time.time() - time0:.2f}s')
+            self.all_residues = self._determineAllResidues()
+            n_residues = sum(len(res_nums) for res_nums in self.all_residues.values())
+            print(f'found {n_residues} residue(s) in the apo structure in {time.time() - time0:.2f}s')
 
             #resolve placer files
             placer_files = sorted(glob.glob(self.placer_files))
@@ -144,25 +167,28 @@ class FinalModelBuilder():
                 print('No placer files found; nothing to rescore.')
                 return
 
-            #gather every conformation of each binding site residue across every
-            #model of every placer file
+            #gather every conformation of each residue across every model of
+            #every placer file
             time0 = time.time()
             self.residue_templates, self.residue_conformers = self._gatherResidueConformers(placer_files)
             print(f'gathered residue conformers in {time.time() - time0:.2f}s')
 
-            #flag (not an error - just something to monitor) any binding site
-            #residue that wasn't found in ANY placer file at all. A residue
+            #flag (not an error - just something to monitor) any residue
+            #that wasn't found in ANY placer file at all. A residue
             #missing from *some* placer files is expected and fine; we only
-            #need conformations from the ones that do have it.
+            #need conformations from the ones that do have it. These residues
+            #fall back to their apo conformation (see _scoreAndSelectBest).
             missing_residues = [key for key, conformers in self.residue_conformers.items()
                                  if not conformers]
             if missing_residues:
                 missing_str = ', '.join(f'{chain_id}{res_num}' for chain_id, res_num in missing_residues)
-                print(f'FLAG: {len(missing_residues)} binding site residue(s) had no conformers in '
+                print(f'FLAG: {len(missing_residues)} residue(s) had no conformers in '
                       f'any placer file (not a dealbreaker, just flagging for awareness): {missing_str}')
 
             #score every conformer of every residue (pooled mask per residue, max
-            #across event maps) and keep the single best-scoring conformer per residue
+            #across event maps), reject any that clash with a ligand pose from the
+            #multimodel pdb, and keep the single best-scoring non-clashing conformer
+            #per residue - falling back to the apo conformation if none qualify
             time0 = time.time()
             self.best_conformers = self._scoreAndSelectBest(output_folder)
             print(f'scored and selected best conformers in {time.time() - time0:.2f}s')
@@ -191,60 +217,99 @@ class FinalModelBuilder():
                         records.append((chain_id, res_num, resname, np.array(atom.xyz)))
         return records
 
-    def _determineBindingSiteByDistance(self, models):
-        """Finds every protein residue (chain_id, res_num) with at least one atom
-        within self.distance_cutoff \u00c5 of any LIG atom, pooled across every
-        model in the multimodel pdb - so a residue near the ligand in *any*
-        cluster rep is included, even if it isn't near the ligand in every rep.
+    def _determineAllResidues(self):
+        """Returns {chain_id: sorted [res_nums]} for every protein residue found
+        in the apo structure. This is the full set of residues that need to end
+        up in the final model - either from a PLACER conformer (if one was
+        found for it) or, if not, taken directly from the apo structure (see
+        _scoreAndSelectBest).
         """
-        residues_in_binding_site = {}
+        residues = {}
+        for chain_id, res_num, resname, _ in self._get_atom_records(self.apo_model):
+            residues.setdefault(chain_id, set()).add(res_num)
 
-        for model in models:
-            records = self._get_atom_records(model)
-            ligand_coors = np.array([xyz for (_, _, resname, xyz) in records if resname == 'LIG'])
-            if ligand_coors.shape[0] == 0:
+        return {chain_id: sorted(res_nums) for chain_id, res_nums in residues.items()}
+
+    def _gatherLigandAtoms(self):
+        """Pools the coordinates and VDW radii of every ligand atom, across every
+        model of the multimodel pdb, into flat arrays used for clash-checking
+        candidate protein residue conformations (see _clashesWithLigands). Every
+        one of these ligand poses is kept in the final model (see
+        _buildFinalModel), so a candidate has to be checked against all of them.
+        """
+        coords = []
+        radii = []
+        for model in self.multimodel_models:
+            ligand = model.extract('resname LIG')
+            if ligand.natoms == 0:
                 continue
+            coords.append(np.asarray(ligand.coor))
+            radii.append(np.asarray(ligand.vdw_radius))
 
-            for chain_id, res_num, resname, xyz in records:
-                if resname == 'LIG':
-                    continue
+        if coords:
+            self.ligand_coords = np.concatenate(coords, axis=0)
+            self.ligand_vdw_radii = np.concatenate(radii, axis=0)
+        else:
+            self.ligand_coords = np.zeros((0, 3))
+            self.ligand_vdw_radii = np.zeros((0,))
 
-                dists = np.linalg.norm(ligand_coors - xyz, axis=1)
-                if np.any(dists < self.distance_cutoff):
-                    residues_in_binding_site.setdefault(chain_id, set()).add(res_num)
+    def _clashesWithLigands(self, template, coor):
+        """Returns True if placing `template`'s atoms at coordinates `coor` would
+        put any atom within self.clash_vdw_scale * (sum of the two atoms' VDW
+        radii) of any ligand atom pooled from the multimodel pdb (see
+        _gatherLigandAtoms).
+        """
+        if self.ligand_coords.shape[0] == 0:
+            return False
 
-        return {chain_id: sorted(res_nums) for chain_id, res_nums in residues_in_binding_site.items()}
+        residue_vdw = np.asarray(template.vdw_radius)
+        diff = coor[:, None, :] - self.ligand_coords[None, :, :]
+        dists = np.linalg.norm(diff, axis=-1)
+        radii_sum = residue_vdw[:, None] + self.ligand_vdw_radii[None, :]
+        clash_threshold = self.clash_vdw_scale * radii_sum
+
+        return bool(np.any(dists < clash_threshold))
+
+    def _get_apo_residue(self, chain_id, res_num):
+        """Extracts (chain_id, res_num) from the apo structure. Returns
+        (coor, structure) or (None, None) if the apo structure doesn't have
+        that residue."""
+        residue = self.apo_model.extract(f'chain {chain_id} and resid {res_num}')
+        if residue.natoms == 0:
+            return None, None
+        return residue.coor, residue
 
     def _gatherResidueConformers(self, placer_files):
-        """For every residue in self.binding_site_residues, gathers every
+        """For every residue in self.all_residues, gathers every
         conformation of that residue found across every model of every input
         placer file. A residue absent from a given placer model is simply
         skipped for that model (no fallback structure is used here).
 
         Returns:
-          residue_templates  : {(chain_id, res_num): Structure} - the first
-                                occurrence of that residue found (in the
-                                multimodel pdb, falling back to the first
-                                placer conformer), used as the atom-identity
-                                template when scoring and when building the
+          residue_templates  : {(chain_id, res_num): Structure} - the apo
+                                structure's own copy of that residue. The apo
+                                structure is guaranteed to have every residue
+                                in self.all_residues (that's where it was
+                                enumerated from), and its atom identity/count
+                                will always match every PLACER conformer, so
+                                it's used as the single canonical template for
+                                scoring, clash-checking, and building the
                                 final model.
           residue_conformers : {(chain_id, res_num): [(coor, placer_file, model_idx), ...]}
         """
         residue_conformers = {}
         residue_templates = {}
 
-        for chain_id, res_nums in self.binding_site_residues.items():
+        for chain_id, res_nums in self.all_residues.items():
             for res_num in res_nums:
                 residue_conformers[(chain_id, res_num)] = []
 
-                #prefer the multimodel pdb's own copy of this residue as the template
-                template = None
-                for model in self.multimodel_models:
-                    candidate = model.extract(f'chain {chain_id} and resid {res_num}')
-                    if candidate.natoms > 0:
-                        template = candidate
-                        break
-                residue_templates[(chain_id, res_num)] = template
+                _, apo_template = self._get_apo_residue(chain_id, res_num)
+                if apo_template is None:
+                    print(f'WARNING: {chain_id}{res_num} was found while enumerating apo '
+                          f'residues but could not be re-extracted from the apo structure; '
+                          f'this should not happen')
+                residue_templates[(chain_id, res_num)] = apo_template
 
         for placer_file in placer_files:
             print(placer_file)
@@ -255,11 +320,6 @@ class FinalModelBuilder():
                     residue = model.extract(f'chain {chain_id} and resid {res_num}')
                     if residue.natoms == 0:
                         continue
-
-                    #fall back to the first placer conformer as the template if
-                    #this residue was somehow absent from the multimodel pdb itself
-                    if residue_templates[(chain_id, res_num)] is None:
-                        residue_templates[(chain_id, res_num)] = residue
 
                     residue_conformers[(chain_id, res_num)].append(
                         (residue.coor, placer_file, model_idx)
@@ -298,36 +358,81 @@ class FinalModelBuilder():
         return [max(scores) for scores in per_conformer_scores]
 
     def _scoreAndSelectBest(self, output_folder):
-        """For every binding site residue, scores every gathered conformer (see
-        _scoreResidueConformers) and keeps the single best-scoring conformer.
+        """For every residue: scores every gathered conformer (see
+        _scoreResidueConformers), and - in descending score order - keeps the
+        first conformer that doesn't clash with any ligand pose from the
+        multimodel pdb (see _clashesWithLigands). If every conformer clashes,
+        or no conformer was ever found for the residue, falls back to the apo
+        structure's conformation of that residue and prints a message saying so.
+
+        Also writes two CSVs to output_folder:
+          - residue_scores.csv: unchanged, one row per residue that had at
+            least one PLACER conformer and had a conformer selected from among
+            them (i.e. excludes apo fallbacks).
+          - residues_with_placer_conformers.csv (new, additional - does not
+            replace residue_scores.csv): a plain list of every residue
+            ("{chain}{resnum}", one per line, no header) that had at least one
+            PLACER conformer, regardless of whether that conformer ended up
+            clashing and falling back to apo.
 
         Returns: {(chain_id, res_num): (best_coor, best_rscc, template)}
+        best_rscc is None for residues that fell back to the apo conformation.
         """
         best_conformers = {}
         summary_rows = []
+        residues_with_conformers = []
 
         for (chain_id, res_num), conformers in self.residue_conformers.items():
-            if not conformers:
-                # already flagged in run(); nothing to score for this residue
+            template = self.residue_templates[(chain_id, res_num)]
+
+            if template is None:
+                # already warned about in _gatherResidueConformers; nothing to
+                # score, clash-check, or fall back to for this residue
+                print(f'WARNING: {chain_id}{res_num} has no template (apo extraction '
+                      f'failed); omitting it from the final model')
                 continue
 
-            template = self.residue_templates[(chain_id, res_num)]
+            if not conformers:
+                # already flagged in run(); fall back to the apo conformation.
+                # template is itself the apo structure's residue, so its own
+                # (unmodified) coordinates ARE the apo conformation.
+                best_conformers[(chain_id, res_num)] = (template.coor, None, template)
+                continue
+
+            residues_with_conformers.append((chain_id, res_num))
+
             coor_list = [c[0] for c in conformers]
+            scores = self._scoreResidueConformers(template, coor_list)
 
-            best_per_conformer = self._scoreResidueConformers(template, coor_list)
+            # try conformers best-scoring first, skipping any that clash with a
+            # ligand pose from the multimodel pdb
+            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            chosen_idx = None
+            for idx in order:
+                if not self._clashesWithLigands(template, coor_list[idx]):
+                    chosen_idx = idx
+                    break
 
-            best_idx = int(np.argmax(best_per_conformer))
-            best_rscc = best_per_conformer[best_idx]
-            best_coor, best_placer_file, best_model_idx = conformers[best_idx]
+            if chosen_idx is not None:
+                best_coor, best_placer_file, best_model_idx = conformers[chosen_idx]
+                best_rscc = scores[chosen_idx]
 
-            best_conformers[(chain_id, res_num)] = (best_coor, best_rscc, template)
-            summary_rows.append((chain_id, res_num, len(conformers), best_rscc,
-                                  best_placer_file, best_model_idx))
+                best_conformers[(chain_id, res_num)] = (best_coor, best_rscc, template)
+                summary_rows.append((chain_id, res_num, len(conformers), best_rscc,
+                                      best_placer_file, best_model_idx))
 
-            print(f'{chain_id}{res_num}: best rscc {best_rscc:.4f} from {best_placer_file} '
-                  f'model {best_model_idx} (of {len(conformers)} conformer(s))')
+                print(f'{chain_id}{res_num}: best rscc {best_rscc:.4f} from {best_placer_file} '
+                      f'model {best_model_idx} (of {len(conformers)} conformer(s))')
+            else:
+                print(f'{chain_id}{res_num}: all {len(conformers)} conformer(s) clashed with a '
+                      f'ligand pose in the multimodel pdb; a non-clashing conformer could not be '
+                      f'found, falling back to apo conformation')
+                best_conformers[(chain_id, res_num)] = (template.coor, None, template)
 
         self._write_residue_scores_csv(summary_rows, output_folder + '/residue_scores.csv')
+        self._write_residue_conformer_list_csv(
+            residues_with_conformers, output_folder + '/residues_with_placer_conformers.csv'
+        )
 
         return best_conformers
 
@@ -338,6 +443,16 @@ class FinalModelBuilder():
             for chain_id, res_num, num_conformers, best_rscc, best_placer_file, best_model_idx in rows:
                 f.write(f'{chain_id},{res_num},{num_conformers},{best_rscc},'
                         f'{best_placer_file},{best_model_idx}')
+                f.write('\n')
+
+    def _write_residue_conformer_list_csv(self, residues, path):
+        """Writes a plain, headerless list of "{chain}{resnum}" (e.g. "A101"),
+        one per line, for every residue that had at least one PLACER conformer.
+        This is additional to residue_scores.csv, not a replacement for it.
+        """
+        with open(path, 'w+') as f:
+            for chain_id, res_num in sorted(residues):
+                f.write(f'{chain_id}{res_num}')
                 f.write('\n')
 
     def _set_resi(self, structure, resi):
@@ -361,23 +476,25 @@ class FinalModelBuilder():
             seen.add(id(residue_group))
 
     def _buildFinalModel(self):
-        """Merges the best-scoring conformation of every binding site residue
-        with every ligand pose found in the multimodel pdb into a single
-        Structure."""
-        final_model = None
+        """Merges the best-scoring (or apo-fallback) conformation of every
+        residue with every ligand pose found in the multimodel pdb into a
+        single Structure, combined in chain/residue-number order so
+        final_model.pdb reads out sorted rather than in whatever order
+        residues and ligands happened to be processed in."""
+        pieces = []
 
-        #best-scoring protein residue conformations
+        #best-scoring (or apo-fallback) protein residue conformations
         for (chain_id, res_num), (best_coor, best_rscc, template) in self.best_conformers.items():
             residue_model = template.copy()
             residue_model.coor = best_coor
             residue_model.b = 20
 
-            final_model = residue_model if final_model is None else final_model.combine(residue_model)
+            pieces.append((chain_id, res_num, residue_model))
 
         #every ligand pose from the multimodel pdb, kept in its original chain
         #but renumbered so its residue number equals the (1-indexed) model
-        #number it came from in the multimodel pdb - preserving a strict
-        #correspondence between each ligand in final_model.pdb and the
+        #number/position it came from in the multimodel pdb - preserving a
+        #strict correspondence between each ligand in final_model.pdb and the
         #MODEL record it was pulled from in cluster_rep_models.pdb
         for model_number, model in enumerate(self.multimodel_models, start=1):
             ligand = model.extract('resname LIG')
@@ -387,7 +504,15 @@ class FinalModelBuilder():
             ligand = ligand.copy()
             self._set_resi(ligand, model_number)
 
-            final_model = ligand if final_model is None else final_model.combine(ligand)
+            ligand_chain_id = self._get_atom_records(ligand)[0][0]
+            pieces.append((ligand_chain_id, model_number, ligand))
+
+        #sort by (chain_id, res_num) and combine in that order
+        pieces.sort(key=lambda piece: (piece[0], piece[1]))
+
+        final_model = None
+        for _, _, structure in pieces:
+            final_model = structure if final_model is None else final_model.combine(structure)
 
         return final_model
 
@@ -402,9 +527,9 @@ class FinalModelBuilder():
 def main():
     p = build_argparser()
     args = p.parse_args()
-
     builder = FinalModelBuilder(args.dataset, args.placer_files, args.multimodel_pdb,
-                                 args.output_folder, args.resolution, args.distance_cutoff)
+                                 args.apo_structure, args.output_folder, args.resolution,
+                                 args.clash_vdw_scale)
     builder.run()
 
 
