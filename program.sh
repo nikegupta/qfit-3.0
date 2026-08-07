@@ -56,6 +56,12 @@
 # check; it doesn't affect stage 0's per-dataset apo/reference RSCC caching
 # (those csvs aren't run-name-scoped) or stage 7's precondition that stage
 # 6's output must already be complete before analysis runs.
+#
+# Dataset scoping: by default every stage runs over every dataset listed in
+# DATASETS_FILE (datasets.txt). Pass --dataset <id[,id...]> to restrict the
+# entire invocation (all stages) to just the given dataset(s) instead -
+# DATASETS_FILE is repointed at a generated temp file listing only those
+# datasets before any stage runs.
 
 set -uo pipefail
 
@@ -63,6 +69,7 @@ usage() {
     cat <<EOF
 Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name]]]]]
            [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>] [-c] [--overwrite]
+           [--dataset <id[,id...]>]
            [--z_threshold <float>] [--num_peaks <int>]
            [--f1_filter_proportion <float>] [--f1_min_cluster_proportion <float>]
            [--f1_rscc_cutoff <float>] [--f1_clustering_mode <all-atom|centroid>]
@@ -94,6 +101,11 @@ Options:
                             (normally such a stage is skipped - see "Idempotency" in the header
                             comment). Does not affect stage 0's per-dataset apo/reference RSCC
                             caching or stage 7's precondition that stage 6 already be complete.
+  --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
+                            (e.g. x00001-1 or x00001-1,x00002-1), instead of every dataset
+                            listed in DATASETS_FILE (datasets.txt). Every dataset given must
+                            already have a directory under DATASETS_DIR. Applies to every
+                            stage (0-7) for the whole invocation.
   --z_threshold <float>            fit_ligand -z/--z_threshold: Z-score threshold for peak
                                     detection (stage 1a). Default (unset): fit_ligand's own
                                     default (4).
@@ -122,24 +134,26 @@ Examples:
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 -c
   $0 run_1 placer_1 filter_1 --z_threshold 5 --num_peaks 50
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 --f1_rscc_cutoff 0.5 --f2_rscc_cutoff 0.7
+  $0 run_1 placer_1 filter_1 --dataset x00001-1
+  $0 run_1 placer_1 filter_1 --dataset x00001-1,x00002-1,x00003-1
 EOF
     exit 1
 }
 
 # --- User-specified configuration: edit these for your environment ---
-BASE_DIR="/home/ngupta/main/program_claude"
+BASE_DIR="/home/ngupta/main/program"
 CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 LIG_PDB_DIR="${BASE_DIR}/pdb_final_geometry"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV_QFIT="qfit_bs"
+CONDA_ENV_QFIT="nikhils_program"
 CONDA_ENV_PLACER="placer_env"
-CONDA_ENV_RSR="rsr"
-CONDA_ENV_EVAL="biotite"
+CONDA_ENV_RSR="nikhils_program"
+CONDA_ENV_EVAL="nikhils_program"
 RUN_PLACER_PY="/home/ngupta/PLACER/PLACER/run_PLACER.py"
 DATASETS_DIR="${BASE_DIR}/datasets"
 DATASETS_FILE="${BASE_DIR}/datasets.txt"
-RSR_SCRIPTS_DIR="${BASE_DIR}/rsr_scripts"
-ANALYSIS_SCRIPTS_DIR="${BASE_DIR}/analysis_scripts"
+RSR_SCRIPTS_DIR="${BASE_DIR}/qfit-3.0/rsr_scripts"
+ANALYSIS_SCRIPTS_DIR="${BASE_DIR}/qfit-3.0/analysis_scripts"
 GRAPHS_DIR="${BASE_DIR}/graphs"
 
 # Only used when -c is given: reference_set/<dataset>/ subfolders (one per
@@ -200,6 +214,13 @@ num_parallel=""
 compare_ref_set=0
 overwrite=0
 
+# --dataset <id[,id...]>: run only on this subset of datasets instead of
+# reading DATASETS_FILE. dataset_arg holds the raw CLI value; if set, it's
+# expanded into DATASET_OVERRIDE_FILE (a generated temp file, one dataset
+# per line) which DATASETS_FILE is then repointed to - see below.
+dataset_arg=""
+DATASET_OVERRIDE_FILE=""
+
 # fit_ligand tunables (stage 1a). Left empty by default so fit_ligand's own
 # argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100) apply; only
 # passed through when explicitly set here.
@@ -247,6 +268,10 @@ while [[ $# -gt 0 ]]; do
         --overwrite)
             overwrite=1
             shift
+            ;;
+        --dataset)
+            dataset_arg="$2"
+            shift 2
             ;;
         --z_threshold)
             z_threshold="$2"
@@ -335,6 +360,48 @@ if [ "$compare_ref_set" -eq 1 ] && [ ! -d "$REF_SET" ]; then
     exit 1
 fi
 
+# --dataset override: repoint DATASETS_FILE at a generated temp file listing
+# just the requested dataset(s), instead of the full DATASETS_FILE. Every
+# stage below reads datasets exclusively via $DATASETS_FILE, so this alone
+# scopes the whole run.
+if [ -n "$dataset_arg" ]; then
+    DATASET_OVERRIDE_FILE=$(mktemp)
+    IFS=',' read -ra _cli_datasets <<< "$dataset_arg"
+    for _cli_dataset in "${_cli_datasets[@]}"; do
+        _cli_dataset="$(echo -n "$_cli_dataset" | xargs)"
+        [ -z "$_cli_dataset" ] && continue
+        if [ ! -d "${DATASETS_DIR}/${_cli_dataset}" ]; then
+            echo "Error: --dataset given but dataset directory not found: ${DATASETS_DIR}/${_cli_dataset}" >&2
+            exit 1
+        fi
+        echo "$_cli_dataset" >> "$DATASET_OVERRIDE_FILE"
+    done
+    unset _cli_datasets _cli_dataset
+
+    if [ ! -s "$DATASET_OVERRIDE_FILE" ]; then
+        echo "Error: --dataset given but no valid dataset IDs were parsed from '${dataset_arg}'" >&2
+        exit 1
+    fi
+
+    DATASETS_FILE="$DATASET_OVERRIDE_FILE"
+    echo "--dataset given: restricting run to $(tr '\n' ' ' < "$DATASETS_FILE")"
+fi
+
+# Canonical, in-memory list of datasets for this run - read from
+# DATASETS_FILE exactly once, here (whichever it currently points to:
+# datasets.txt by default, or the --dataset override above). Every stage
+# that enumerates datasets directly in this shell (stage_complete, do_placer,
+# do_placer2, and every parallel-driving do_* function below) iterates this
+# array instead of separately re-reading DATASETS_FILE or - as do_placer2
+# previously did - deriving its own list some other way. That means
+# overriding DATASETS_FILE (e.g. via --dataset) above is guaranteed to scope
+# every stage consistently, since they all read from this one array.
+mapfile -t DATASETS < <(grep -v '^[[:space:]]*$' "$DATASETS_FILE")
+if [ ${#DATASETS[@]} -eq 0 ]; then
+    echo "Error: no datasets found in ${DATASETS_FILE}" >&2
+    exit 1
+fi
+
 NUM_PARALLEL_DEFAULT=${num_parallel:-1}
 
 IFS=',' read -ra GPU_IDS_ARR <<< "$gpu_ids"
@@ -365,7 +432,7 @@ export RUN_PLACER_PY
 # CSV_FILE and reused by every stage that needs it (fit_ligand, filter,
 # filter2, build_final, calc_backbone_refined_rscc, calc_final_refined_rscc). ---
 LOOKUP_FILE=$(mktemp)
-trap 'rm -f "$LOOKUP_FILE"' EXIT
+trap 'rm -f "$LOOKUP_FILE" "$DATASET_OVERRIDE_FILE"' EXIT
 tail -n +2 "$CSV_FILE" | while IFS=',' read -r dataset resolution ligand_name; do
     dataset="${dataset//$'\r'/}"
     resolution="${resolution//$'\r'/}"
@@ -403,12 +470,11 @@ export -f get_lig_id
 stage_complete() {
     local rel_path="$1"
     local dataset
-    while IFS= read -r dataset; do
-        [ -z "$dataset" ] && continue
+    for dataset in "${DATASETS[@]}"; do
         if [ ! -d "${DATASETS_DIR}/${dataset}/${rel_path}" ]; then
             return 1
         fi
-    done < "$DATASETS_FILE"
+    done
     return 0
 }
 
@@ -430,7 +496,9 @@ should_skip_stage() {
 run_step() {
     local desc="$1"
     shift
-    echo "=== ${desc} ==="
+    echo ""
+    echo ""
+    echo "========= ${desc} ========="
     "$@"
     local status=$?
     if [ $status -ne 0 ]; then
@@ -445,18 +513,25 @@ run_step() {
 # (ADDR2LINE, etc.) without defaults. Those hooks are fine under an
 # interactive shell (no `set -u`) but abort this script's `set -uo
 # pipefail`. Temporarily relax nounset just for the source/activate calls.
+#
+# Some packages (e.g. coot-headless) also install activate.d/deactivate.d
+# hooks that unconditionally `echo` every variable they set/unset
+# ("COOT_PREFIX set to ...", "COOT_PREFIX unset", etc). With this script
+# activating/deactivating envs once per dataset (many times per run), that
+# floods stdout, so hook stdout is discarded here; stderr is left alone so
+# real hook errors still surface.
 conda_activate() {
     set +u
     source "$CONDA_SH"
-    conda activate "$1"
+    conda activate "$1" > /dev/null
     set -u
 }
 
-# conda_deactivate: same nounset relaxation as conda_activate, for
-# deactivate.d hooks that restore saved variables.
+# conda_deactivate: same nounset relaxation and stdout suppression as
+# conda_activate, for deactivate.d hooks that restore saved variables.
 conda_deactivate() {
     set +u
-    conda deactivate
+    conda deactivate > /dev/null
     set -u
 }
 export -f conda_activate conda_deactivate
@@ -558,7 +633,7 @@ do_calc_apo_rscc() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_apo_rscc_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_apo_rscc_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -630,7 +705,7 @@ do_calc_ref_set_rscc() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_ref_set_rscc_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_ref_set_rscc_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -709,7 +784,7 @@ export -f fit_ligand_process_dataset
 do_fit_ligand() {
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" fit_ligand_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" fit_ligand_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -768,7 +843,7 @@ placer_process_dataset() {
 
     export CUDA_VISIBLE_DEVICES=$gpu_id
 
-    echo "=== Dataset: ${dataset} (GPU ${gpu_id}) ==="
+    echo "========= Dataset: ${dataset} (GPU ${gpu_id}) ========="
 
     local dataset_dir="${DATASETS_DIR}/${dataset}"
     local run_dir="${dataset_dir}/${run_name}"
@@ -825,12 +900,11 @@ do_placer() {
     local start_time=$(date +%s)
 
     local idx=0
-    while IFS= read -r dataset; do
-        [ -z "$dataset" ] && continue
+    for dataset in "${DATASETS[@]}"; do
         local gpu_id=${GPU_IDS_ARR[$((idx % NUM_GPUS))]}
         echo "${dataset} ${gpu_id}"
         idx=$((idx + 1))
-    done < "$DATASETS_FILE" | parallel -j "$NUM_GPUS" --line-buffer --colsep ' ' placer_process_dataset {1} {2}
+    done | parallel -j "$NUM_GPUS" --line-buffer --colsep ' ' placer_process_dataset {1} {2}
 
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -942,7 +1016,7 @@ export -f rsr_placer_process_dataset
 do_rsr_placer() {
     echo "Starting RSR run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_placer_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_placer_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1103,7 +1177,7 @@ do_filter() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" filter_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" filter_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1234,7 +1308,7 @@ do_rsr_backbone() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_backbone_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_backbone_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 
@@ -1298,7 +1372,7 @@ do_calc_backbone_rscc() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_backbone_refined_rscc_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_backbone_refined_rscc_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1350,7 +1424,7 @@ placer2_process_dataset() {
 
     export CUDA_VISIBLE_DEVICES=$gpu_id
 
-    echo "=== Dataset: ${dataset} (GPU ${gpu_id}) ==="
+    echo "========= Dataset: ${dataset} (GPU ${gpu_id}) ========="
 
     local dataset_dir="${DATASETS_DIR}/${dataset}"
     local filter_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}"
@@ -1463,9 +1537,7 @@ do_placer2() {
     local start_time=$(date +%s)
 
     local idx=0
-    for folder in "${DATASETS_DIR}"/*/; do
-        local dataset
-        dataset=$(basename "${folder%/}")
+    for dataset in "${DATASETS[@]}"; do
         local gpu_id=${GPU_IDS_ARR[$((idx % NUM_GPUS))]}
         echo "${dataset} ${gpu_id}"
         idx=$((idx + 1))
@@ -1616,7 +1688,7 @@ export -f rsr_placer2_process_dataset
 do_rsr_placer2() {
     echo "Starting RSR run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_placer2_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_placer2_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1803,7 +1875,7 @@ do_filter2() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" filter2_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" filter2_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1880,7 +1952,7 @@ do_build_final() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" build_final_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" build_final_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -2005,7 +2077,7 @@ do_rsr_final() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_final_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_final_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 
@@ -2066,7 +2138,7 @@ do_calc_final_rscc() {
 
     echo "Starting run"
     local start_time=$(date +%s)
-    cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_final_refined_rscc_process_dataset {}
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_final_refined_rscc_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -2287,6 +2359,6 @@ elapsed=$((overall_end - overall_start))
 hours=$((elapsed / 3600))
 minutes=$(((elapsed % 3600) / 60))
 seconds=$((elapsed % 60))
-echo "=== program.sh complete ==="
+echo "========= program.sh complete ========="
 printf "Total time: %02d:%02d:%02d (HH:MM:SS)\n" $hours $minutes $seconds
 
