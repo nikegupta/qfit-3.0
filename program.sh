@@ -8,13 +8,20 @@
 #   0. calc_apo_rscc                    -> <dataset>/<dataset>-aligned-structure_rscc.csv
 #      + calc_ref_set_rscc (only with -c) -> REF_SET/<dataset>/<REF_SET_PDB_PATTERN%.pdb>_rscc.csv
 #   1. fit_ligand                       -> <run_name>/
+#      + plot_fit_ligand_counts (always) -> GRAPHS_DIR/<run_name>/
+#      + (only with -c) centroid_rmsd_all -> GRAPHS_DIR/<run_name>/
 #   2. placer + rsr_placer              -> <run_name>/<placer_run_name>/
+#      + (only with -c) calc_placer_sampling (refined + unrefined)
+#                                        -> GRAPHS_DIR/<run_name>/<placer_run_name>/
 #   3. filter + rsr_backbone
 #      + calc_backbone_refined_rscc     -> .../<filter_run_name>/
 #      + (only with -c) plot_lig_vs_ref_filter1, plot_residues_vs_ref_backbone
 #                                        -> GRAPHS_DIR/<run_name>/.../<filter_run_name>/
 #   4. placer2 + rsr_placer2            -> .../<placer2_run_name>/
-#   5. filter2                          -> .../<filter2_run_name>/
+#      + (only with -c) calc_placer_sampling (refined + unrefined)
+#                                        -> GRAPHS_DIR/<run_name>/.../<placer2_run_name>/
+#   5. filter2 (runs the same `filter` script as stage 3, not `filter_all`)
+#                                        -> .../<filter2_run_name>/
 #      + (only with -c) plot_lig_vs_ref_filter2
 #                                        -> GRAPHS_DIR/<run_name>/.../<filter2_run_name>/
 #   6. build_final + rsr_final
@@ -24,6 +31,7 @@
 #   7. analysis_scripts/*.py            -> .../<final_run_name>/graphs/
 #      (cluster-rep and per-residue RSCC plots, computed independently per
 #      dataset only runs once <final_run_name> is given and stage 6's output exists for every dataset)
+#
 #
 #
 # Modularity: pass only as many of the six run-name arguments as you want to
@@ -42,14 +50,26 @@
 # associated RSR/RSCC sub-steps) is skipped entirely so previous runs are
 # never overwritten. If you want to redo a stage, use a new *_run_name for
 # it (and everything downstream will naturally run fresh too, since its
-# nested path is new).
+# nested path is new) - or pass --overwrite to force every requested stage's
+# main sub-steps to re-run in place under the *_run_name(s) given, even if
+# their output already exists. --overwrite only affects this skip-if-exists
+# check; it doesn't affect stage 0's per-dataset apo/reference RSCC caching
+# (those csvs aren't run-name-scoped) or stage 7's precondition that stage
+# 6's output must already be complete before analysis runs.
 
 set -uo pipefail
 
 usage() {
     cat <<EOF
 Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name]]]]]
-           [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>] [-c]
+           [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>] [-c] [--overwrite]
+           [--z_threshold <float>] [--num_peaks <int>]
+           [--f1_filter_proportion <float>] [--f1_min_cluster_proportion <float>]
+           [--f1_rscc_cutoff <float>] [--f1_clustering_mode <all-atom|centroid>]
+           [--f1_clustering_cutoff <float>]
+           [--f2_filter_proportion <float>] [--f2_min_cluster_proportion <float>]
+           [--f2_rscc_cutoff <float>] [--f2_clustering_mode <all-atom|centroid>]
+           [--f2_clustering_cutoff <float>]
 
 Only <run_name> is required. Supplying fewer than all six names runs only
 that many stages of the pipeline (see header comment for the stage list).
@@ -64,13 +84,44 @@ Options:
   -c                       Also compare results to the reference set (REF_SET). Runs
                             calc_ref_set_rscc as stage 0b: per dataset, computes RSCC of
                             REF_SET/<dataset>/<REF_SET_PDB_PATTERN>, skipping any dataset whose
-                            output csv already exists.
+                            output csv already exists. Also runs pooled (cross-dataset)
+                            ligand/residue comparison plots into GRAPHS_DIR after stages
+                            1 (centroid_rmsd_all), 2 and 4 (calc_placer_sampling, refined
+                            + unrefined), 3 (plot_lig_vs_ref_filter1, plot_residues_vs_ref_backbone),
+                            5 (plot_lig_vs_ref_filter2), and 6 (plot_residues_vs_ref_final).
+  --overwrite              Force every requested stage's main sub-steps to re-run in place,
+                            even if their output directory already exists for all datasets
+                            (normally such a stage is skipped - see "Idempotency" in the header
+                            comment). Does not affect stage 0's per-dataset apo/reference RSCC
+                            caching or stage 7's precondition that stage 6 already be complete.
+  --z_threshold <float>            fit_ligand -z/--z_threshold: Z-score threshold for peak
+                                    detection (stage 1a). Default (unset): fit_ligand's own
+                                    default (4).
+  --num_peaks <int>                fit_ligand -n/--num_peaks: number of peaks to find (stage 1a).
+                                    Default (unset): fit_ligand's own default (100).
+  --f1_filter_proportion <float>       filter --filter_proportion for stage 3a (filter_run_name).
+  --f1_min_cluster_proportion <float>  filter --min_cluster_proportion for stage 3a.
+  --f1_rscc_cutoff <float>             filter --rscc_cutoff for stage 3a.
+  --f1_clustering_mode <all-atom|centroid>  filter --clustering_mode for stage 3a.
+  --f1_clustering_cutoff <float>       filter --clustering_cutoff for stage 3a.
+  --f2_filter_proportion <float>       filter --filter_proportion for stage 5a (filter2_run_name).
+  --f2_min_cluster_proportion <float>  filter --min_cluster_proportion for stage 5a.
+  --f2_rscc_cutoff <float>             filter --rscc_cutoff for stage 5a.
+  --f2_clustering_mode <all-atom|centroid>  filter --clustering_mode for stage 5a.
+  --f2_clustering_cutoff <float>       filter --clustering_cutoff for stage 5a.
+                                    All f1_*/f2_* options are left unset by default, so
+                                    filter's own argparse defaults apply. Stage 5a (filter2_run_name)
+                                    now runs the same "filter" script as stage 3a (filter_run_name)
+                                    instead of "filter_all" - see header comment.
 
 Examples:
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1
   $0 run_1 placer_1 filter_1
   $0 run_1 placer_1 filter_2 placer2_1 filter2_1 final_1 -n 1000 -n2 500 -g 0,1
+  $0 run_1 placer_1 filter_1 --overwrite
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 -c
+  $0 run_1 placer_1 filter_1 --z_threshold 5 --num_peaks 50
+  $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 --f1_rscc_cutoff 0.5 --f2_rscc_cutoff 0.7
 EOF
     exit 1
 }
@@ -85,6 +136,11 @@ CONDA_ENV_PLACER="placer_env"
 CONDA_ENV_RSR="rsr"
 CONDA_ENV_EVAL="biotite"
 RUN_PLACER_PY="/home/ngupta/PLACER/PLACER/run_PLACER.py"
+DATASETS_DIR="${BASE_DIR}/datasets"
+DATASETS_FILE="${BASE_DIR}/datasets.txt"
+RSR_SCRIPTS_DIR="${BASE_DIR}/rsr_scripts"
+ANALYSIS_SCRIPTS_DIR="${BASE_DIR}/analysis_scripts"
+GRAPHS_DIR="${BASE_DIR}/graphs"
 
 # Only used when -c is given: reference_set/<dataset>/ subfolders (one per
 # datasets.txt entry) holding a reference structure to compare RSCC against.
@@ -92,13 +148,9 @@ REF_SET="${BASE_DIR}/reference_set"
 REF_SET_PDB_PATTERN="{dataset}-pandda-model.pdb"
 
 # --- Derived paths: assumed to live at fixed locations under BASE_DIR ---
-DATASETS_DIR="${BASE_DIR}/datasets"
-DATASETS_FILE="${BASE_DIR}/datasets.txt"
-RSR_SCRIPTS_DIR="${BASE_DIR}/rsr_scripts"
 RSR_SCRIPT_LIGAND="${RSR_SCRIPTS_DIR}/real_space_refine.py"
 RSR_SCRIPT_PROTEIN="${RSR_SCRIPTS_DIR}/real_space_refine_protein.py"
 RSR_SCRIPT_FINAL="${RSR_SCRIPTS_DIR}/real_space_refine_final.py"
-ANALYSIS_SCRIPTS_DIR="${BASE_DIR}/analysis_scripts"
 PLOT_CLUSTER_REPS_PY="${ANALYSIS_SCRIPTS_DIR}/plot_cluster_reps_rscc.py"
 AGGREGATE_PROTEIN_RSCC_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_protein_rscc.py"
 AGGREGATE_LIG_RSCC_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_lig_rscc.py"
@@ -106,12 +158,17 @@ PLOT_LIG_VS_REF_FILTER1_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_filter1.py"
 PLOT_LIG_VS_REF_FILTER2_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_filter2.py"
 PLOT_RESIDUES_VS_REF_BACKBONE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_backbone.py"
 PLOT_RESIDUES_VS_REF_FINAL_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_final.py"
-GRAPHS_DIR="${BASE_DIR}/graphs"
+CENTROID_RMSD_ALL_PY="${ANALYSIS_SCRIPTS_DIR}/centroid_rmsd_all.py"
+CALC_PLACER_SAMPLING_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling.py"
+CALC_PLACER_SAMPLING_UNREFINED_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling_unrefined.py"
+PLOT_FIT_LIGAND_COUNTS_PY="${ANALYSIS_SCRIPTS_DIR}/plot_fit_ligand_counts.py"
 
 for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN" "$RSR_SCRIPT_FINAL" \
          "$RUN_PLACER_PY" "$PLOT_CLUSTER_REPS_PY" "$AGGREGATE_PROTEIN_RSCC_PY" "$AGGREGATE_LIG_RSCC_PY" \
          "$PLOT_LIG_VS_REF_FILTER1_PY" "$PLOT_LIG_VS_REF_FILTER2_PY" \
-         "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY"; do
+         "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY" \
+         "$CENTROID_RMSD_ALL_PY" "$CALC_PLACER_SAMPLING_PY" "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
+         "$PLOT_FIT_LIGAND_COUNTS_PY"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
         exit 1
@@ -141,6 +198,29 @@ num_placer2_confs=100
 gpu_ids=""
 num_parallel=""
 compare_ref_set=0
+overwrite=0
+
+# fit_ligand tunables (stage 1a). Left empty by default so fit_ligand's own
+# argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100) apply; only
+# passed through when explicitly set here.
+z_threshold=""
+num_peaks=""
+
+# filter tunables (stage 3a, filter_run_name), left empty by default so
+# filter's own argparse defaults apply.
+f1_filter_proportion=""
+f1_min_cluster_proportion=""
+f1_rscc_cutoff=""
+f1_clustering_mode=""
+f1_clustering_cutoff=""
+
+# filter tunables (stage 5a, filter2_run_name) - same underlying `filter`
+# script as f1_*, set independently.
+f2_filter_proportion=""
+f2_min_cluster_proportion=""
+f2_rscc_cutoff=""
+f2_clustering_mode=""
+f2_clustering_cutoff=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -163,6 +243,58 @@ while [[ $# -gt 0 ]]; do
         -c)
             compare_ref_set=1
             shift
+            ;;
+        --overwrite)
+            overwrite=1
+            shift
+            ;;
+        --z_threshold)
+            z_threshold="$2"
+            shift 2
+            ;;
+        --num_peaks)
+            num_peaks="$2"
+            shift 2
+            ;;
+        --f1_filter_proportion)
+            f1_filter_proportion="$2"
+            shift 2
+            ;;
+        --f1_min_cluster_proportion)
+            f1_min_cluster_proportion="$2"
+            shift 2
+            ;;
+        --f1_rscc_cutoff)
+            f1_rscc_cutoff="$2"
+            shift 2
+            ;;
+        --f1_clustering_mode)
+            f1_clustering_mode="$2"
+            shift 2
+            ;;
+        --f1_clustering_cutoff)
+            f1_clustering_cutoff="$2"
+            shift 2
+            ;;
+        --f2_filter_proportion)
+            f2_filter_proportion="$2"
+            shift 2
+            ;;
+        --f2_min_cluster_proportion)
+            f2_min_cluster_proportion="$2"
+            shift 2
+            ;;
+        --f2_rscc_cutoff)
+            f2_rscc_cutoff="$2"
+            shift 2
+            ;;
+        --f2_clustering_mode)
+            f2_clustering_mode="$2"
+            shift 2
+            ;;
+        --f2_clustering_cutoff)
+            f2_clustering_cutoff="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -212,12 +344,19 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # needs to be visible inside the per-dataset *_process_dataset functions even
 # when GNU parallel forks them into new subshells, so it all gets exported.
 export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name
-export num_placer_confs num_placer2_confs compare_ref_set
+export num_placer_confs num_placer2_confs compare_ref_set overwrite
+export z_threshold num_peaks
+export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
+       f1_clustering_mode f1_clustering_cutoff
+export f2_filter_proportion f2_min_cluster_proportion f2_rscc_cutoff \
+       f2_clustering_mode f2_clustering_cutoff
 export BASE_DIR DATASETS_DIR DATASETS_FILE CSV_FILE LIG_PDB_DIR
 export RSR_SCRIPT_LIGAND RSR_SCRIPT_PROTEIN RSR_SCRIPT_FINAL
 export ANALYSIS_SCRIPTS_DIR PLOT_CLUSTER_REPS_PY AGGREGATE_PROTEIN_RSCC_PY AGGREGATE_LIG_RSCC_PY
 export PLOT_LIG_VS_REF_FILTER1_PY PLOT_LIG_VS_REF_FILTER2_PY
 export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY GRAPHS_DIR
+export CENTROID_RMSD_ALL_PY CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
+export PLOT_FIT_LIGAND_COUNTS_PY
 export REF_SET REF_SET_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL
 export RUN_PLACER_PY
@@ -273,6 +412,20 @@ stage_complete() {
     return 0
 }
 
+# should_skip_stage <relative_path_under_dataset_dir>
+# Same as stage_complete, except it always returns failure (1, "don't skip")
+# when --overwrite was given. Used by stage1-6's "already done, skip it"
+# checks. Stage 7's precondition check ("has stage 6 finished for every
+# dataset yet?") calls stage_complete directly instead - that's a readiness
+# gate, not a skip-if-exists cache, and --overwrite must not affect it.
+should_skip_stage() {
+    local rel_path="$1"
+    if [ "$overwrite" -eq 1 ]; then
+        return 1
+    fi
+    stage_complete "$rel_path"
+}
+
 # run_step <description> <command...>
 run_step() {
     local desc="$1"
@@ -319,6 +472,29 @@ print_elapsed() {
     local seconds=$((elapsed % 60))
     printf "Script took %02d:%02d:%02d (HH:MM:SS)\n" $hours $minutes $seconds
 }
+
+# write_params_txt <output_file> <name=value> [<name=value> ...]
+# Records the CLI-configurable parameters actually used for a stage's run,
+# into its output directory. An empty value means the corresponding
+# program.sh flag wasn't given, so the underlying script's own argparse
+# default applied instead.
+write_params_txt() {
+    local output_file="$1"
+    shift
+    local kv name value
+    {
+        for kv in "$@"; do
+            name="${kv%%=*}"
+            value="${kv#*=}"
+            if [ -z "$value" ]; then
+                echo "${name}: (not set - script default used)"
+            else
+                echo "${name}: ${value}"
+            fi
+        done
+    } > "$output_file"
+}
+export -f write_params_txt
 
 ######################################################################
 # Stage 0: calc_apo_rscc
@@ -494,6 +670,12 @@ fit_ligand_process_dataset() {
 
     echo "  Found ${#pdb_dirs[@]} matching director(ies) for ${dataset} (fragment_id=${fragment_id})"
 
+    local run_out_dir="${DATASETS_DIR}/${dataset}/${run_name}"
+    mkdir -p "${run_out_dir}"
+    write_params_txt "${run_out_dir}/fit_ligand_params.txt" \
+        "z_threshold=${z_threshold}" \
+        "num_peaks=${num_peaks}"
+
     for pdb_dir in "${pdb_dirs[@]}"; do
         local dir_name=$(basename "$pdb_dir")
         local pdb_file="${pdb_dir}/${dir_name}.pdb"
@@ -508,10 +690,15 @@ fit_ligand_process_dataset() {
 
         echo "  Running fit_ligand: PDB=${dir_name}, sampling=${run_name}"
 
+        local fit_ligand_extra_args=()
+        [ -n "$z_threshold" ] && fit_ligand_extra_args+=(-z "$z_threshold")
+        [ -n "$num_peaks" ] && fit_ligand_extra_args+=(-n "$num_peaks")
+
         fit_ligand "${DATASETS_DIR}/${dataset}" \
             "${pdb_file}" \
             -r ${resolution} \
             --sampling ${run_name} \
+            "${fit_ligand_extra_args[@]}" \
             > "${out_dir}/ligandfit_${dir_name}.txt" 2>&1
 
         echo "  Completed: ${dataset} / ${dir_name}"
@@ -523,6 +710,50 @@ do_fit_ligand() {
     echo "Starting run"
     local start_time=$(date +%s)
     cat "$DATASETS_FILE" | parallel -j "$NUM_PARALLEL_DEFAULT" fit_ligand_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 1b: centroid_rmsd_all (only runs when -c is given)
+######################################################################
+# Pooled (cross-dataset) histogram under GRAPHS_DIR/<run_name>/: minimum
+# ligand centroid distance from every reference LIG conformation to the
+# closest fit_ligand output pose (after CA superposition onto the
+# reference), before any PLACER sampling has happened.
+
+do_centroid_rmsd_all() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CENTROID_RMSD_ALL_PY" \
+        "$run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 1c: plot_fit_ligand_counts (always runs, not gated behind -c)
+######################################################################
+# Pooled (cross-dataset) histogram under GRAPHS_DIR/<run_name>/: number of
+# fit_ligand output poses per dataset (one data point per dataset), read
+# straight from each dataset's fit_ligand_manifest.csv row count. Doesn't
+# touch the reference set, so it runs on every stage-1 invocation.
+
+do_plot_fit_ligand_counts() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_FIT_LIGAND_COUNTS_PY" \
+        "$run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --graphs-dir "$out_dir"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -599,11 +830,11 @@ do_placer() {
         local gpu_id=${GPU_IDS_ARR[$((idx % NUM_GPUS))]}
         echo "${dataset} ${gpu_id}"
         idx=$((idx + 1))
-    done < "$DATASETS_FILE" | parallel -j "$NUM_GPUS" --colsep ' ' placer_process_dataset {1} {2}
+    done < "$DATASETS_FILE" | parallel -j "$NUM_GPUS" --line-buffer --colsep ' ' placer_process_dataset {1} {2}
 
     echo "All jobs completed"
     print_elapsed "$start_time"
-    conda deactivate
+    conda_deactivate
 }
 
 ######################################################################
@@ -717,6 +948,42 @@ do_rsr_placer() {
 }
 
 ######################################################################
+# Stage 2c/2d: calc_placer_sampling refined/unrefined (only runs when -c is given)
+######################################################################
+# Pooled (cross-dataset) histograms under GRAPHS_DIR/<run_name>/<placer_run_name>/:
+# minimum symmetry-aware RMSD from every reference LIG conformation to the
+# closest round-1 PLACER-sampled ligand conformer, scored both after RSR
+# (placer_sampling.png) and on PLACER's own raw output (placer_sampling_unrefined.png).
+
+do_placer_sampling_refined_round1() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CALC_PLACER_SAMPLING_PY" \
+        "$run_name" "$placer_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+do_placer_sampling_unrefined_round1() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
+        "$run_name" "$placer_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
 # Stage 3a: filter
 ######################################################################
 
@@ -737,17 +1004,32 @@ filter_process_dataset() {
 
     echo "Processing ${dataset}: fragment_id=${fragment_id}, resolution=${resolution}"
 
+    local f1_extra_args=()
+    [ -n "$f1_filter_proportion" ] && f1_extra_args+=(--filter_proportion "$f1_filter_proportion")
+    [ -n "$f1_min_cluster_proportion" ] && f1_extra_args+=(--min_cluster_proportion "$f1_min_cluster_proportion")
+    [ -n "$f1_rscc_cutoff" ] && f1_extra_args+=(--rscc_cutoff "$f1_rscc_cutoff")
+    [ -n "$f1_clustering_mode" ] && f1_extra_args+=(--clustering_mode "$f1_clustering_mode")
+    [ -n "$f1_clustering_cutoff" ] && f1_extra_args+=(--clustering_cutoff "$f1_clustering_cutoff")
+
     filter ${dataset_dir} \
         "${dataset_dir}/${run_name}/${placer_run_name}/*_refined.pdb" \
         "${dataset_dir}/${run_name}/*.pdb" \
         $run_name/${placer_run_name}/${filter_run_name} \
-        -r ${resolution}
+        -r ${resolution} \
+        "${f1_extra_args[@]}"
 
     local filter_exit=$?
     if [ $filter_exit -ne 0 ]; then
         echo "ERROR [${dataset}]: filter failed with exit code ${filter_exit}"
         return 1
     fi
+
+    write_params_txt "${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/filter_params.txt" \
+        "filter_proportion=${f1_filter_proportion}" \
+        "min_cluster_proportion=${f1_min_cluster_proportion}" \
+        "rscc_cutoff=${f1_rscc_cutoff}" \
+        "clustering_mode=${f1_clustering_mode}" \
+        "clustering_cutoff=${f1_clustering_cutoff}"
 
     # --- Post-hoc: annotate cluster_reps.csv with a cif_restraints_file column ---
     local cluster_csv="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/cluster_reps.csv"
@@ -1187,11 +1469,11 @@ do_placer2() {
         local gpu_id=${GPU_IDS_ARR[$((idx % NUM_GPUS))]}
         echo "${dataset} ${gpu_id}"
         idx=$((idx + 1))
-    done | parallel -j "$NUM_GPUS" --colsep ' ' placer2_process_dataset {1} {2}
+    done | parallel -j "$NUM_GPUS" --line-buffer --colsep ' ' placer2_process_dataset {1} {2}
 
     echo "All jobs completed"
     print_elapsed "$start_time"
-    conda deactivate
+    conda_deactivate
 }
 
 ######################################################################
@@ -1340,6 +1622,41 @@ do_rsr_placer2() {
 }
 
 ######################################################################
+# Stage 4c/4d: calc_placer_sampling refined/unrefined (only runs when -c is given)
+######################################################################
+# Pooled (cross-dataset) histograms under
+# GRAPHS_DIR/<run_name>/<placer_run_name>/<filter_run_name>/<placer2_run_name>/:
+# same comparison as stage 2c/2d, but for round-2 PLACER samples.
+
+do_placer_sampling_refined_round2() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CALC_PLACER_SAMPLING_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+do_placer_sampling_unrefined_round2() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
 # Stage 5: filter2
 ######################################################################
 
@@ -1360,22 +1677,37 @@ filter2_process_dataset() {
 
     echo "Processing ${dataset}: fragment_id=${fragment_id}, resolution=${resolution}"
 
-    filter_all "${dataset_dir}" \
+    local f2_extra_args=()
+    [ -n "$f2_filter_proportion" ] && f2_extra_args+=(--filter_proportion "$f2_filter_proportion")
+    [ -n "$f2_min_cluster_proportion" ] && f2_extra_args+=(--min_cluster_proportion "$f2_min_cluster_proportion")
+    [ -n "$f2_rscc_cutoff" ] && f2_extra_args+=(--rscc_cutoff "$f2_rscc_cutoff")
+    [ -n "$f2_clustering_mode" ] && f2_extra_args+=(--clustering_mode "$f2_clustering_mode")
+    [ -n "$f2_clustering_cutoff" ] && f2_extra_args+=(--clustering_cutoff "$f2_clustering_cutoff")
+
+    filter "${dataset_dir}" \
         "${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/*_refined.pdb" \
         "${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/*_refined_*.pdb" \
         ${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name} \
-        -r ${resolution}
+        -r ${resolution} \
+        "${f2_extra_args[@]}"
 
     local filter_exit=$?
     if [ $filter_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: filter_all failed with exit code ${filter_exit}"
+        echo "ERROR [${dataset}]: filter failed with exit code ${filter_exit}"
         return 1
     fi
+
+    local filter2_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}"
+    write_params_txt "${filter2_dir}/filter_params.txt" \
+        "filter_proportion=${f2_filter_proportion}" \
+        "min_cluster_proportion=${f2_min_cluster_proportion}" \
+        "rscc_cutoff=${f2_rscc_cutoff}" \
+        "clustering_mode=${f2_clustering_mode}" \
+        "clustering_cutoff=${f2_clustering_cutoff}"
 
     # --- Post-hoc: carry the cif_restraints_file column over from filter_run_name's
     # cluster_reps.csv into filter2_run_name's cluster_reps.csv ---
     local filter_csv="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/cluster_reps.csv"
-    local filter2_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}"
     local filter2_csv="${filter2_dir}/cluster_reps.csv"
 
     if [ ! -f "$filter2_csv" ]; then
@@ -1829,26 +2161,34 @@ stage0_apo_rscc() {
 
 stage1_run() {
     local rel_path="${run_name}"
-    if stage_complete "$rel_path"; then
+    if should_skip_stage "$rel_path"; then
         echo "Skipping stage 1 (fit_ligand): ${rel_path} already exists for all datasets."
-        return
+    else
+        run_step "Stage 1a: fit_ligand (${run_name})" do_fit_ligand
     fi
-    run_step "Stage 1: fit_ligand (${run_name})" do_fit_ligand
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step "Stage 1b: centroid_rmsd_all (${run_name})" do_centroid_rmsd_all
+    fi
+    run_step "Stage 1c: plot_fit_ligand_counts (${run_name})" do_plot_fit_ligand_counts
 }
 
 stage2_placer() {
     local rel_path="${run_name}/${placer_run_name}"
-    if stage_complete "$rel_path"; then
+    if should_skip_stage "$rel_path"; then
         echo "Skipping stage 2 (placer/rsr_placer): ${rel_path} already exists for all datasets."
-        return
+    else
+        run_step "Stage 2a: placer (${placer_run_name})" do_placer
+        run_step "Stage 2b: rsr_placer (${placer_run_name})" do_rsr_placer
     fi
-    run_step "Stage 2a: placer (${placer_run_name})" do_placer
-    run_step "Stage 2b: rsr_placer (${placer_run_name})" do_rsr_placer
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step "Stage 2c: calc_placer_sampling refined (${placer_run_name})" do_placer_sampling_refined_round1
+        run_step "Stage 2d: calc_placer_sampling unrefined (${placer_run_name})" do_placer_sampling_unrefined_round1
+    fi
 }
 
 stage3_filter() {
     local rel_path="${run_name}/${placer_run_name}/${filter_run_name}"
-    if stage_complete "$rel_path"; then
+    if should_skip_stage "$rel_path"; then
         echo "Skipping stage 3 (filter/rsr_backbone/calc_backbone_refined_rscc): ${rel_path} already exists for all datasets."
     else
         run_step "Stage 3a: filter (${filter_run_name})" do_filter
@@ -1866,17 +2206,21 @@ stage3_filter() {
 
 stage4_placer2() {
     local rel_path="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
-    if stage_complete "$rel_path"; then
+    if should_skip_stage "$rel_path"; then
         echo "Skipping stage 4 (placer2/rsr_placer2): ${rel_path} already exists for all datasets."
-        return
+    else
+        run_step "Stage 4a: placer2 (${placer2_run_name})" do_placer2
+        run_step "Stage 4b: rsr_placer2 (${placer2_run_name})" do_rsr_placer2
     fi
-    run_step "Stage 4a: placer2 (${placer2_run_name})" do_placer2
-    run_step "Stage 4b: rsr_placer2 (${placer2_run_name})" do_rsr_placer2
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step "Stage 4c: calc_placer_sampling refined (${placer2_run_name})" do_placer_sampling_refined_round2
+        run_step "Stage 4d: calc_placer_sampling unrefined (${placer2_run_name})" do_placer_sampling_unrefined_round2
+    fi
 }
 
 stage5_filter2() {
     local rel_path="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}"
-    if stage_complete "$rel_path"; then
+    if should_skip_stage "$rel_path"; then
         echo "Skipping stage 5 (filter2): ${rel_path} already exists for all datasets."
     else
         run_step "Stage 5a: filter2 (${filter2_run_name})" do_filter2
@@ -1888,7 +2232,7 @@ stage5_filter2() {
 
 stage6_final() {
     local rel_path="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
-    if stage_complete "$rel_path"; then
+    if should_skip_stage "$rel_path"; then
         echo "Skipping stage 6 (build_final/rsr_final/calc_final_refined_rscc): ${rel_path} already exists for all datasets."
     else
         run_step "Stage 6a: build_final (${final_run_name})" do_build_final

@@ -1,0 +1,10 @@
+name: rsr
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python
+  - numpy
+  - biotite
+  - coot-headless

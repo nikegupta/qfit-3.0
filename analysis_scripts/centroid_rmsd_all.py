@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""
+Pooled (across every dataset in datasets.txt) ligand centroid-distance
+comparison: every reference-set LIG conformation vs the ligand poses already
+present in fit_ligand's own output structures (run_name/*.pdb) - before any
+PLACER sampling or refinement has touched them.
+
+Unlike the later-stage reference comparisons in this pipeline (stages 3/5/6,
+which trust that both sides already share the reference's crystallographic
+frame), fit_ligand's output structures aren't guaranteed to - so each
+candidate structure is first superimposed onto the reference by protein CA
+atoms (matched by chain_id/res_id) before ligand centroid distances are
+computed.
+
+For each reference LIG conformation (altloc-aware), keeps the minimum
+centroid distance to any ligand pose across every fit_ligand PDB for that
+dataset, pooled across all datasets into a single histogram.
+
+Run at the end of stage 1 (fit_ligand), only when -c (compare to reference
+set) is given.
+
+Usage:
+  centroid_rmsd_all.py <run_name> --ref-set <dir> --graphs-dir <dir> [options]
+"""
+from pathlib import Path
+
+import numpy as np
+import biotite.structure as struc
+import biotite.structure.io.pdb as pdb
+
+from rscc_common import (
+    build_ref_argparser, read_datasets, read_pdb_raw_atoms, lig_conformations_filtered,
+    plot_distance_histogram, ref_pdb_path,
+)
+
+
+def read_pdb_biotite(path):
+    pdb_file = pdb.PDBFile.read(str(path))
+    return pdb_file.get_structure(model=1)
+
+
+def get_protein_ca(structure):
+    ca = structure[struc.filter_amino_acids(structure)]
+    return ca[ca.atom_name == 'CA']
+
+
+def align_to_reference(mobile_struct, target_struct):
+    """Superimposes mobile onto target using CA atoms matched by
+    (chain_id, res_id). Raises ValueError if no residues are in common."""
+    mobile_ca = get_protein_ca(mobile_struct)
+    target_ca = get_protein_ca(target_struct)
+
+    mobile_res = set(zip(mobile_ca.chain_id, mobile_ca.res_id))
+    target_res = set(zip(target_ca.chain_id, target_ca.res_id))
+    common_res = mobile_res & target_res
+    if not common_res:
+        raise ValueError('No CA residues in common between model and reference.')
+
+    def select_sorted(ca_atoms):
+        mask = np.array([(ch, ri) in common_res
+                          for ch, ri in zip(ca_atoms.chain_id, ca_atoms.res_id)])
+        subset = ca_atoms[mask]
+        order = np.argsort([f'{ch}_{ri:06d}' for ch, ri in zip(subset.chain_id, subset.res_id)])
+        return subset[order]
+
+    _, transformation = struc.superimpose(select_sorted(mobile_ca), select_sorted(target_ca))
+    return transformation
+
+
+def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
+    """Returns a list of min-centroid-distance values, one per reference LIG
+    conformation matched against the closest ligand pose (after CA
+    superposition) across every *.pdb file directly in run_dir."""
+    if not run_dir.exists() or not ref_path.exists():
+        return []
+
+    pdb_files = sorted(run_dir.glob('*.pdb'))
+    if not pdb_files:
+        return []
+
+    ref_atoms = read_pdb_raw_atoms(ref_path)
+    ref_struct = read_pdb_biotite(ref_path)
+    ref_confs = lig_conformations_filtered(ref_atoms)
+    if not ref_confs:
+        return []
+
+    min_dists = {key: np.inf for key in ref_confs}
+
+    for pdb_file in pdb_files:
+        try:
+            model_struct = read_pdb_biotite(pdb_file)
+            transformation = align_to_reference(model_struct, ref_struct)
+        except Exception as e:
+            print(f'    Warning: could not align {pdb_file.name} ({dataset}): {e}')
+            continue
+
+        model_atoms = read_pdb_raw_atoms(pdb_file)
+        model_confs = lig_conformations_filtered(model_atoms, chain_id=model_chain, res_id=model_resi)
+        if not model_confs:
+            model_confs = lig_conformations_filtered(model_atoms)
+            if not model_confs:
+                continue
+
+        for ref_key, ref_centroid in ref_confs.items():
+            for m_centroid in model_confs.values():
+                aligned = transformation.apply(m_centroid.reshape(1, 3))[0]
+                dist = float(np.linalg.norm(ref_centroid - aligned))
+                if dist < min_dists[ref_key]:
+                    min_dists[ref_key] = dist
+
+    return [dist for dist in min_dists.values() if np.isfinite(dist)]
+
+
+def main():
+    args = build_ref_argparser(__doc__, ['run_name']).parse_args()
+
+    datasets = read_datasets(args.datasets_file)
+    all_dists = []
+    for dataset in datasets:
+        run_dir = Path(args.datasets_dir) / dataset / args.run_name
+        ref_path = ref_pdb_path(args, dataset)
+        dists = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1)
+        print(f'  {dataset}: {len(dists)} ref LIG conformation(s) matched')
+        all_dists.extend(dists)
+
+    out_dir = Path(args.graphs_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plot_distance_histogram(
+        all_dists,
+        title=f'Ligand Centroid Distance: fit_ligand Structures vs Reference ({args.run_name})',
+        xlabel='Minimum Centroid Distance to Closest fit_ligand Pose (Å)',
+        out_path=out_dir / 'centroid_rmsd_all.png',
+        bin_width=1.0,
+    )
+
+
+if __name__ == '__main__':
+    main()

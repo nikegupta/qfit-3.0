@@ -73,8 +73,9 @@ def main():
                 "phenix_ligandfit = qfit.command_line.phenix_ligandfit:main",
                 "filter = qfit.command_line.filter:main",
                 "rotamer_optimize = qfit.command_line.rotamer_optimize:main",
-                "compare_rscc = qfit.command_line.compare_sidechain_rscc:main",
-                "compare_lig_rscc = qfit.command_line.compare_lig_rscc:main"
+                "calc_rscc = qfit.command_line.calc_rscc:main",
+                "compare_lig_rscc = qfit.command_line.compare_lig_rscc:main",
+                "build_final_model = qfit.command_line.build_final_model:main",
             ]
         },
         scripts=[

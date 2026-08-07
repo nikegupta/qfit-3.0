@@ -20,8 +20,6 @@ from qfit.xtal.transformer import get_transformer
 
 import iotbx.pdb
 
-RSCC_CUTOFF = 0.6
-
 
 class _Tee:
     """
@@ -110,21 +108,46 @@ def build_argparser():
              "(default: 0.75)",
     )
     p.add_argument(
-        "--rep_selection",
-        default="score",
-        choices=["score", "centroid"],
-        help="Method used to pick each spatial cluster's representative "
-             "conformer. 'score' (default) picks the conformer with the best "
-             "(lowest) map-fit MSE score. 'centroid' picks the conformer "
-             "whose ligand geometry is closest (lowest RMSD) to the mean "
-             "ligand geometry of the cluster.",
+        "-c",
+        "--rscc_cutoff",
+        default=0.6,
+        metavar="<float>",
+        type=float,
+        help="RSCC filtering: minimum real-space correlation coefficient a "
+             "cluster representative's ligand must have against its best "
+             "event map to be kept. Runs after count filtering and before "
+             "per-placer_file de-duplication. (default: 0.6)",
+    )
+    p.add_argument(
+        "--clustering_mode",
+        default="all-atom",
+        choices=["all-atom", "centroid"],
+        help="Distance metric used for spatial clustering of ligand "
+             "conformers. 'all-atom' (default) clusters on the per-atom RMSD "
+             "between two conformers' full ligand geometry. 'centroid' "
+             "instead clusters on the distance between each conformer's "
+             "single ligand centroid (the mean position of its atoms), which "
+             "groups conformers by where the ligand sits rather than by its "
+             "full pose.",
+    )
+    p.add_argument(
+        "--clustering_cutoff",
+        default=4.0,
+        metavar="<float>",
+        type=float,
+        help="Distance cutoff (Å) used to cut the hierarchical clustering "
+             "tree: two conformers end up in the same spatial cluster if the "
+             "distance at which their branches merge is <= this value. "
+             "Interpreted as an all-atom RMSD or a centroid-centroid "
+             "distance depending on --clustering_mode. (default: 4.0)",
     )
     return p
 
 class Filter():
     def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder,
                  resolution, filter_proportion=0.1, min_cluster_proportion=0.1,
-                 clash_vdw_scale=0.75, rep_selection='score'):
+                 clash_vdw_scale=0.75, rscc_cutoff=0.6,
+                 clustering_mode='all-atom', clustering_cutoff=4.0):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.fit_ligand_files = fit_ligand_files
@@ -151,9 +174,21 @@ class Filter():
         # distance is less than clash_vdw_scale * (sum of their vdw radii).
         self.clash_vdw_scale = clash_vdw_scale
 
-        # How to pick a cluster's representative conformer: 'score' (best
-        # map-fit MSE) or 'centroid' (closest to the cluster's mean geometry).
-        self.rep_selection = rep_selection
+        # RSCC filtering: minimum real-space correlation coefficient a
+        # cluster representative's ligand must have against its best event
+        # map to be kept.
+        self.rscc_cutoff = rscc_cutoff
+
+        # Distance metric used for spatial clustering (_spatialClustering):
+        # 'all-atom' clusters on full per-atom ligand RMSD; 'centroid'
+        # clusters on the distance between each conformer's single ligand
+        # centroid instead.
+        self.clustering_mode = clustering_mode
+
+        # Distance cutoff (Å) used to cut the hierarchical clustering tree,
+        # interpreted as an all-atom RMSD or a centroid distance depending on
+        # self.clustering_mode.
+        self.clustering_cutoff = clustering_cutoff
 
         self._load_event_maps()
 
@@ -320,7 +355,7 @@ class Filter():
             #filter cluster_reps by rscc
             rscc_cluster_reps = {}
             for cluster_id in self.cluster_reps:
-                if self.cluster_rsccs[cluster_id] > RSCC_CUTOFF:
+                if self.cluster_rsccs[cluster_id] > self.rscc_cutoff:
                     rscc_cluster_reps.update({cluster_id: self.cluster_reps[cluster_id]})
             self.cluster_reps = rscc_cluster_reps
             passed_rscc_ids = set(self.cluster_reps.keys())
@@ -626,39 +661,25 @@ class Filter():
         (score, placer_file, index, ligand_coor) tuples belonging to one
         cluster (the same shape as the entries in self.clusters[cluster_id]).
 
-        Two selection strategies are supported, controlled by
-        self.rep_selection:
-
-          - 'score' (default, original behavior): pick the member with the
-            lowest map-fit MSE score, i.e. the conformer that agrees best
-            with the event map.
-
-          - 'centroid': compute the per-atom mean ligand coordinate across
-            all members of the cluster (the cluster centroid), then pick the
-            member whose ligand coordinates are closest (lowest RMSD) to that
-            centroid. This favors the conformer that best represents the
-            cluster's consensus geometry, rather than whichever single
-            conformer happens to score best against the map.
+        Picks the member with the lowest map-fit MSE score, i.e. the
+        conformer that agrees best with the event map.
         """
-        if self.rep_selection == 'centroid':
-            ligand_coors = np.array([member[3] for member in members])  # (n_members, n_atoms, 3)
-            centroid = ligand_coors.mean(axis=0)
-
-            best_rmsd = None
-            best_member = None
-            for member in members:
-                diff = member[3] - centroid
-                rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-                if best_rmsd is None or rmsd < best_rmsd:
-                    best_rmsd = rmsd
-                    best_member = member
-            return best_member
-        else:
-            # original behavior: lowest mse score wins
-            return min(members, key=lambda member: member[0])
+        return min(members, key=lambda member: member[0])
 
     def _spatialClustering(self, top_n):
-        """Spatially clusters the ligands of the top_n models based on RMSD.
+        """Spatially clusters the ligands of the top_n models based on
+        distance between conformers.
+
+        The distance metric is controlled by self.clustering_mode:
+          - 'all-atom' (default): pairwise per-atom RMSD between two
+            conformers' full ligand geometry -- sensitive to differences in
+            ligand pose/orientation, not just where it sits.
+          - 'centroid': distance between each conformer's single ligand
+            centroid (mean position of its atoms) -- groups conformers by
+            where the ligand sits, ignoring differences in its pose at that
+            location.
+
+        Either way, the tree is cut at self.clustering_cutoff (Å).
         """
 
         # extract just the ligand coordinates for every entry, tracking provenance
@@ -676,21 +697,30 @@ class Filter():
 
         n_entries = len(ligand_coor_sets)
 
-        # build the pairwise RMSD distance matrix between ligand conformers
+        # build the pairwise distance matrix between ligand conformers, using
+        # either full all-atom RMSD or centroid-to-centroid distance
+        # depending on self.clustering_mode
+        if self.clustering_mode == 'centroid':
+            centroids = np.array([coor.mean(axis=0) for coor in ligand_coor_sets])
+
         dist_matrix = np.zeros((n_entries, n_entries))
         for i in range(n_entries):
             for j in range(i + 1, n_entries):
-                diff = ligand_coor_sets[i] - ligand_coor_sets[j]
-                rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-                dist_matrix[i, j] = rmsd
-                dist_matrix[j, i] = rmsd
+                if self.clustering_mode == 'centroid':
+                    distance = np.linalg.norm(centroids[i] - centroids[j])
+                else:
+                    diff = ligand_coor_sets[i] - ligand_coor_sets[j]
+                    distance = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
+                dist_matrix[i, j] = distance
+                dist_matrix[j, i] = distance
 
         condensed_dist = squareform(dist_matrix, checks=False)
         linkage_matrix = linkage(condensed_dist, method='average')
 
-        # cut the tree at a 2 A RMSD cutoff: any two leaves are in the same
-        # cluster if the RMSD at which their branches merge is <= 2 A.
-        rmsd_cutoff = 4.0
+        # cut the tree at the configured distance cutoff: any two leaves are
+        # in the same cluster if the distance at which their branches merge
+        # is <= self.clustering_cutoff
+        rmsd_cutoff = self.clustering_cutoff
         cluster_ids = fcluster(linkage_matrix, t=rmsd_cutoff, criterion='distance')
         self.cluster_assignments = cluster_ids  # 1-indexed cluster id per entry, same order as entry_labels/entry_provenance
 
@@ -709,9 +739,10 @@ class Filter():
             above_threshold_color='lightgray' # links merging above cutoff (between clusters)
         )
 
+        distance_label = 'centroid distance' if self.clustering_mode == 'centroid' else 'all-atom RMSD'
         ax.set_xlabel('placer_file, index')
-        ax.set_ylabel('RMSD (\u00c5)')
-        ax.set_title('Hierarchical clustering of top ligand conformers (average linkage, RMSD)')
+        ax.set_ylabel(f'{distance_label} (\u00c5)')
+        ax.set_title(f'Hierarchical clustering of top ligand conformers (average linkage, {distance_label})')
         fig.tight_layout()
         fig.savefig(dendrogram_path, dpi=200)
         plt.close(fig)
@@ -725,7 +756,7 @@ class Filter():
 
         # pick each cluster's representative conformer (either the
         # best-scoring member, or the member closest to the cluster centroid
-        # - see _selectClusterRepresentative / self.rep_selection)
+        # - see _selectClusterRepresentative)
         self.cluster_reps = {}
         for cluster_id in clusters:
             cluster_size = len(clusters[cluster_id])
@@ -963,7 +994,8 @@ def main():
 
     filter = Filter(args.dataset, placer_files, fit_ligand_files, args.output_folder,
                      args.resolution, args.filter_proportion, args.min_cluster_proportion,
-                     args.clash_vdw_scale, args.rep_selection)
+                     args.clash_vdw_scale, args.rscc_cutoff,
+                     args.clustering_mode, args.clustering_cutoff)
     filter.run()
 
 

@@ -1,18 +1,23 @@
 """
-Shared helpers for the RSCC analysis scripts in analysis_scripts/.
+Shared helpers for the RSCC/geometry analysis scripts in analysis_scripts/.
 
-None of these scripts recompute RSCC - they only read the per-residue CSVs
-already written during the pipeline by calc_rscc (calc_apo_rscc,
+Most of these scripts don't recompute RSCC - they only read the per-residue
+CSVs already written during the pipeline by calc_rscc (calc_apo_rscc,
 calc_backbone_refined_rscc, calc_final_refined_rscc, each producing a
 model_idx,residue,rscc csv) and the 'rscc' column already written into
-cluster_reps.csv by filter/filter2.
+cluster_reps.csv by filter/filter2. A few (centroid_rmsd_all.py,
+calc_placer_sampling.py/calc_placer_sampling_unrefined.py) instead compare
+raw ligand geometry (centroid distance / symmetry-aware RMSD) against the
+reference set, since there's no RSCC value to reuse before RSR has run.
 """
 import argparse
 import re
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -62,6 +67,52 @@ def build_ref_argparser(description, positional_names):
                     help='Max centroid distance (A) for a reference/pipeline ligand pair to '
                          'count as matched, same default as qfit compare_lig_rscc (default: 2.0)')
     return p
+
+
+def build_placer_sampling_argparser(description):
+    """Argparser for calc_placer_sampling.py / calc_placer_sampling_unrefined.py.
+    Like build_ref_argparser, but run_name/placer_run_name are always
+    required while filter_run_name/placer2_run_name are optional and must be
+    given together - 2 positional args selects MODE A (score round-1 PLACER
+    samples directly under placer_run_name/), 4 selects MODE B (score
+    round-2 PLACER samples under .../filter_run_name/placer2_run_name/)."""
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument('run_name')
+    p.add_argument('placer_run_name')
+    p.add_argument('filter_run_name', nargs='?', default=None)
+    p.add_argument('placer2_run_name', nargs='?', default=None)
+    p.add_argument('--datasets-dir', default=DEFAULT_DATASETS_DIR,
+                    help='Root directory containing per-dataset folders')
+    p.add_argument('--datasets-file', default=DEFAULT_DATASETS_FILE,
+                    help='Path to newline-delimited list of dataset names')
+    p.add_argument('--ref-set', required=True,
+                    help='Root directory of the reference set (one subfolder per dataset)')
+    p.add_argument('--ref-pdb-pattern', default='{dataset}-pandda-model.pdb',
+                    help="Reference structure filename pattern within REF_SET/<dataset>/; "
+                         "'{dataset}' is replaced with the dataset name")
+    p.add_argument('--graphs-dir', required=True,
+                    help='Output directory for the pooled (cross-dataset) plot')
+    p.add_argument('--model-chain', default='C',
+                    help="Chain ID of the LIG ligand in sampled model files (default: C)")
+    p.add_argument('--model-resi', type=int, default=1,
+                    help="Residue number of the LIG ligand in sampled model files (default: 1)")
+    return p
+
+
+def resolve_placer_sampling_mode(args):
+    """Validates filter_run_name/placer2_run_name were given together and
+    returns (mode_b, run_tag)."""
+    has_filter = args.filter_run_name is not None
+    has_placer2 = args.placer2_run_name is not None
+    if has_filter != has_placer2:
+        raise SystemExit('filter_run_name and placer2_run_name must be given together '
+                          '(4 positional args), or both omitted (2 positional args).')
+    mode_b = has_filter and has_placer2
+    if mode_b:
+        run_tag = f'{args.run_name}/{args.placer_run_name}/{args.filter_run_name}/{args.placer2_run_name}'
+    else:
+        run_tag = f'{args.run_name}/{args.placer_run_name}'
+    return mode_b, run_tag
 
 
 def ref_pdb_path(args, dataset):
@@ -185,6 +236,215 @@ def lig_conformations(atoms):
                 coords = np.array([a['coord'] for a in alt_atoms])
                 conformations[(chain_id, res_id, altloc)] = coords.mean(axis=0)
     return conformations
+
+
+def _group_lig_residues(atoms, chain_id=None, res_id=None):
+    """Shared by lig_conformations_filtered/lig_atom_groups: filters an atom
+    list down to LIG residues (optionally restricted to one chain_id/res_id)
+    and groups them into {(chain_id, res_id, altloc): [atom dict, ...]},
+    same altloc-splitting rule as lig_conformations."""
+    lig_atoms = [a for a in atoms if a['res_name'] == 'LIG']
+    if chain_id is not None:
+        lig_atoms = [a for a in lig_atoms if a['chain_id'] == chain_id]
+    if res_id is not None:
+        lig_atoms = [a for a in lig_atoms if a['res_id'] == res_id]
+    if not lig_atoms:
+        return {}
+
+    by_residue = {}
+    for a in lig_atoms:
+        by_residue.setdefault((a['chain_id'], a['res_id']), []).append(a)
+
+    groups = {}
+    for (chain, resi), res_atoms in by_residue.items():
+        explicit_altlocs = sorted({a['altloc'] for a in res_atoms if a['altloc'] != ''})
+        if not explicit_altlocs:
+            groups[(chain, resi, '')] = res_atoms
+        else:
+            for altloc in explicit_altlocs:
+                groups[(chain, resi, altloc)] = [
+                    a for a in res_atoms if a['altloc'] in (altloc, '')
+                ]
+    return groups
+
+
+def lig_conformations_filtered(atoms, chain_id=None, res_id=None):
+    """Like lig_conformations, but restricted to a given chain_id/res_id
+    before grouping (used for sampled model files where the ligand's
+    chain/resi convention is known, e.g. PLACER's chain C res 1)."""
+    return {
+        key: np.array([a['coord'] for a in res_atoms]).mean(axis=0)
+        for key, res_atoms in _group_lig_residues(atoms, chain_id, res_id).items()
+    }
+
+
+def lig_atom_groups(atoms, chain_id=None, res_id=None):
+    """Like lig_conformations_filtered, but returns each conformation's full
+    atom list ({'name', 'coord'} dicts) instead of just its centroid - needed
+    for atom-level RMSD (compute_rmsd_symmetric) rather than centroid
+    distance."""
+    return {
+        key: [{'name': a['name'], 'coord': a['coord']} for a in res_atoms]
+        for key, res_atoms in _group_lig_residues(atoms, chain_id, res_id).items()
+    }
+
+
+def _element_of(name):
+    """Extracts the element symbol from a PDB atom name (e.g. 'C6' -> 'C')."""
+    m = re.match(r'^[A-Za-z]+', name)
+    return m.group(0) if m else name
+
+
+def compute_rmsd_symmetric(model_atoms, ref_atoms):
+    """Symmetry-aware RMSD between two ligand conformers: for each element
+    type present in both atom lists, atoms are paired by spatial proximity
+    (Hungarian assignment over the pairwise squared-distance matrix) rather
+    than by atom name, since PLACER poses can be rotated such that
+    pseudo-symmetric atoms end up with names swapped relative to the
+    reference - this would badly inflate a naive name-matched RMSD even when
+    the pose is essentially correct. If element counts differ between the
+    two sets, only as many pairs as the smaller count are matched per
+    element. Returns None if the two atom sets share no element type."""
+    ref_coor = np.array([a['coord'] for a in ref_atoms])
+    cand_coor = np.array([a['coord'] for a in model_atoms])
+    ref_elements = [_element_of(a['name']) for a in ref_atoms]
+    cand_elements = [_element_of(a['name']) for a in model_atoms]
+
+    ref_by_elem = defaultdict(list)
+    for i, el in enumerate(ref_elements):
+        ref_by_elem[el].append(i)
+    cand_by_elem = defaultdict(list)
+    for i, el in enumerate(cand_elements):
+        cand_by_elem[el].append(i)
+
+    shared_elements = set(ref_by_elem) & set(cand_by_elem)
+    if not shared_elements:
+        return None
+
+    squared_diffs = []
+    for el in shared_elements:
+        ref_pts = ref_coor[ref_by_elem[el]]
+        cand_pts = cand_coor[cand_by_elem[el]]
+        diff = ref_pts[:, None, :] - cand_pts[None, :, :]
+        dist_sq = np.sum(diff ** 2, axis=2)
+        row_idx, col_idx = linear_sum_assignment(dist_sq)
+        squared_diffs.extend(dist_sq[row_idx, col_idx])
+
+    if not squared_diffs:
+        return None
+    return float(np.sqrt(np.mean(squared_diffs)))
+
+
+def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_chain, model_resi):
+    """For a single dataset, returns one min-RMSD value per reference LIG
+    conformation matched: the minimum symmetry-aware RMSD from that
+    reference LIG to the closest sampled ligand conformer across every
+    model_dir.rglob(file_pattern) file. Each matched file may contain one or
+    many MODEL/ENDMDL blocks (e.g. PLACER's own multimodel *_model.pdb
+    outputs); every block is scored independently. If a block has no LIG
+    under model_chain/model_resi, falls back to any LIG in that block.
+    Empty list if model_dir/ref_path don't exist or nothing matches."""
+    if not model_dir.exists() or not ref_path.exists():
+        return []
+
+    model_files = sorted(model_dir.rglob(file_pattern))
+    if not model_files:
+        return []
+
+    ref_groups = lig_atom_groups(read_pdb_raw_atoms(ref_path))
+    if not ref_groups:
+        return []
+
+    min_rmsds = {key: np.inf for key in ref_groups}
+
+    for model_file in model_files:
+        try:
+            blocks = split_pdb_models(model_file)
+        except Exception as e:
+            print(f'    Warning: could not read {model_file}: {e}')
+            continue
+
+        for atoms in blocks:
+            model_groups = lig_atom_groups(atoms, chain_id=model_chain, res_id=model_resi)
+            if not model_groups:
+                model_groups = lig_atom_groups(atoms)
+                if not model_groups:
+                    continue
+
+            for ref_key, ref_atom_list in ref_groups.items():
+                for model_atom_list in model_groups.values():
+                    rmsd = compute_rmsd_symmetric(model_atom_list, ref_atom_list)
+                    if rmsd is not None and rmsd < min_rmsds[ref_key]:
+                        min_rmsds[ref_key] = rmsd
+
+    return [v for v in min_rmsds.values() if np.isfinite(v)]
+
+
+def plot_distance_histogram(values, title, xlabel, out_path, bin_width=1.0, color='steelblue'):
+    """Histogram for distance/RMSD-style measurements with an unbounded
+    (non-[0,1]) x-range, in the style of calc_filter_rmsd.py's
+    save_histogram. Unlike plot_rscc_histogram, bins span [0, max(values)]
+    at bin_width increments rather than the fixed RSCC [0, 1] range."""
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    if len(values) == 0:
+        print(f'  Skipping {out_path.name}: no data points.')
+        return
+
+    bins = np.arange(0, np.ceil(values.max() / bin_width) * bin_width + bin_width, bin_width)
+    plt.figure(figsize=(10, 6))
+    plt.hist(values, bins=bins, edgecolor='black', alpha=0.7, color=color)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel('Count', fontsize=12)
+    plt.title(f'{title} (n={len(values)})', fontsize=13)
+    plt.xticks(bins, fontsize=8, rotation=90)
+    plt.grid(True, alpha=0.3)
+
+    stats_text = (f'Mean:   {values.mean():.2f} Å\n'
+                  f'Median: {np.median(values):.2f} Å\n'
+                  f'≤ 2 Å:  {(values <= 2).sum()}/{len(values)}')
+    plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes,
+              va='top', ha='right', fontsize=10,
+              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f'  Histogram saved to: {out_path}')
+
+
+def plot_count_histogram(values, title, xlabel, out_path, color='steelblue'):
+    """Histogram of small non-negative integer counts (one value per
+    dataset), with integer-centered bins and a mean/median stats box - no
+    RSCC/distance-specific axis range or threshold line, unlike
+    plot_rscc_histogram/plot_distance_histogram."""
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+    if len(values) == 0:
+        print(f'  Skipping {out_path.name}: no data points.')
+        return
+
+    lo, hi = int(values.min()), int(values.max())
+    bins = np.arange(lo, hi + 2) - 0.5  # one bin per integer value
+
+    plt.figure(figsize=(8, 6))
+    plt.hist(values, bins=bins, edgecolor='black', alpha=0.7, color=color)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel('Number of Datasets', fontsize=12)
+    plt.title(f'{title} (n={len(values)} datasets)', fontsize=13)
+    plt.grid(True, alpha=0.3)
+
+    stats_text = f'Mean:   {values.mean():.2f}\nMedian: {np.median(values):.2f}'
+    plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes,
+              va='top', ha='right', fontsize=10,
+              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f'  Histogram saved to: {out_path}')
 
 
 def residue_label_from_key(chain_id, res_id, altloc):
