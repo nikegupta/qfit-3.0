@@ -666,6 +666,25 @@ def dataset_graphs_dir(datasets_dir, dataset, args):
     return graphs_dir
 
 
+def dataset_csvs_dir(datasets_dir, dataset, args):
+    """Sibling of dataset_graphs_dir: each dataset's final_run_name
+    directory also gets its own csvs/ folder, holding the exact data
+    plotted into the matching file under graphs/ (same basename, .csv
+    instead of .png): .../<final_run_name>/csvs/"""
+    csvs_dir = dataset_final_dir(datasets_dir, dataset, args) / 'csvs'
+    csvs_dir.mkdir(parents=True, exist_ok=True)
+    return csvs_dir
+
+
+def write_plot_csv(csvs_dir, plot_filename, df):
+    """Writes the exact data underlying a plot named plot_filename (e.g.
+    'foo.png', as saved into dataset_graphs_dir) to csvs_dir/foo.csv - same
+    basename as the plot, .csv extension instead of .png."""
+    csv_path = Path(csvs_dir) / (Path(plot_filename).stem + '.csv')
+    df.to_csv(csv_path, index=False)
+    print(f'  Plot data csv saved to: {csv_path}')
+
+
 def read_datasets(datasets_file):
     with open(datasets_file) as f:
         return [line.strip() for line in f if line.strip()]
@@ -677,6 +696,29 @@ def read_calc_rscc_csv(path):
     path = Path(path)
     if not path.exists():
         return pd.DataFrame(columns=['model_idx', 'residue', 'rscc'])
+    return pd.read_csv(path)
+
+
+def read_calc_z_csv(path):
+    """Reads a calc_z-style csv (model_idx,residue,max_z,min_z,average_z).
+    Returns an empty DataFrame with the right columns if the file doesn't
+    exist."""
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame(columns=['model_idx', 'residue', 'max_z', 'min_z', 'average_z'])
+    return pd.read_csv(path)
+
+
+def read_calc_rscc_b_csv(path):
+    """Reads a calc_rscc_b-style csv (model_idx,residue,event_map,bfactor,
+    rscc,spearmans_rho - one row per (event_map, bfactor) combination per
+    residue, restricted to whatever residue list calc_rscc_b was given).
+    Returns an empty DataFrame with the right columns if the file doesn't
+    exist."""
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame(columns=['model_idx', 'residue', 'event_map', 'bfactor', 'rscc',
+                                      'spearmans_rho'])
     return pd.read_csv(path)
 
 
@@ -740,11 +782,45 @@ def find_lig_residue_label(pdb_path):
     return None
 
 
-def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None):
+def find_all_lig_residues(pdb_path):
+    """Scans a PDB file for every distinct residue named 'LIG' and returns
+    [(residue_label, resnum), ...] sorted by resnum, ascending - unlike
+    find_lig_residue_label (which only returns the first LIG residue found),
+    this returns every one. final_model_refined.pdb can contain multiple LIG
+    residues, one per surviving ligand pose, numbered sequentially starting
+    at 1 - the same position-based indexing convention as filter2_run_name's
+    cluster_reps.csv rows (the i-th LIG residue, resid i, corresponds to the
+    i-th DATA row of filter2's cluster_reps.csv). A residue with two or more
+    altloc conformers yields one (label, resnum) pair per altloc, all
+    sharing that residue's resnum (same altloc-splitting rule as
+    lig_conformations/_group_lig_residues)."""
+    path = Path(pdb_path)
+    if not path.exists():
+        return []
+    groups = _group_lig_residues(read_pdb_raw_atoms(path))
+    keys = sorted(groups.keys(), key=lambda k: (k[1], k[0], k[2]))
+    return [(residue_label_from_key(*key), key[1]) for key in keys]
+
+
+def _auto_axis_range(x, y, pad_frac=0.05):
+    """Computes a shared (min, max) axis range covering both x and y, with a
+    fractional padding on each side - used for unbounded metrics (e.g.
+    Z-scores) that don't have RSCC's natural [0, 1] range."""
+    values = np.concatenate([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
+    lo, hi = float(values.min()), float(values.max())
+    pad = (hi - lo) * pad_frac if hi > lo else 1.0
+    return (lo - pad, hi + pad)
+
+
+def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None, axis_range=(0, 1)):
     """Scatter plot in the style of qfit's compare_lig_rscc._plot_scatter:
-    unity dashed line, [0,1] axes, equal aspect, mean/median stats box.
+    unity dashed line, fixed square axes, equal aspect, mean/median stats box.
     extra_text, if given, is appended to the stats box (e.g. a lost-ligand
-    count) below the mean/median lines."""
+    count) below the mean/median lines.
+
+    axis_range: (min, max) applied to both axes and the unity line. Defaults
+    to RSCC's natural (0, 1) range; pass a wider/data-driven range (e.g.
+    _auto_axis_range(x, y)) for unbounded metrics like Z-scores."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
@@ -755,7 +831,7 @@ def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None):
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(x, y, color='steelblue', s=8, edgecolor='none')
 
-    lims = [0, 1]
+    lims = list(axis_range)
     ax.plot(lims, lims, linestyle='--', color='gray', linewidth=1)
     ax.set_xlim(lims)
     ax.set_ylim(lims)
@@ -783,22 +859,30 @@ def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None):
     print(f'  Scatterplot saved to: {out_path}')
 
 
-def plot_rscc_histogram(values, title, xlabel, out_path, color='steelblue'):
+def plot_rscc_histogram(values, title, xlabel, out_path, color='steelblue', value_range=(0, 1)):
     """Histogram in the style of calc_filter_rmsd.py's save_histogram, binned
-    over the fixed [0, 1] RSCC range."""
+    over value_range (default RSCC's fixed [0, 1] range). Pass
+    value_range=None to auto-compute a padded range from the data instead -
+    for unbounded metrics like Z-scores that don't have RSCC's natural
+    [0, 1] range."""
     values = np.asarray(values, dtype=float)
     values = values[~np.isnan(values)]
     if len(values) == 0:
         print(f'  Skipping {out_path.name}: no data points.')
         return
 
-    bins = np.linspace(0, 1, 21)
+    if value_range is None:
+        lo, hi = float(values.min()), float(values.max())
+        pad = (hi - lo) * 0.05 if hi > lo else 1.0
+        value_range = (lo - pad, hi + pad)
+
+    bins = np.linspace(value_range[0], value_range[1], 21)
     plt.figure(figsize=(8, 6))
     plt.hist(values, bins=bins, edgecolor='black', alpha=0.7, color=color)
     plt.xlabel(xlabel, fontsize=12)
     plt.ylabel('Count', fontsize=12)
     plt.title(f'{title} (n={len(values)})', fontsize=13)
-    plt.xlim(0, 1)
+    plt.xlim(value_range)
     plt.grid(True, alpha=0.3)
 
     stats_text = f'Mean:   {values.mean():.3f}\nMedian: {np.median(values):.3f}'
@@ -887,9 +971,13 @@ def _collect_dataset_rscc(datasets_dir, dataset, args, mode):
 def run_rscc_aggregator(args, mode):
     """For every dataset independently (no pooling across datasets), builds
     and saves scatter plots (backbone-vs-apo, final-vs-apo, and - for
-    'protein' only - final-vs-backbone; each over all residues and again
-    restricted to that dataset's residues_with_placer_conformers.csv) into
-    that dataset's own .../<final_run_name>/graphs/ folder.
+    'protein' only - final-vs-backbone), restricted to that dataset's
+    residues_with_placer_conformers.csv, into that dataset's own
+    .../<final_run_name>/graphs/ folder, plus a csv of each plot's
+    underlying data (residue label + both RSCC columns) into the sibling
+    .../<final_run_name>/csvs/ folder. The unrestricted (all-residues)
+    variant of these plots was dropped - it carried no information beyond
+    the placer-conformer-restricted one and only added noise.
 
     mode: 'protein' keeps every residue except the identified LIG residue;
           'lig' keeps only the identified LIG residue. final-vs-backbone is
@@ -916,23 +1004,386 @@ def run_rscc_aggregator(args, mode):
             continue
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
+        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
 
-        subsets = [
-            ('all_residues', df, ''),
-            ('placer_conformers', df[df['has_conformer']], ' (placer-conformer residues)'),
+        conformer_df = df[df['has_conformer']]
+        for xcol, ycol, title, tag in comparisons:
+            paired = conformer_df.dropna(subset=[xcol, ycol])
+            out_name = f'{mode}_{tag}_rscc_placer_conformers.png'
+            if paired.empty:
+                # e.g. every 'vs apo' comparison in mode='lig': the apo structure
+                # has no ligand, so this pair of columns is always all-NaN. Skip
+                # entirely rather than writing an empty plot/csv.
+                print(f'  {dataset}: no data points for {out_name}; skipping.')
+                continue
+            plot_rscc_scatter(
+                paired[xcol], paired[ycol],
+                xlabel=f'{xcol.capitalize()} RSCC', ylabel=f'{ycol.capitalize()} RSCC',
+                title=f'{title} ({dataset}) (placer-conformer residues)',
+                out_path=graphs_dir / out_name,
+            )
+            write_plot_csv(
+                csvs_dir, out_name,
+                paired[['residue', xcol, ycol]].rename(
+                    columns={xcol: f'{xcol}_rscc', ycol: f'{ycol}_rscc'}
+                ),
+            )
+
+
+def _dataset_z_values(z_csv):
+    """Reads a calc_z csv and collapses altloc variants of the same residue
+    down to a single {residue_base: {'max_z', 'min_z', 'average_z'}} dict,
+    keeping the row with the highest max_z for a given base (same
+    'prefer the more extreme reading' choice used for RSCC's altloc
+    collapsing, adapted since a Z-map anomaly is what's being flagged
+    here). calc_z writes one row per residue (no per-event-map/bfactor
+    rows to pool, unlike the RSCC csvs), so no other aggregation is
+    needed."""
+    df = read_calc_z_csv(z_csv)
+    vals = {}
+    for residue, max_z, min_z, average_z in zip(df['residue'], df['max_z'], df['min_z'], df['average_z']):
+        if pd.isna(max_z):
+            continue
+        base = residue_base(residue)
+        if base not in vals or max_z > vals[base]['max_z']:
+            vals[base] = {'max_z': max_z, 'min_z': min_z, 'average_z': average_z}
+    return vals
+
+
+def _dataset_final_vs_apo_z(dataset, args):
+    """Matches every residue in a dataset's final_model_refined_z.csv to the
+    same residue_base in its apo structure's _z.csv (both calc_z outputs),
+    restricted to the residues listed in final_run_name's
+    residues_with_placer_conformers.csv - same restriction as the RSCC
+    vs-apo plots. Returns a DataFrame with columns ['residue', 'apo_max_z',
+    'final_max_z', 'apo_min_z', 'final_min_z', 'apo_average_z',
+    'final_average_z']."""
+    dataset_dir = Path(args.datasets_dir) / dataset
+    apo_csv = dataset_dir / f'{dataset}-aligned-structure_z.csv'
+    final_dir = dataset_final_dir(args.datasets_dir, dataset, args)
+    final_csv = final_dir / 'final_model_refined_z.csv'
+
+    apo_vals = _dataset_z_values(apo_csv)
+    final_vals = _dataset_z_values(final_csv)
+    restrict_labels = read_residue_conformer_list(final_dir / 'residues_with_placer_conformers.csv')
+
+    rows = []
+    for base in set(apo_vals) & set(final_vals):
+        if base not in restrict_labels:
+            continue
+        rows.append({
+            'residue': base,
+            'apo_max_z': apo_vals[base]['max_z'],
+            'final_max_z': final_vals[base]['max_z'],
+            'apo_min_z': apo_vals[base]['min_z'],
+            'final_min_z': final_vals[base]['min_z'],
+            'apo_average_z': apo_vals[base]['average_z'],
+            'final_average_z': final_vals[base]['average_z'],
+        })
+    return pd.DataFrame(rows, columns=[
+        'residue', 'apo_max_z', 'final_max_z', 'apo_min_z', 'final_min_z',
+        'apo_average_z', 'final_average_z',
+    ])
+
+
+def run_z_aggregator(args):
+    """For every dataset independently (no pooling across datasets), builds
+    and saves scatter plots comparing final_model_refined's per-residue
+    Z-map statistics (max_z, min_z, average_z) against the apo structure's
+    own Z-map statistics (same Z-map, different structure), restricted to
+    the residues listed in final_run_name's residues_with_placer_conformers.csv
+    - same restriction as the RSCC vs-apo plots. Plots go into that
+    dataset's own .../<final_run_name>/graphs/ folder, plus a matching csv
+    of each plot's underlying data into the sibling
+    .../<final_run_name>/csvs/ folder.
+
+    Unlike RSCC (bounded to [0, 1]), Z-scores are unbounded and roughly
+    centered on 0, so each plot's axis range is computed from its own data
+    (see _auto_axis_range) rather than using plot_rscc_scatter's [0, 1]
+    default.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    comparisons = [
+        ('apo_max_z', 'final_max_z', 'Max Z-score: Final-Refined vs Apo', 'max_z'),
+        ('apo_min_z', 'final_min_z', 'Min Z-score: Final-Refined vs Apo', 'min_z'),
+        ('apo_average_z', 'final_average_z', 'Average Z-score: Final-Refined vs Apo', 'average_z'),
+    ]
+
+    for dataset in datasets:
+        df = _dataset_final_vs_apo_z(dataset, args)
+        if df.empty:
+            print(f'  {dataset}: no Z-map data found; skipping plots for this dataset.')
+            continue
+
+        graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
+        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
+
+        for xcol, ycol, title, tag in comparisons:
+            paired = df.dropna(subset=[xcol, ycol])
+            out_name = f'final_vs_apo_{tag}_placer_conformers.png'
+            if paired.empty:
+                print(f'  {dataset}: no data points for {out_name}; skipping.')
+                continue
+            plot_rscc_scatter(
+                paired[xcol], paired[ycol],
+                xlabel=f'Apo {tag.replace("_", " ").title()}',
+                ylabel=f'Final-Refined {tag.replace("_", " ").title()}',
+                title=f'{title} ({dataset}) (placer-conformer residues)',
+                out_path=graphs_dir / out_name,
+                axis_range=_auto_axis_range(paired[xcol], paired[ycol]),
+            )
+            write_plot_csv(
+                csvs_dir, out_name,
+                paired[['residue', xcol, ycol]],
+            )
+
+
+def _final_lig_z_values(dataset, args):
+    """For one dataset, returns a DataFrame with columns ['resnum',
+    'residue', 'max_z', 'min_z', 'average_z'] - one row per distinct LIG
+    residue found by scanning final_model_refined.pdb directly (via
+    find_all_lig_residues, not inferred from any csv), matched to its
+    row in final_model_refined_z.csv by residue label. resnum is each LIG
+    residue's own residue number - the same position-based indexing
+    convention as filter2_run_name's cluster_reps.csv rows (see
+    find_all_lig_residues)."""
+    final_dir = dataset_final_dir(args.datasets_dir, dataset, args)
+    final_pdb = final_dir / 'final_model_refined.pdb'
+    final_csv = final_dir / 'final_model_refined_z.csv'
+
+    lig_residues = find_all_lig_residues(final_pdb)
+    if not lig_residues:
+        return pd.DataFrame(columns=['resnum', 'residue', 'max_z', 'min_z', 'average_z'])
+
+    z_df = read_calc_z_csv(final_csv)
+    z_by_residue = {
+        residue: (max_z, min_z, average_z)
+        for residue, max_z, min_z, average_z in zip(
+            z_df['residue'], z_df['max_z'], z_df['min_z'], z_df['average_z']
+        )
+    }
+
+    rows = []
+    for label, resnum in lig_residues:
+        stats = z_by_residue.get(label)
+        if stats is None:
+            print(f'  {dataset}: LIG residue {label} found in {final_pdb} but has no row in '
+                  f'{final_csv}; skipping.')
+            continue
+        max_z, min_z, average_z = stats
+        rows.append({'resnum': resnum, 'residue': label, 'max_z': max_z, 'min_z': min_z,
+                      'average_z': average_z})
+    return pd.DataFrame(rows, columns=['resnum', 'residue', 'max_z', 'min_z', 'average_z'])
+
+
+def run_final_lig_z_histograms(args):
+    """For every dataset independently (no pooling across datasets, same as
+    plot_cluster_reps_rscc.py's cluster_reps_1/2 histograms), plots
+    histograms of max_z/min_z/average_z over every LIG residue in
+    final_model_refined.pdb - i.e. every surviving ligand pose in the final
+    model, found by scanning the pdb for resn 'LIG' (not inferred from
+    residues_with_placer_conformers.csv or any other restriction). Plots go
+    into that dataset's own .../<final_run_name>/graphs/ folder, plus a
+    matching csv of each plot's underlying data (resnum + residue label +
+    that plot's value) into the sibling .../<final_run_name>/csvs/ folder.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    comparisons = [
+        ('max_z', 'Final Ligand Max Z-score'),
+        ('min_z', 'Final Ligand Min Z-score'),
+        ('average_z', 'Final Ligand Average Z-score'),
+    ]
+
+    for dataset in datasets:
+        df = _final_lig_z_values(dataset, args)
+        if df.empty:
+            print(f'  {dataset}: no final LIG residue(s) with Z-map data found; skipping plots '
+                  f'for this dataset.')
+            continue
+
+        graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
+        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
+
+        for col, title in comparisons:
+            values_df = df.dropna(subset=[col])
+            out_name = f'final_lig_{col}.png'
+            if values_df.empty:
+                print(f'  {dataset}: no data points for {out_name}; skipping.')
+                continue
+            plot_rscc_histogram(
+                values_df[col],
+                title=f'{title} ({dataset})',
+                xlabel=title,
+                out_path=graphs_dir / out_name,
+                value_range=None,
+            )
+            write_plot_csv(
+                csvs_dir, out_name,
+                values_df[['resnum', 'residue', col]],
+            )
+
+
+def _plot_bfactor_lines(lines_data, out_path, title, ylabel):
+    """lines_data: list of (bfactors, values, rho) tuples, one per residue -
+    bfactors/values are that residue's full bfactor sweep (see
+    _dataset_final_rscc_b_lines), rho is that sweep's spearmans_rho (or None
+    if undefined). Draws one line per tuple onto a single plot.
+
+    With up to ~200 lines pooled across every dataset, a per-residue legend
+    would be unreadable, so lines are colored by rho instead of by residue
+    identity: a diverging colormap centered at 0, with a colorbar - this
+    turns color into an at-a-glance summary of which lines are
+    bfactor-sensitive (rho near 0 or negative) vs not (rho near +1), and
+    pairs with the companion spearman-rho histogram. Lines with an
+    undefined rho (a canonical event map with only 1 bfactor row - shouldn't
+    happen when calc_rscc_b is run with >=2 --bfactors, but guarded anyway)
+    are drawn in flat gray. Thin, semi-transparent lines let overlapping
+    regions read as density rather than a solid blob."""
+    if not lines_data:
+        print(f'  Skipping {out_path.name}: no data points.')
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    cmap = plt.get_cmap('coolwarm_r')
+    norm = plt.Normalize(vmin=-1, vmax=1)
+
+    for bfactors, values, rho in lines_data:
+        color = cmap(norm(rho)) if rho is not None else (0.6, 0.6, 0.6, 1.0)
+        ax.plot(bfactors, values, color=color, linewidth=0.8, alpha=0.5)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label='Spearman ρ (bfactor vs RSCC), gray = undefined')
+
+    ax.set_xlabel('B-factor')
+    ax.set_ylabel(ylabel)
+    ax.set_title(f'{title} (n={len(lines_data)} residues)')
+    ax.grid(True, alpha=0.3)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f'  Line plot saved to: {out_path}')
+
+
+def _dataset_final_rscc_b_lines(dataset, args):
+    """For one dataset, returns [(bfactors, rsccs, rho, residue), ...] - one
+    entry per residue in final_model_refined_rscc_b.csv, where bfactors/
+    rsccs are that residue's full bfactor sweep (sorted ascending by
+    bfactor) against whichever event map contains that residue's single
+    highest RSCC value across all (event_map, bfactor) rows - the
+    'canonical' event map for that residue - and rho is calc_rscc_b's own
+    spearmans_rho for that (residue, canonical event map) group (None if it
+    was left empty, i.e. fewer than 2 distinct bfactors)."""
+    final_dir = dataset_final_dir(args.datasets_dir, dataset, args)
+    csv_path = final_dir / 'final_model_refined_rscc_b.csv'
+    df = read_calc_rscc_b_csv(csv_path)
+    if df.empty:
+        return []
+
+    lines = []
+    for residue, group in df.groupby('residue'):
+        group = group.dropna(subset=['rscc'])
+        if group.empty:
+            continue
+        canonical_map = group.loc[group['rscc'].idxmax(), 'event_map']
+        map_group = group[group['event_map'] == canonical_map].sort_values('bfactor')
+        bfactors = map_group['bfactor'].to_numpy(dtype=float)
+        rsccs = map_group['rscc'].to_numpy(dtype=float)
+        rho = map_group['spearmans_rho'].iloc[0]
+        rho = None if pd.isna(rho) else float(rho)
+        lines.append((bfactors, rsccs, rho, residue))
+    return lines
+
+
+def run_bfactor_sensitivity_plots(args):
+    """For every dataset independently (no pooling across datasets, same as
+    plot_final_lig_z.py), builds three plots from that dataset's own
+    canonical-event-map bfactor sweep (see _dataset_final_rscc_b_lines,
+    reading final_model_refined_rscc_b.csv) into that dataset's own
+    .../<final_run_name>/graphs/ folder, plus a matching csv of each plot's
+    underlying data (same basename, .csv instead of .png) into the sibling
+    .../<final_run_name>/csvs/ folder:
+
+      bfactor_sensitivity_lines.png             RSCC vs bfactor, one line
+                                                 per residue (its canonical
+                                                 event map's full sweep)
+      bfactor_sensitivity_lines_normalized.png  same, each line shifted so
+                                                 its lowest-bfactor RSCC is 0
+      bfactor_sensitivity_spearman_rho_hist.png histogram of each residue's
+                                                 canonical spearmans_rho,
+                                                 one value per residue
+
+    Not restricted further - every residue calc_rscc_b was run on (i.e.
+    residues_with_placer_conformers.csv) contributes one line/value here.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    for dataset in datasets:
+        lines = _dataset_final_rscc_b_lines(dataset, args)
+        if not lines:
+            print(f'  {dataset}: no bfactor-sweep data found; skipping bfactor sensitivity plots.')
+            continue
+        print(f'  {dataset}: {len(lines)} residue(s) with a canonical bfactor sweep')
+
+        graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
+        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
+
+        # --- Plot 1: raw RSCC vs bfactor ---
+        _plot_bfactor_lines(
+            [(bfactors, rsccs, rho) for bfactors, rsccs, rho, _ in lines],
+            out_path=graphs_dir / 'bfactor_sensitivity_lines.png',
+            title=f'RSCC vs B-factor (canonical event map per residue) ({dataset})',
+            ylabel='RSCC',
+        )
+        raw_csv_rows = [
+            {'residue': residue, 'bfactor': b, 'rscc': r}
+            for bfactors, rsccs, _, residue in lines
+            for b, r in zip(bfactors, rsccs)
         ]
+        write_plot_csv(
+            csvs_dir, 'bfactor_sensitivity_lines.png',
+            pd.DataFrame(raw_csv_rows, columns=['residue', 'bfactor', 'rscc']),
+        )
 
-        for subset_name, subset_df, title_suffix in subsets:
-            suffix = '' if subset_name == 'all_residues' else '_placer_conformers'
-            for xcol, ycol, title, tag in comparisons:
-                paired = subset_df.dropna(subset=[xcol, ycol])
-                out_path = graphs_dir / f'{mode}_{tag}_rscc{suffix}.png'
-                plot_rscc_scatter(
-                    paired[xcol], paired[ycol],
-                    xlabel=f'{xcol.capitalize()} RSCC', ylabel=f'{ycol.capitalize()} RSCC',
-                    title=f'{title} ({dataset}){title_suffix}',
-                    out_path=out_path,
-                )
+        # --- Plot 2: normalized (each line's lowest-bfactor RSCC subtracted off) ---
+        normalized_lines_data = []
+        norm_csv_rows = []
+        for bfactors, rsccs, rho, residue in lines:
+            baseline = rsccs[0]  # bfactors sorted ascending, so index 0 is the lowest bfactor
+            normalized = rsccs - baseline
+            normalized_lines_data.append((bfactors, normalized, rho))
+            for b, r, nr in zip(bfactors, rsccs, normalized):
+                norm_csv_rows.append({'residue': residue, 'bfactor': b, 'rscc': r,
+                                       'normalized_rscc': nr})
+        _plot_bfactor_lines(
+            normalized_lines_data,
+            out_path=graphs_dir / 'bfactor_sensitivity_lines_normalized.png',
+            title=f'RSCC vs B-factor, normalized to lowest bfactor (canonical event map per residue) ({dataset})',
+            ylabel='RSCC - RSCC(lowest bfactor)',
+        )
+        write_plot_csv(
+            csvs_dir, 'bfactor_sensitivity_lines_normalized.png',
+            pd.DataFrame(norm_csv_rows, columns=['residue', 'bfactor', 'rscc', 'normalized_rscc']),
+        )
+
+        # --- Plot 3: histogram of canonical spearmans_rho, one per residue ---
+        rho_rows = [
+            {'residue': residue, 'spearmans_rho': rho}
+            for _, _, rho, residue in lines if rho is not None
+        ]
+        rho_df = pd.DataFrame(rho_rows, columns=['residue', 'spearmans_rho'])
+        plot_rscc_histogram(
+            rho_df['spearmans_rho'],
+            title=f'Spearman ρ of RSCC vs B-factor (canonical event map per residue) ({dataset})',
+            xlabel='Spearman ρ',
+            out_path=graphs_dir / 'bfactor_sensitivity_spearman_rho_hist.png',
+            value_range=(-1.1, 1.1),
+        )
+        write_plot_csv(csvs_dir, 'bfactor_sensitivity_spearman_rho_hist.png', rho_df)
 
 
 def _round1_index_from_placer_file(placer_file, dataset):
@@ -961,6 +1412,14 @@ def plot_filter2_vs_filter1_lig_rscc(args):
     filter.py keeps at most one cluster rep per input placer_file, so each
     round-1 index maps to at most one filter2_run_name row - the match is
     always 1:1, never many:1.
+
+    Also writes the matched (filter_1_cluster_rep_index, filter_2_cluster_rep_index,
+    filter_1_rscc, filter_2_rscc) rows to a csv under .../<final_run_name>/csvs/,
+    matching the plot's filename. filter_1_cluster_rep_index is the round-1
+    index embedded in the placer_file column (1-based position in
+    filter_run_name/cluster_reps.csv); filter_2_cluster_rep_index is that
+    matched row's own 1-based position in filter2_run_name/cluster_reps.csv,
+    which equals the LIG residue number that row ends up as in final_model.pdb.
     """
     datasets = read_datasets(args.datasets_file)
 
@@ -986,9 +1445,16 @@ def plot_filter2_vs_filter1_lig_rscc(args):
         filter2_df = pd.read_csv(filter2_csv)
 
         matched_x, matched_y = [], []
+        matched_filter1_idx, matched_filter2_idx = [], []
         matched_indices = set()
         unmatched_placer_files = []
-        for placer_file, rscc2 in zip(filter2_df['placer_file'], filter2_df['rscc']):
+        # filter2_row_idx is that row's own 1-based position in
+        # filter2_run_name/cluster_reps.csv - the pipeline-wide position-based
+        # indexing convention means this equals the LIG residue number that
+        # row ends up as in final_model.pdb.
+        for filter2_row_idx, (placer_file, rscc2) in enumerate(
+            zip(filter2_df['placer_file'], filter2_df['rscc']), start=1
+        ):
             idx = _round1_index_from_placer_file(placer_file, dataset)
             if idx is None:
                 unmatched_placer_files.append(placer_file)
@@ -1001,6 +1467,8 @@ def plot_filter2_vs_filter1_lig_rscc(args):
             matched_indices.add(idx)
             matched_x.append(rscc1)
             matched_y.append(rscc2)
+            matched_filter1_idx.append(idx)
+            matched_filter2_idx.append(filter2_row_idx)
 
         if unmatched_placer_files:
             preview = unmatched_placer_files[:3]
@@ -1013,11 +1481,26 @@ def plot_filter2_vs_filter1_lig_rscc(args):
         print(f'  {dataset}: {len(matched_x)} matched ligand(s); '
               f'{n_lost}/{n_total_filter1} filter_1 cluster rep(s) lost by filter_2')
 
+        if not matched_x:
+            print(f'  {dataset}: no matched ligand(s); skipping lig_filter2_vs_filter1_rscc.')
+            continue
+
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
+        out_name = 'lig_filter2_vs_filter1_rscc.png'
         plot_rscc_scatter(
             matched_x, matched_y,
             xlabel='Filter_1 RSCC', ylabel='Filter_2 RSCC',
             title=f'Ligand RSCC: Filter_2 vs Filter_1 ({dataset})',
-            out_path=graphs_dir / 'lig_filter2_vs_filter1_rscc.png',
+            out_path=graphs_dir / out_name,
             extra_text=f'Lost filter_1 -> filter_2: {n_lost}/{n_total_filter1}',
+        )
+        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
+        write_plot_csv(
+            csvs_dir, out_name,
+            pd.DataFrame({
+                'filter_1_cluster_rep_index': matched_filter1_idx,
+                'filter_2_cluster_rep_index': matched_filter2_idx,
+                'filter_1_rscc': matched_x,
+                'filter_2_rscc': matched_y,
+            }),
         )

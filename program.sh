@@ -7,6 +7,7 @@
 # Runs, in order:
 #   0. calc_apo_rscc                    -> <dataset>/<dataset>-aligned-structure_rscc.csv
 #      + calc_ref_set_rscc (only with -c) -> REF_SET/<dataset>/<REF_SET_PDB_PATTERN%.pdb>_rscc.csv
+#      + calc_apo_z                     -> <dataset>/<dataset>-aligned-structure_z.csv
 #   1. fit_ligand                       -> <run_name>/
 #      + plot_fit_ligand_counts (always) -> GRAPHS_DIR/<run_name>/
 #      + (only with -c) centroid_rmsd_all -> GRAPHS_DIR/<run_name>/
@@ -26,11 +27,17 @@
 #                                        -> GRAPHS_DIR/<run_name>/.../<filter2_run_name>/
 #   6. build_final + rsr_final
 #      + calc_final_refined_rscc        -> .../<final_run_name>/
+#      + calc_final_refined_z           -> .../<final_run_name>/final_model_refined_z.csv
+#      + calc_final_refined_rscc_b      -> .../<final_run_name>/final_model_refined_rscc_b.csv
+#        (restricted to residues_with_placer_conformers.csv)
 #      + (only with -c) plot_residues_vs_ref_final
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
 #   7. analysis_scripts/*.py            -> .../<final_run_name>/graphs/
-#      (cluster-rep and per-residue RSCC plots, computed independently per
-#      dataset only runs once <final_run_name> is given and stage 6's output exists for every dataset)
+#      (cluster-rep and per-residue RSCC plots, final-vs-apo Z-map statistics
+#      plots (plot_final_vs_apo_z), per-dataset final-ligand Z-map statistics
+#      histograms (plot_final_lig_z), and pooled bfactor-sensitivity plots
+#      (plot_bfactor_sensitivity, from stage 6c3's csvs), computed once
+#      <final_run_name> is given and stage 6's output exists for every dataset)
 #
 #
 #
@@ -69,7 +76,7 @@ usage() {
     cat <<EOF
 Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name]]]]]
            [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>] [-c] [--overwrite]
-           [--dataset <id[,id...]>]
+           [--dataset <id[,id...]>] [--bfactors <list>]
            [--z_threshold <float>] [--num_peaks <int>]
            [--f1_filter_proportion <float>] [--f1_min_cluster_proportion <float>]
            [--f1_rscc_cutoff <float>] [--f1_clustering_mode <all-atom|centroid>]
@@ -85,9 +92,10 @@ Options:
   -n <num_placer_confs>    Number of PLACER conformers for round 1 (placer -n). Default: 1000
   -n2 <num_placer2_confs>  Number of PLACER conformers for round 2 (placer2 -n). Default: 1000
   -g <gpu_ids>             Comma-separated GPU ids for both PLACER rounds. Default: 0
-  -p <num_parallel>        CPU parallelism for every non-PLACER stage (calc_apo_rscc, fit_ligand,
-                            rsr_placer, filter, rsr_backbone, calc_backbone_refined_rscc, rsr_placer2,
-                            filter2, build_final, rsr_final, calc_final_refined_rscc). Default: 1
+  -p <num_parallel>        CPU parallelism for every non-PLACER stage (calc_apo_rscc, calc_apo_z,
+                            fit_ligand, rsr_placer, filter, rsr_backbone, calc_backbone_refined_rscc,
+                            rsr_placer2, filter2, build_final, rsr_final, calc_final_refined_rscc,
+                            calc_final_refined_z). Default: 1
   -c                       Also compare results to the reference set (REF_SET). Runs
                             calc_ref_set_rscc as stage 0b: per dataset, computes RSCC of
                             REF_SET/<dataset>/<REF_SET_PDB_PATTERN>, skipping any dataset whose
@@ -106,6 +114,15 @@ Options:
                             listed in DATASETS_FILE (datasets.txt). Every dataset given must
                             already have a directory under DATASETS_DIR. Applies to every
                             stage (0-7) for the whole invocation.
+  --bfactors <list>        B-factor(s) passed to calc_rscc_b (stage 6c3): a single value
+                            (e.g. "20") or a comma-separated list (e.g. "20,40,60,80,100").
+                            calc_rscc_b is only run on final_model_refined.pdb, restricted to
+                            the residues listed in residues_with_placer_conformers.csv, and
+                            scores every (event map, bfactor) combination separately - a
+                            residue with 4 event maps and 5 bfactors gets 20 rows in
+                            final_model_refined_rscc_b.csv. Passing fewer than 2 bfactors
+                            makes that csv's spearmans_rho column always empty (a rank
+                            correlation needs >= 2 points). Default: "20,40,60,80,100".
   --z_threshold <float>            fit_ligand -z/--z_threshold: Z-score threshold for peak
                                     detection (stage 1a). Default (unset): fit_ligand's own
                                     default (4).
@@ -141,14 +158,14 @@ EOF
 }
 
 # --- User-specified configuration: edit these for your environment ---
-BASE_DIR="/home/ngupta/main/program"
+BASE_DIR="/home/ngupta/main/program_exp"
 CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 LIG_PDB_DIR="${BASE_DIR}/pdb_final_geometry"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV_QFIT="nikhils_program"
+CONDA_ENV_QFIT="nikhils_program_exp"
 CONDA_ENV_PLACER="placer_env"
-CONDA_ENV_RSR="nikhils_program"
-CONDA_ENV_EVAL="nikhils_program"
+CONDA_ENV_RSR="nikhils_program_exp"
+CONDA_ENV_EVAL="nikhils_program_exp"
 RUN_PLACER_PY="/home/ngupta/PLACER/PLACER/run_PLACER.py"
 DATASETS_DIR="${BASE_DIR}/datasets"
 DATASETS_FILE="${BASE_DIR}/datasets.txt"
@@ -176,13 +193,17 @@ CENTROID_RMSD_ALL_PY="${ANALYSIS_SCRIPTS_DIR}/centroid_rmsd_all.py"
 CALC_PLACER_SAMPLING_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling.py"
 CALC_PLACER_SAMPLING_UNREFINED_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling_unrefined.py"
 PLOT_FIT_LIGAND_COUNTS_PY="${ANALYSIS_SCRIPTS_DIR}/plot_fit_ligand_counts.py"
+PLOT_FINAL_VS_APO_Z_PY="${ANALYSIS_SCRIPTS_DIR}/plot_final_vs_apo_z.py"
+PLOT_FINAL_LIG_Z_PY="${ANALYSIS_SCRIPTS_DIR}/plot_final_lig_z.py"
+PLOT_BFACTOR_SENSITIVITY_PY="${ANALYSIS_SCRIPTS_DIR}/plot_bfactor_sensitivity.py"
 
 for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN" "$RSR_SCRIPT_FINAL" \
          "$RUN_PLACER_PY" "$PLOT_CLUSTER_REPS_PY" "$AGGREGATE_PROTEIN_RSCC_PY" "$AGGREGATE_LIG_RSCC_PY" \
          "$PLOT_LIG_VS_REF_FILTER1_PY" "$PLOT_LIG_VS_REF_FILTER2_PY" \
          "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY" \
          "$CENTROID_RMSD_ALL_PY" "$CALC_PLACER_SAMPLING_PY" "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
-         "$PLOT_FIT_LIGAND_COUNTS_PY"; do
+         "$PLOT_FIT_LIGAND_COUNTS_PY" "$PLOT_FINAL_VS_APO_Z_PY" "$PLOT_FINAL_LIG_Z_PY" \
+         "$PLOT_BFACTOR_SENSITIVITY_PY"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
         exit 1
@@ -213,6 +234,12 @@ gpu_ids=""
 num_parallel=""
 compare_ref_set=0
 overwrite=0
+
+# B-factor(s) passed to calc_rscc_b (stage 6c3, final_model_refined.pdb
+# only) - always passed explicitly, since calc_rscc_b's own single-bfactor
+# default would make its spearmans_rho column always empty (needs >=2
+# distinct bfactors per residue/event-map group).
+bfactors="20,40,60,80,100"
 
 # --dataset <id[,id...]>: run only on this subset of datasets instead of
 # reading DATASETS_FILE. dataset_arg holds the raw CLI value; if set, it's
@@ -268,6 +295,10 @@ while [[ $# -gt 0 ]]; do
         --overwrite)
             overwrite=1
             shift
+            ;;
+        --bfactors)
+            bfactors="$2"
+            shift 2
             ;;
         --dataset)
             dataset_arg="$2"
@@ -411,7 +442,7 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # needs to be visible inside the per-dataset *_process_dataset functions even
 # when GNU parallel forks them into new subshells, so it all gets exported.
 export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name
-export num_placer_confs num_placer2_confs compare_ref_set overwrite
+export num_placer_confs num_placer2_confs compare_ref_set overwrite bfactors
 export z_threshold num_peaks
 export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
        f1_clustering_mode f1_clustering_cutoff
@@ -424,6 +455,9 @@ export PLOT_LIG_VS_REF_FILTER1_PY PLOT_LIG_VS_REF_FILTER2_PY
 export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY GRAPHS_DIR
 export CENTROID_RMSD_ALL_PY CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
 export PLOT_FIT_LIGAND_COUNTS_PY
+export PLOT_FINAL_VS_APO_Z_PY
+export PLOT_FINAL_LIG_Z_PY
+export PLOT_BFACTOR_SENSITIVITY_PY
 export REF_SET REF_SET_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL
 export RUN_PLACER_PY
@@ -634,6 +668,72 @@ do_calc_apo_rscc() {
     echo "Starting run"
     local start_time=$(date +%s)
     printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_apo_rscc_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 0c: calc_apo_z
+######################################################################
+# Computes the per-residue Z-map statistics (max/min/average Z-score) of
+# each dataset's baseline {dataset}-aligned-structure.pdb against its own
+# Z-map ({dataset}-z_map.native.ccp4 - the same file fit_ligand.py's
+# LigandPlacer uses to find PLACER peaks), so later analysis can compare the
+# final-refined structure's Z-map statistics against this apo baseline.
+# Dataset-scoped like calc_apo_rscc, and skipped per-dataset whenever its
+# output csv already exists.
+
+calc_apo_z_process_dataset() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+
+    local structure="${dataset_dir}/${dataset}-aligned-structure.pdb"
+    local zmap="${dataset_dir}/${dataset}-z_map.native.ccp4"
+    local output_csv="${dataset_dir}/${dataset}-aligned-structure_z.csv"
+
+    if [ -f "$output_csv" ]; then
+        echo "Skipping [${dataset}]: ${output_csv} already exists."
+        return 0
+    fi
+
+    if [ ! -f "$structure" ]; then
+        echo "Warning [${dataset}]: aligned structure not found: ${structure}, skipping."
+        return 1
+    fi
+    if [ ! -f "$zmap" ]; then
+        echo "Warning [${dataset}]: Z-map not found: ${zmap}, skipping."
+        return 1
+    fi
+
+    local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
+    if [ -z "$lookup" ]; then
+        echo "Warning: No match found for dataset ${dataset}, skipping."
+        return 1
+    fi
+    local resolution=$(echo "$lookup" | awk '{print $3}')
+
+    echo "Processing ${dataset}: resolution=${resolution}"
+
+    calc_z "${structure}" "${zmap}" "${resolution}" "${output_csv}"
+
+    local calc_exit=$?
+    if [ $calc_exit -ne 0 ]; then
+        echo "ERROR [${dataset}]: calc_z failed on ${structure} with exit code ${calc_exit}"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${structure} -> ${output_csv}"
+}
+export -f calc_apo_z_process_dataset
+
+do_calc_apo_z() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_apo_z_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -2144,6 +2244,140 @@ do_calc_final_rscc() {
 }
 
 ######################################################################
+# Stage 6c2: calc_final_refined_z
+######################################################################
+# Computes final_model_refined.pdb's per-residue Z-map statistics
+# (max/min/average Z-score) against the dataset's Z-map, so
+# plot_final_vs_apo_z (stage 7d) can compare them to the apo baseline
+# written by calc_apo_z (stage 0c).
+
+calc_final_refined_z_process_dataset() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+
+    local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
+    if [ -z "$lookup" ]; then
+        echo "Warning: No match found for dataset ${dataset}, skipping."
+        return 1
+    fi
+
+    local resolution=$(echo "$lookup" | awk '{print $3}')
+
+    echo "Processing ${dataset}: resolution=${resolution}"
+
+    local zmap="${dataset_dir}/${dataset}-z_map.native.ccp4"
+    if [ ! -f "$zmap" ]; then
+        echo "Warning [${dataset}]: Z-map not found: ${zmap}, skipping."
+        return 1
+    fi
+
+    local final_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local structure="${final_dir}/final_model_refined.pdb"
+
+    if [ ! -f "$structure" ]; then
+        echo "Warning [${dataset}]: final_model_refined.pdb not found: ${structure}, skipping."
+        return 1
+    fi
+
+    local output_csv="${structure%.pdb}_z.csv"
+
+    calc_z "${structure}" "${zmap}" "${resolution}" "${output_csv}"
+
+    local calc_exit=$?
+    if [ $calc_exit -ne 0 ]; then
+        echo "ERROR [${dataset}]: calc_z failed on ${structure} with exit code ${calc_exit}"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${structure} -> ${output_csv}"
+}
+export -f calc_final_refined_z_process_dataset
+
+do_calc_final_z() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_final_refined_z_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 6c3: calc_final_refined_rscc_b
+######################################################################
+# Computes final_model_refined.pdb's per-residue, per-event-map, per-bfactor
+# RSCC (plus a spearmans_rho column, computed by calc_rscc_b itself),
+# restricted to the residues listed in residues_with_placer_conformers.csv
+# (this sweep is expensive - every residue x every event map x every
+# bfactor - so it's never run over every residue in the structure).
+# final_model_refined_rscc_b.csv feeds the bfactor-sensitivity line/histogram
+# plots (stage 7f).
+
+calc_final_refined_rscc_b_process_dataset() {
+    conda_activate "$CONDA_ENV_QFIT"
+    shopt -s nullglob
+
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+
+    local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
+    if [ -z "$lookup" ]; then
+        echo "Warning: No match found for dataset ${dataset}, skipping."
+        return 1
+    fi
+
+    local resolution=$(echo "$lookup" | awk '{print $3}')
+
+    echo "Processing ${dataset}: resolution=${resolution}"
+
+    local event_maps=("${dataset_dir}/${dataset}-event_"*)
+    if [ ${#event_maps[@]} -eq 0 ]; then
+        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        return 1
+    fi
+
+    local final_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local structure="${final_dir}/final_model_refined.pdb"
+    local residues_file="${final_dir}/residues_with_placer_conformers.csv"
+
+    if [ ! -f "$structure" ]; then
+        echo "Warning [${dataset}]: final_model_refined.pdb not found: ${structure}, skipping."
+        return 1
+    fi
+    if [ ! -s "$residues_file" ]; then
+        echo "Warning [${dataset}]: residues_with_placer_conformers.csv not found or empty: ${residues_file}, skipping."
+        return 1
+    fi
+
+    local output_csv="${structure%.pdb}_rscc_b.csv"
+
+    calc_rscc_b "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" "${residues_file}" \
+        --bfactors "$bfactors"
+
+    local calc_exit=$?
+    if [ $calc_exit -ne 0 ]; then
+        echo "ERROR [${dataset}]: calc_rscc_b failed on ${structure} with exit code ${calc_exit}"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${structure} -> ${output_csv}"
+}
+export -f calc_final_refined_rscc_b_process_dataset
+
+do_calc_final_rscc_b() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_final_refined_rscc_b_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
 # Stage 6d: reference-set comparison (only runs when -c is given)
 ######################################################################
 # Per-residue RSCC comparison of final_model_refined vs reference, pooled
@@ -2221,6 +2455,74 @@ do_aggregate_lig_rscc() {
 }
 
 ######################################################################
+# Stage 7d: plot_final_vs_apo_z
+######################################################################
+# Scatter plots comparing every residue's Z-map statistics (max/min/average
+# Z-score) between final_model_refined and the apo baseline, pooling the
+# per-residue csvs already written by calc_apo_z (stage 0c) and
+# calc_final_refined_z (stage 6c2). Not gated behind -c, since it doesn't
+# need the reference set - same as stage 7a-c.
+
+do_plot_final_vs_apo_z() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_FINAL_VS_APO_Z_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 7e: plot_final_lig_z
+######################################################################
+# Histograms of every LIG residue's Z-map statistics (max/min/average
+# Z-score) in final_model_refined.pdb - one set of 3 histograms per dataset,
+# analogous to plot_cluster_reps_rscc.py's cluster_reps_1/2 histograms.
+# Reads final_model_refined_z.csv (calc_final_refined_z, stage 6c2), scoped
+# to the LIG residues found by scanning final_model_refined.pdb itself. Not
+# gated behind -c - same as stage 7a-d.
+
+do_plot_final_lig_z() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_FINAL_LIG_Z_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 7f: plot_bfactor_sensitivity
+######################################################################
+# Pooled (cross-dataset) plots under GRAPHS_DIR/<run>/.../<final_run_name>/:
+# RSCC-vs-bfactor line plots (raw and normalized) plus a spearmans_rho
+# histogram, built from every dataset's final_model_refined_rscc_b.csv
+# (stage 6c3). Not gated behind -c, since it doesn't compare against the
+# reference set - same as stage 7a-e.
+
+do_plot_bfactor_sensitivity() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_BFACTOR_SENSITIVITY_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
 # Stage orchestration (unchanged shape: check -> run_step -> label)
 ######################################################################
 
@@ -2229,6 +2531,7 @@ stage0_apo_rscc() {
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step "Stage 0b: calc_ref_set_rscc" do_calc_ref_set_rscc
     fi
+    run_step "Stage 0c: calc_apo_z" do_calc_apo_z
 }
 
 stage1_run() {
@@ -2305,11 +2608,13 @@ stage5_filter2() {
 stage6_final() {
     local rel_path="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
     if should_skip_stage "$rel_path"; then
-        echo "Skipping stage 6 (build_final/rsr_final/calc_final_refined_rscc): ${rel_path} already exists for all datasets."
+        echo "Skipping stage 6 (build_final/rsr_final/calc_final_refined_rscc/calc_final_refined_z/calc_final_refined_rscc_b): ${rel_path} already exists for all datasets."
     else
         run_step "Stage 6a: build_final (${final_run_name})" do_build_final
         run_step "Stage 6b: rsr_final (${final_run_name})" do_rsr_final
         run_step "Stage 6c: calc_final_refined_rscc (${final_run_name})" do_calc_final_rscc
+        run_step "Stage 6c2: calc_final_refined_z (${final_run_name})" do_calc_final_z
+        run_step "Stage 6c3: calc_final_refined_rscc_b (${final_run_name})" do_calc_final_rscc_b
     fi
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step "Stage 6d: plot_residues_vs_ref_final (${final_run_name})" do_plot_residues_vs_ref_final
@@ -2325,6 +2630,9 @@ stage7_analysis() {
     run_step "Stage 7a: plot_cluster_reps_rscc (${final_run_name})" do_plot_cluster_reps_rscc
     run_step "Stage 7b: aggregate_protein_rscc (${final_run_name})" do_aggregate_protein_rscc
     run_step "Stage 7c: aggregate_lig_rscc (${final_run_name})" do_aggregate_lig_rscc
+    run_step "Stage 7d: plot_final_vs_apo_z (${final_run_name})" do_plot_final_vs_apo_z
+    run_step "Stage 7e: plot_final_lig_z (${final_run_name})" do_plot_final_lig_z
+    run_step "Stage 7f: plot_bfactor_sensitivity (${final_run_name})" do_plot_bfactor_sensitivity
 }
 
 # --- Drive the requested stages, in order, stopping after the last name given ---

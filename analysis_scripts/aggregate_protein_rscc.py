@@ -12,9 +12,9 @@ except the fitted LIG) across pipeline stages:
   final-refined     vs apo
   final-refined     vs backbone-refined (best RSCC across its cluster reps)
 
-Each comparison is plotted twice: once over every protein residue, and once
-restricted to the residues listed in final_run_name's
-residues_with_placer_conformers.csv.
+Each comparison is restricted to the residues listed in final_run_name's
+residues_with_placer_conformers.csv - the unrestricted (all-residues)
+variant was dropped since it carried no information beyond this one.
 
 Usage:
   aggregate_protein_rscc.py <run_name> <placer_run_name> <filter_run_name> \\

@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import spearmanr
 
 from qfit import Structure
 from qfit import XMap
@@ -25,10 +26,42 @@ def parse_bdc(map_filename):
     return m.group(1) if m else None
 
 
+def parse_bfactors(raw):
+    """Parses a --bfactors value ('20' or '20,40,60,80,100') into a sorted
+    list of unique floats."""
+    return sorted({float(b) for b in str(raw).split(',')})
+
+
+def format_bfactor(bfactor):
+    """Formats a bfactor for use in a csv value, e.g. 20.0 -> '20',
+    22.5 -> '22.5', so whole-number bfactors don't get a pointless '.0'
+    (same helper as real_space_refine_protein.py's format_bfactor)."""
+    if float(bfactor).is_integer():
+        return str(int(bfactor))
+    return str(bfactor)
+
+
+def parse_residues_file(path):
+    """Reads a headerless file of '{chain}{resnum}' labels, one per line
+    (e.g. residues_with_placer_conformers.csv), and returns them as a set.
+    Used to restrict the (expensive - every residue x every event map x
+    every bfactor) sweep to just these residues. Altloc-insensitive: a
+    residue key (chain_id, resi, altloc) is included if its base
+    '{chain_id}{resi}' (no altloc suffix) is in this set."""
+    residues = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                residues.add(line)
+    return residues
+
+
 def build_argparser():
     p = argparse.ArgumentParser(
         description="Calculate per-residue RSCC for a single-model or multimodel PDB "
-                    "structure against a density map."
+                    "structure against one or more density maps, at one or more B-factors, "
+                    "restricted to an explicit list of residues (this sweep is expensive)."
     )
     p.add_argument(
         'structure_pdb',
@@ -40,9 +73,11 @@ def build_argparser():
         type=Path,
         nargs='+',
         help='Path(s) to one or more density map files (e.g. .ccp4 maps) to score each residue '
-             'against. A residue\'s reported RSCC is the max across all maps given. Maps whose '
-             'filename embeds a duplicate 1-BDC_<value>_ (same background-subtraction fraction '
-             'as an already-loaded map) are skipped, since they are identical to that map.'
+             'against. Every residue is scored against every map, at every --bfactors value, '
+             'and every (map, bfactor) combination is written out as its own row - no maximum '
+             'is taken across maps. Maps whose filename embeds a duplicate 1-BDC_<value>_ (same '
+             'background-subtraction fraction as an already-loaded map) are skipped, since they '
+             'are identical to that map.'
     )
     p.add_argument(
         'resolution',
@@ -52,24 +87,39 @@ def build_argparser():
     p.add_argument(
         'output_csv',
         type=Path,
-        help='Path to write the per-residue RSCC csv'
+        help='Path to write the per-residue, per-map, per-bfactor RSCC csv'
     )
     p.add_argument(
-        '--bfactor',
-        type=float,
-        default=DEFAULT_BFACTOR,
-        help=f'B-factor used when generating each residue\'s model density (default: {DEFAULT_BFACTOR})',
+        'residues_file',
+        type=Path,
+        help='Path to a headerless file listing residue labels ("{chain}{resnum}", one per '
+             'line - e.g. residues_with_placer_conformers.csv) to restrict the calculation to. '
+             'Required: this sweep (every residue x every event map x every bfactor) is '
+             'expensive enough that running it over every residue in the structure is not '
+             'practical.'
+    )
+    p.add_argument(
+        '--bfactors',
+        type=str,
+        default=str(DEFAULT_BFACTOR),
+        help='B-factor(s) used when generating each residue\'s model density: a single value '
+             f'(e.g. "20") or a comma-separated list (e.g. "20,40,60,80,100"). RSCC is '
+             'calculated separately at every (map, bfactor) combination - a residue with 4 '
+             'maps and 5 bfactors gets 20 rows in the output csv. '
+             f'(default: {DEFAULT_BFACTOR})',
     )
     return p
 
 
 class ResidueRSCCCalculator:
-    def __init__(self, structure_pdb, map_files, resolution, output_csv, bfactor=DEFAULT_BFACTOR):
+    def __init__(self, structure_pdb, map_files, resolution, output_csv, residues,
+                 bfactors=(DEFAULT_BFACTOR,)):
         self.structure_pdb = Path(structure_pdb)
         self.map_files = [Path(m) for m in map_files]
         self.resolution = resolution
         self.output_csv = Path(output_csv)
-        self.bfactor = bfactor
+        self.residues = set(residues)
+        self.bfactors = list(bfactors)
         self.rmask = 0.5 + resolution / 3.0  # from qfit
 
     def _clean_structure(self, structure):
@@ -101,7 +151,8 @@ class ResidueRSCCCalculator:
 
     def _find_residue_keys(self, structure):
         """
-        Returns [(chain_id, resi, altloc), ...] for every residue in a single-model structure.
+        Returns [(chain_id, resi, altloc), ...] for every residue in a single-model structure
+        that's in self.residues (matched by base '{chain_id}{resi}' label, altloc-insensitive).
 
         A residue group that contains two or more distinct non-blank altlocs (e.g. 'A' and 'B')
         is split into one key per altloc, since each altloc represents a physically distinct
@@ -113,6 +164,8 @@ class ResidueRSCCCalculator:
             chain_id = chain.id.strip()
             for residue_group in chain.residue_groups():
                 resi = int(residue_group.resseq)
+                if f'{chain_id}{resi}' not in self.residues:
+                    continue
                 altlocs = sorted({ag.altloc.strip() for ag in residue_group.atom_groups()})
                 non_blank_altlocs = [a for a in altlocs if a != '']
                 if len(non_blank_altlocs) >= 2:
@@ -179,25 +232,50 @@ class ResidueRSCCCalculator:
             map_models[name] = map_model
         return maps, map_models
 
-    def _score_residue(self, residue_structure, coor, maps, map_models):
-        """Converts a single residue conformer's coordinates to density and returns its highest
-        RSCC across all provided maps, using that conformer's own mask (recomputed per map,
-        since each map may have a different grid)."""
+    def _score_residue_rows(self, residue_structure, coor, maps, map_models):
+        """Computes RSCC for a single residue conformer against every map, at every
+        B-factor in self.bfactors. Returns [(map_name, bfactor, rscc, spearmans_rho), ...],
+        one row per (map, bfactor) combination - no maximum is taken across maps or bfactors
+        here. spearmans_rho is the spearman correlation of bfactor vs rscc within that
+        (map, bfactor-sweep) group - the same value on every row for a given map, since it's
+        a property of the whole per-map bfactor sweep, not of any one bfactor. Left as None
+        (written as an empty csv value) when a map has fewer than 2 distinct bfactor rows,
+        since a rank correlation isn't defined for a single point.
+
+        A fresh transformer is created for every (bfactor, map) combination, and
+        residue_structure.b is set to the current bfactor immediately before building it -
+        qFit's Transformer only computes its radial densities from the structure's B-factor
+        once per instance (on first use) and silently reuses them afterward, so reusing a
+        transformer across bfactors (or forgetting to update .b first) would silently score
+        every bfactor after the first against the first bfactor's density. Same fix applied
+        in real_space_refine_protein.py's score_residue_rsccs, which this mirrors."""
         scaled_bulk_solvent = 0
         coor_set = [coor]
-        bfactor_array = [self.bfactor]
 
-        rsccs = []
-        for name in maps:
-            transformer = get_transformer("qfit", residue_structure, map_models[name])
-            mask = transformer.get_conformers_mask(coor_set, self.rmask)
-            target = maps[name].array[mask]
-            for density in transformer.get_conformers_densities(coor_set, bfactor_array):
-                model_density = density[mask]
-                np.maximum(model_density, scaled_bulk_solvent, out=model_density)
-                correlation_matrix = np.corrcoef(model_density, target)
-                rsccs.append(correlation_matrix[0, 1])
-        return max(rsccs)
+        rows_by_map = {}
+        for bfactor in self.bfactors:
+            for name in maps:
+                residue_structure.b = bfactor
+                transformer = get_transformer("qfit", residue_structure, map_models[name])
+                mask = transformer.get_conformers_mask(coor_set, self.rmask)
+                target = maps[name].array[mask]
+                for density in transformer.get_conformers_densities(coor_set, [bfactor]):
+                    model_density = density[mask]
+                    np.maximum(model_density, scaled_bulk_solvent, out=model_density)
+                    correlation_matrix = np.corrcoef(model_density, target)
+                    rscc = correlation_matrix[0, 1]
+                rows_by_map.setdefault(name, []).append((bfactor, rscc))
+
+        rows = []
+        for name, bfactor_rscc_pairs in rows_by_map.items():
+            bfactors = [b for b, _ in bfactor_rscc_pairs]
+            rsccs = [r for _, r in bfactor_rscc_pairs]
+            rho = None
+            if len(set(bfactors)) >= 2:
+                rho, _ = spearmanr(bfactors, rsccs)
+            for bfactor, rscc in bfactor_rscc_pairs:
+                rows.append((name, bfactor, rscc, rho))
+        return rows
 
     def run(self):
         maps, map_models = self._load_maps()
@@ -229,27 +307,30 @@ class ResidueRSCCCalculator:
                     continue
                 label = self._residue_label(chain_id, resi, altloc)
                 try:
-                    rscc = self._score_residue(residue_structure, coor, maps, map_models)
+                    rows = self._score_residue_rows(residue_structure, coor, maps, map_models)
                 except Exception as e:
                     print(f'Warning: failed to score model {model_idx} residue {label} '
                           f'({type(e).__name__}: {e}); skipping.')
                     continue
-                results.append((model_idx, label, rscc))
+                for map_name, bfactor, rscc, rho in rows:
+                    results.append((model_idx, label, map_name, bfactor, rscc, rho))
 
         self._write_csv(results)
 
     def _write_csv(self, results):
         with open(self.output_csv, 'w+') as f:
-            f.write('model_idx,residue,rscc\n')
-            for model_idx, label, rscc in results:
-                f.write(f'{model_idx},{label},{rscc}\n')
-        print(f'{len(results)} residue RSCC value(s) written to {self.output_csv}')
+            f.write('model_idx,residue,event_map,bfactor,rscc,spearmans_rho\n')
+            for model_idx, label, map_name, bfactor, rscc, rho in results:
+                rho_str = '' if rho is None or np.isnan(rho) else str(rho)
+                f.write(f'{model_idx},{label},{map_name},{format_bfactor(bfactor)},{rscc},{rho_str}\n')
+        print(f'{len(results)} row(s) written to {self.output_csv}')
 
 
 def main():
     args = build_argparser().parse_args()
     calculator = ResidueRSCCCalculator(
-        args.structure_pdb, args.map_files, args.resolution, args.output_csv, args.bfactor
+        args.structure_pdb, args.map_files, args.resolution, args.output_csv,
+        parse_residues_file(args.residues_file), parse_bfactors(args.bfactors),
     )
     calculator.run()
 

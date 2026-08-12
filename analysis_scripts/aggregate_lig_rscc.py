@@ -11,12 +11,12 @@ stages:
   backbone-refined vs apo
   final-refined     vs apo
 
-The apo structure has no ligand, so both "vs apo" comparisons will have no
-data points and are skipped with a message - this is expected, not an
-error. Each comparison is also plotted restricted to the residues listed in
-final_run_name's residues_with_placer_conformers.csv (which never includes
-the ligand, so those plots are expected to be empty too); both variants are
-produced for structural symmetry with aggregate_protein_rscc.py.
+The apo structure has no ligand, so both "vs apo" comparisons will always
+have no data points - no plot or csv is written for them, just a skip
+message - this is expected, not an error. Like aggregate_protein_rscc.py,
+each comparison is restricted to the residues listed in final_run_name's
+residues_with_placer_conformers.csv (which never includes the ligand, so
+these comparisons would be empty for that reason too).
 
 final-refined vs backbone-refined is intentionally omitted here (unlike
 aggregate_protein_rscc.py) since it's redundant with the filter_2-vs-filter_1

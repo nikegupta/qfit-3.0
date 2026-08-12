@@ -1,34 +1,17 @@
 import argparse
-import re
 from pathlib import Path
-
-import numpy as np
 
 from qfit import Structure
 from qfit import XMap
 from qfit.xtal.transformer import get_transformer
 
 
-# Default B-factor used when generating model density for each residue conformer.
-DEFAULT_BFACTOR = 20
-
-# Matches the BDC value embedded in an event map filename, e.g.
-# 'x00407-1-event_1_1-BDC_0.08_map.native.ccp4' -> '0.08'.
-BDC_PATTERN = re.compile(r'1-BDC_([\d.]+)_')
-
-
-def parse_bdc(map_filename):
-    """Extracts the BDC value (as a string, so '0.080' and '0.08' aren't
-    silently treated as equal) from an event map filename. Returns None if
-    the filename doesn't match the expected '1-BDC_<value>_' pattern."""
-    m = BDC_PATTERN.search(str(map_filename))
-    return m.group(1) if m else None
-
-
 def build_argparser():
     p = argparse.ArgumentParser(
-        description="Calculate per-residue RSCC for a single-model or multimodel PDB "
-                    "structure against a density map."
+        description="Calculate per-residue Z-map statistics (max/min/average Z-score) for a "
+                    "single-model or multimodel PDB structure, using the same per-residue "
+                    "voxel mask as calc_rscc's RSCC calculation (and every other density "
+                    "calculation in this pipeline)."
     )
     p.add_argument(
         'structure_pdb',
@@ -36,40 +19,32 @@ def build_argparser():
         help='Path to a single-model or multimodel PDB structure'
     )
     p.add_argument(
-        'map_files',
+        'zmap_file',
         type=Path,
-        nargs='+',
-        help='Path(s) to one or more density map files (e.g. .ccp4 maps) to score each residue '
-             'against. A residue\'s reported RSCC is the max across all maps given. Maps whose '
-             'filename embeds a duplicate 1-BDC_<value>_ (same background-subtraction fraction '
-             'as an already-loaded map) are skipped, since they are identical to that map.'
+        help="Path to the dataset's Z-map file (PanDDA's native-frame "
+             "'<dataset>-z_map.native.ccp4', same file fit_ligand.py's LigandPlacer loads to "
+             "find PLACER peaks). Unlike event maps, there is exactly one Z-map per dataset, "
+             "so no deduplication/max-across-maps logic applies here."
     )
     p.add_argument(
         'resolution',
         type=float,
-        help='Resolution (Å) of the map(s), used both for loading the XMap(s) and for the mask radius'
+        help='Resolution (Å) of the map, used both for loading the XMap and for the mask radius'
     )
     p.add_argument(
         'output_csv',
         type=Path,
-        help='Path to write the per-residue RSCC csv'
-    )
-    p.add_argument(
-        '--bfactor',
-        type=float,
-        default=DEFAULT_BFACTOR,
-        help=f'B-factor used when generating each residue\'s model density (default: {DEFAULT_BFACTOR})',
+        help='Path to write the per-residue Z-map statistics csv'
     )
     return p
 
 
-class ResidueRSCCCalculator:
-    def __init__(self, structure_pdb, map_files, resolution, output_csv, bfactor=DEFAULT_BFACTOR):
+class ResidueZCalculator:
+    def __init__(self, structure_pdb, zmap_file, resolution, output_csv):
         self.structure_pdb = Path(structure_pdb)
-        self.map_files = [Path(m) for m in map_files]
+        self.zmap_file = Path(zmap_file)
         self.resolution = resolution
         self.output_csv = Path(output_csv)
-        self.bfactor = bfactor
         self.rmask = 0.5 + resolution / 3.0  # from qfit
 
     def _clean_structure(self, structure):
@@ -146,61 +121,35 @@ class ResidueRSCCCalculator:
             label += f'-{altloc}'
         return label
 
-    def _load_maps(self):
+    def _load_zmap(self):
         """
-        Loads every map in self.map_files into an {name: XMap} dict, along with a matching
-        {name: zeroed-template XMap} dict used later to build each residue's model density.
-        Keyed by filename (rather than index) so any per-map warnings can reference the file.
-
-        Event maps sharing the same BDC value are identical (same partial-occupancy
-        background subtraction), so scoring more than one of them per residue is
-        wasted compute for no new information - only the first map seen for a given
-        BDC is loaded/kept; later ones with the same BDC are skipped. A map whose
-        filename doesn't match the expected BDC pattern is always kept, since its
-        BDC (and therefore whether it duplicates another map) can't be determined.
+        Loads the Z-map (same XMap.fromfile convention as fit_ligand.py's LigandPlacer.zmap),
+        along with a zeroed-template XMap on the same grid, used to build each residue's mask -
+        same pattern as calc_rscc's map_models, just for a single map instead of a list.
         """
-        maps = {}
-        map_models = {}
-        seen_bdcs = set()
-        for map_file in self.map_files:
-            bdc = parse_bdc(map_file.name)
-            if bdc is not None:
-                if bdc in seen_bdcs:
-                    print(f'Skipping map {map_file}: duplicate BDC={bdc} '
-                          f'(another event map with this BDC was already loaded).')
-                    continue
-                seen_bdcs.add(bdc)
+        print(f'Loading Z-map {self.zmap_file} at resolution {self.resolution}')
+        zmap = XMap.fromfile(str(self.zmap_file), resolution=self.resolution)
+        zmap_model = zmap.zeros_like(zmap)
+        zmap_model.set_space_group("P1")
+        return zmap, zmap_model
 
-            name = map_file.name
-            print(f'Loading map {map_file} at resolution {self.resolution}')
-            maps[name] = XMap.fromfile(str(map_file), resolution=self.resolution)
-            map_model = maps[name].zeros_like(maps[name])
-            map_model.set_space_group("P1")
-            map_models[name] = map_model
-        return maps, map_models
-
-    def _score_residue(self, residue_structure, coor, maps, map_models):
-        """Converts a single residue conformer's coordinates to density and returns its highest
-        RSCC across all provided maps, using that conformer's own mask (recomputed per map,
-        since each map may have a different grid)."""
-        scaled_bulk_solvent = 0
+    def _score_residue(self, residue_structure, coor, zmap, zmap_model):
+        """
+        Masks the Z-map down to a single residue conformer's voxels - the same per-residue
+        voxel mask calc_rscc's RSCC calculation (and every other density calculation in this
+        pipeline) uses - and returns (max_z, min_z, average_z) over that mask. Unlike RSCC, no
+        model density is generated here: a Z-map's values are read directly rather than
+        compared against a model, so b-factor plays no role (get_conformers_mask depends only
+        on atomic coordinates/radii, not b-factor).
+        """
         coor_set = [coor]
-        bfactor_array = [self.bfactor]
-
-        rsccs = []
-        for name in maps:
-            transformer = get_transformer("qfit", residue_structure, map_models[name])
-            mask = transformer.get_conformers_mask(coor_set, self.rmask)
-            target = maps[name].array[mask]
-            for density in transformer.get_conformers_densities(coor_set, bfactor_array):
-                model_density = density[mask]
-                np.maximum(model_density, scaled_bulk_solvent, out=model_density)
-                correlation_matrix = np.corrcoef(model_density, target)
-                rsccs.append(correlation_matrix[0, 1])
-        return max(rsccs)
+        transformer = get_transformer("qfit", residue_structure, zmap_model)
+        mask = transformer.get_conformers_mask(coor_set, self.rmask)
+        target = zmap.array[mask]
+        return float(target.max()), float(target.min()), float(target.mean())
 
     def run(self):
-        maps, map_models = self._load_maps()
+        zmap, zmap_model = self._load_zmap()
 
         model_serials = self._get_model_serials(self.structure_pdb)
         raw_models = Structure.fromfile(str(self.structure_pdb)).split_models()
@@ -229,27 +178,29 @@ class ResidueRSCCCalculator:
                     continue
                 label = self._residue_label(chain_id, resi, altloc)
                 try:
-                    rscc = self._score_residue(residue_structure, coor, maps, map_models)
+                    max_z, min_z, average_z = self._score_residue(
+                        residue_structure, coor, zmap, zmap_model
+                    )
                 except Exception as e:
                     print(f'Warning: failed to score model {model_idx} residue {label} '
                           f'({type(e).__name__}: {e}); skipping.')
                     continue
-                results.append((model_idx, label, rscc))
+                results.append((model_idx, label, max_z, min_z, average_z))
 
         self._write_csv(results)
 
     def _write_csv(self, results):
         with open(self.output_csv, 'w+') as f:
-            f.write('model_idx,residue,rscc\n')
-            for model_idx, label, rscc in results:
-                f.write(f'{model_idx},{label},{rscc}\n')
-        print(f'{len(results)} residue RSCC value(s) written to {self.output_csv}')
+            f.write('model_idx,residue,max_z,min_z,average_z\n')
+            for model_idx, label, max_z, min_z, average_z in results:
+                f.write(f'{model_idx},{label},{max_z},{min_z},{average_z}\n')
+        print(f'{len(results)} residue Z-map statistics row(s) written to {self.output_csv}')
 
 
 def main():
     args = build_argparser().parse_args()
-    calculator = ResidueRSCCCalculator(
-        args.structure_pdb, args.map_files, args.resolution, args.output_csv, args.bfactor
+    calculator = ResidueZCalculator(
+        args.structure_pdb, args.zmap_file, args.resolution, args.output_csv
     )
     calculator.run()
 

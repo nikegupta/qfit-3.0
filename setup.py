@@ -74,6 +74,8 @@ def main():
                 "filter = qfit.command_line.filter:main",
                 "rotamer_optimize = qfit.command_line.rotamer_optimize:main",
                 "calc_rscc = qfit.command_line.calc_rscc:main",
+                "calc_rscc_b = qfit.command_line.calc_rscc_b:main",
+                "calc_z = qfit.command_line.calc_z:main",
                 "compare_lig_rscc = qfit.command_line.compare_lig_rscc:main",
                 "build_final_model = qfit.command_line.build_final_model:main",
             ]
