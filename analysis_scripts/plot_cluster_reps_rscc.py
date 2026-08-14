@@ -24,30 +24,10 @@ Usage:
 """
 from pathlib import Path
 
-import pandas as pd
-
 from rscc_common import (
     build_common_argparser, dataset_graphs_dir, dataset_csvs_dir, read_datasets,
-    plot_rscc_histogram, write_plot_csv,
+    plot_rscc_histogram, write_plot_csv, cluster_rep_rscc_values,
 )
-
-
-def cluster_rep_rscc_values(csv_path):
-    """Returns a DataFrame with columns ['cluster_rep_index', 'rscc'] - one
-    row per data row of csv_path's cluster_reps.csv, with cluster_rep_index
-    set to that row's 1-based position in the file (dropped rows, e.g. a
-    missing rscc, keep the position numbering of the rows that remain)."""
-    empty = pd.DataFrame(columns=['cluster_rep_index', 'rscc'])
-    if not csv_path.exists():
-        print(f'  Warning: cluster_reps.csv not found: {csv_path}')
-        return empty
-    df = pd.read_csv(csv_path)
-    if 'rscc' not in df.columns:
-        print(f'  Warning: no rscc column in {csv_path}')
-        return empty
-    df = df.reset_index(drop=True)
-    df['cluster_rep_index'] = df.index + 1
-    return df[['cluster_rep_index', 'rscc']].dropna(subset=['rscc'])
 
 
 def main():

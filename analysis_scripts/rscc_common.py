@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import gaussian_kde
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -66,6 +67,29 @@ def build_ref_argparser(description, positional_names):
     p.add_argument('--centroid-cutoff', type=float, default=2.0,
                     help='Max centroid distance (A) for a reference/pipeline ligand pair to '
                          'count as matched, same default as qfit compare_lig_rscc (default: 2.0)')
+    return p
+
+
+def build_pooled_argparser(description):
+    """Argparser for pooled (cross-dataset) plots that, unlike
+    build_ref_argparser's reference-set comparisons, don't need the
+    reference set and aren't gated behind -c: the six pipeline run names,
+    the datasets dir/file, and --graphs-dir for the pooled plot output
+    location (same GRAPHS_DIR/<run>/.../<final_run_name> nesting the -c
+    pooled plots use)."""
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument('run_name')
+    p.add_argument('placer_run_name')
+    p.add_argument('filter_run_name')
+    p.add_argument('placer2_run_name')
+    p.add_argument('filter2_run_name')
+    p.add_argument('final_run_name')
+    p.add_argument('--datasets-dir', default=DEFAULT_DATASETS_DIR,
+                    help='Root directory containing per-dataset folders')
+    p.add_argument('--datasets-file', default=DEFAULT_DATASETS_FILE,
+                    help='Path to newline-delimited list of dataset names')
+    p.add_argument('--graphs-dir', required=True,
+                    help='Output directory for the pooled (cross-dataset) plot(s)')
     return p
 
 
@@ -738,6 +762,24 @@ def best_rscc_per_residue(csv_paths):
     return best
 
 
+def cluster_rep_rscc_values(csv_path):
+    """Returns a DataFrame with columns ['cluster_rep_index', 'rscc'] - one
+    row per data row of csv_path's cluster_reps.csv, with cluster_rep_index
+    set to that row's 1-based position in the file (dropped rows, e.g. a
+    missing rscc, keep the position numbering of the rows that remain)."""
+    empty = pd.DataFrame(columns=['cluster_rep_index', 'rscc'])
+    if not csv_path.exists():
+        print(f'  Warning: cluster_reps.csv not found: {csv_path}')
+        return empty
+    df = pd.read_csv(csv_path)
+    if 'rscc' not in df.columns:
+        print(f'  Warning: no rscc column in {csv_path}')
+        return empty
+    df = df.reset_index(drop=True)
+    df['cluster_rep_index'] = df.index + 1
+    return df[['cluster_rep_index', 'rscc']].dropna(subset=['rscc'])
+
+
 def residue_base(label):
     """Strips a calc_rscc residue label's altloc suffix, e.g. 'A103-B' ->
     'A103', so it can be matched against residues_with_placer_conformers.csv
@@ -812,15 +854,50 @@ def _auto_axis_range(x, y, pad_frac=0.05):
     return (lo - pad, hi + pad)
 
 
-def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None, axis_range=(0, 1)):
+# Sentinel default for plot_rscc_scatter's axis_range / plot_rscc_histogram's
+# value_range: means "not explicitly given" (distinct from a caller passing
+# value_range=None, which has its own separate meaning on the histogram
+# side - see plot_rscc_histogram). RSCC is a correlation coefficient bounded
+# to [-1, 1], but real values are seldom that negative, so a fixed [0, 1] or
+# [-1, 1] axis either clips negative RSCCs or wastes a lot of space; when
+# left at this default, both functions instead compute the range from the
+# data itself as (min(data) - 1, 1).
+_RSCC_RANGE_DEFAULT = object()
+
+
+def _point_density(x, y):
+    """Gaussian-KDE point density for each (x[i], y[i]), for a
+    density-colored scatter. Returns None (rather than raising) whenever
+    density estimation isn't meaningful/possible: fewer than 3 points, or
+    degenerate data (e.g. every point identical) that makes the KDE's
+    covariance matrix singular."""
+    if len(x) < 3:
+        return None
+    try:
+        xy = np.vstack([x, y])
+        return gaussian_kde(xy)(xy)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+
+
+def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None,
+                       axis_range=_RSCC_RANGE_DEFAULT, color_by_density=False):
     """Scatter plot in the style of qfit's compare_lig_rscc._plot_scatter:
     unity dashed line, fixed square axes, equal aspect, mean/median stats box.
     extra_text, if given, is appended to the stats box (e.g. a lost-ligand
     count) below the mean/median lines.
 
-    axis_range: (min, max) applied to both axes and the unity line. Defaults
-    to RSCC's natural (0, 1) range; pass a wider/data-driven range (e.g.
-    _auto_axis_range(x, y)) for unbounded metrics like Z-scores."""
+    axis_range: (min, max) applied to both axes and the unity line. Left at
+    its default, computed from the data as (min(x, y) - 1, 1) - see
+    _RSCC_RANGE_DEFAULT. Pass an explicit (min, max) tuple (e.g.
+    _auto_axis_range(x, y)) for unbounded metrics like Z-scores.
+
+    color_by_density: colors each point by its local (gaussian-KDE) point
+    density instead of a flat color, with a colorbar - meant for pooled
+    (cross-dataset) plots, where far more overplotting makes a flat color
+    much less informative than in any single dataset's plot. Falls back to
+    the flat color if density estimation isn't possible (see
+    _point_density)."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
@@ -828,8 +905,17 @@ def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None, ax
         print(f'  Skipping {out_path.name}: no data points.')
         return
 
+    if axis_range is _RSCC_RANGE_DEFAULT:
+        axis_range = (float(np.concatenate([x, y]).min()) - 1, 1)
+
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(x, y, color='steelblue', s=8, edgecolor='none')
+    density = _point_density(x, y) if color_by_density else None
+    if density is not None:
+        order = np.argsort(density)  # draw densest points last, on top
+        sc = ax.scatter(x[order], y[order], c=density[order], cmap='viridis', s=8, edgecolor='none')
+        fig.colorbar(sc, ax=ax, label='Point density', shrink=0.8)
+    else:
+        ax.scatter(x, y, color='steelblue', s=8, edgecolor='none')
 
     lims = list(axis_range)
     ax.plot(lims, lims, linestyle='--', color='gray', linewidth=1)
@@ -859,19 +945,24 @@ def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None, ax
     print(f'  Scatterplot saved to: {out_path}')
 
 
-def plot_rscc_histogram(values, title, xlabel, out_path, color='steelblue', value_range=(0, 1)):
+def plot_rscc_histogram(values, title, xlabel, out_path, color='steelblue',
+                         value_range=_RSCC_RANGE_DEFAULT):
     """Histogram in the style of calc_filter_rmsd.py's save_histogram, binned
-    over value_range (default RSCC's fixed [0, 1] range). Pass
-    value_range=None to auto-compute a padded range from the data instead -
-    for unbounded metrics like Z-scores that don't have RSCC's natural
-    [0, 1] range."""
+    over value_range. Left at its default, computed from the data as
+    (min(values) - 1, 1) - see _RSCC_RANGE_DEFAULT. Pass value_range=None to
+    instead auto-compute a symmetrically padded range from the data - for
+    unbounded metrics like Z-scores that don't have RSCC's natural [0, 1]
+    range. Pass an explicit (min, max) tuple to fully override (e.g. a fixed
+    [-1.1, 1.1] for a correlation-coefficient-like metric)."""
     values = np.asarray(values, dtype=float)
     values = values[~np.isnan(values)]
     if len(values) == 0:
         print(f'  Skipping {out_path.name}: no data points.')
         return
 
-    if value_range is None:
+    if value_range is _RSCC_RANGE_DEFAULT:
+        value_range = (float(values.min()) - 1, 1)
+    elif value_range is None:
         lo, hi = float(values.min()), float(values.max())
         pad = (hi - lo) * 0.05 if hi > lo else 1.0
         value_range = (lo - pad, hi + pad)
@@ -1030,6 +1121,72 @@ def run_rscc_aggregator(args, mode):
             )
 
 
+def run_rscc_aggregator_pooled(args, mode):
+    """Pooled (across every dataset in datasets.txt) counterpart of
+    run_rscc_aggregator: the same per-residue apo/backbone/final RSCC
+    comparisons (restricted to residues_with_placer_conformers.csv),
+    combined into a single scatter plot per comparison instead of one per
+    dataset, colored by point density (plot_rscc_scatter's
+    color_by_density) since pooling every dataset's residues creates far
+    more overplotting than any single dataset's plot has. Plots go into
+    args.graphs_dir, with a matching csv of each plot's underlying data
+    (now including a 'dataset' column, since rows are pooled from many) in
+    the sibling args.graphs_dir/csvs/ folder.
+    """
+    datasets = read_datasets(args.datasets_file)
+    label = mode.capitalize()
+
+    comparisons = [
+        ('apo', 'backbone', f'{label} RSCC: Backbone-Refined vs Apo (pooled)', 'backbone_vs_apo'),
+        ('apo', 'final', f'{label} RSCC: Final-Refined vs Apo (pooled)', 'final_vs_apo'),
+    ]
+    if mode != 'lig':
+        comparisons.append(
+            ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined (pooled)',
+             'final_vs_backbone')
+        )
+
+    pooled_rows = []
+    for dataset in datasets:
+        df = _collect_dataset_rscc(args.datasets_dir, dataset, args, mode)
+        if df.empty:
+            print(f'  {dataset}: no {mode} RSCC data found; skipping.')
+            continue
+        df = df[df['has_conformer']].copy()
+        df['dataset'] = dataset
+        pooled_rows.append(df)
+
+    if not pooled_rows:
+        print(f'  No {mode} RSCC data found for any dataset; skipping pooled plots.')
+        return
+    pooled_df = pd.concat(pooled_rows, ignore_index=True)
+
+    graphs_dir = Path(args.graphs_dir)
+    csvs_dir = graphs_dir / 'csvs'
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    csvs_dir.mkdir(parents=True, exist_ok=True)
+
+    for xcol, ycol, title, tag in comparisons:
+        paired = pooled_df.dropna(subset=[xcol, ycol])
+        out_name = f'{mode}_{tag}_rscc_placer_conformers_pooled.png'
+        if paired.empty:
+            print(f'  No data points for {out_name}; skipping.')
+            continue
+        plot_rscc_scatter(
+            paired[xcol], paired[ycol],
+            xlabel=f'{xcol.capitalize()} RSCC', ylabel=f'{ycol.capitalize()} RSCC',
+            title=f'{title} (placer-conformer residues)',
+            out_path=graphs_dir / out_name,
+            color_by_density=True,
+        )
+        write_plot_csv(
+            csvs_dir, out_name,
+            paired[['dataset', 'residue', xcol, ycol]].rename(
+                columns={xcol: f'{xcol}_rscc', ycol: f'{ycol}_rscc'}
+            ),
+        )
+
+
 def _dataset_z_values(z_csv):
     """Reads a calc_z csv and collapses altloc variants of the same residue
     down to a single {residue_base: {'max_z', 'min_z', 'average_z'}} dict,
@@ -1137,6 +1294,61 @@ def run_z_aggregator(args):
                 csvs_dir, out_name,
                 paired[['residue', xcol, ycol]],
             )
+
+
+def run_z_aggregator_pooled(args):
+    """Pooled (across every dataset in datasets.txt) counterpart of
+    run_z_aggregator: the same final-vs-apo Z-map statistic comparisons
+    (max/min/average, restricted to residues_with_placer_conformers.csv),
+    combined into a single scatter plot per statistic instead of one per
+    dataset, colored by point density (see run_rscc_aggregator_pooled).
+    Plots go into args.graphs_dir, with a matching csv (now including a
+    'dataset' column) in the sibling args.graphs_dir/csvs/ folder.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    comparisons = [
+        ('apo_max_z', 'final_max_z', 'Max Z-score: Final-Refined vs Apo (pooled)', 'max_z'),
+        ('apo_min_z', 'final_min_z', 'Min Z-score: Final-Refined vs Apo (pooled)', 'min_z'),
+        ('apo_average_z', 'final_average_z', 'Average Z-score: Final-Refined vs Apo (pooled)', 'average_z'),
+    ]
+
+    pooled_rows = []
+    for dataset in datasets:
+        df = _dataset_final_vs_apo_z(dataset, args)
+        if df.empty:
+            print(f'  {dataset}: no Z-map data found; skipping.')
+            continue
+        df = df.copy()
+        df['dataset'] = dataset
+        pooled_rows.append(df)
+
+    if not pooled_rows:
+        print('  No Z-map data found for any dataset; skipping pooled plots.')
+        return
+    pooled_df = pd.concat(pooled_rows, ignore_index=True)
+
+    graphs_dir = Path(args.graphs_dir)
+    csvs_dir = graphs_dir / 'csvs'
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    csvs_dir.mkdir(parents=True, exist_ok=True)
+
+    for xcol, ycol, title, tag in comparisons:
+        paired = pooled_df.dropna(subset=[xcol, ycol])
+        out_name = f'final_vs_apo_{tag}_placer_conformers_pooled.png'
+        if paired.empty:
+            print(f'  No data points for {out_name}; skipping.')
+            continue
+        plot_rscc_scatter(
+            paired[xcol], paired[ycol],
+            xlabel=f'Apo {tag.replace("_", " ").title()}',
+            ylabel=f'Final-Refined {tag.replace("_", " ").title()}',
+            title=f'{title} (placer-conformer residues)',
+            out_path=graphs_dir / out_name,
+            axis_range=_auto_axis_range(paired[xcol], paired[ycol]),
+            color_by_density=True,
+        )
+        write_plot_csv(csvs_dir, out_name, paired[['dataset', 'residue', xcol, ycol]])
 
 
 def _final_lig_z_values(dataset, args):
@@ -1384,6 +1596,105 @@ def run_bfactor_sensitivity_plots(args):
             value_range=(-1.1, 1.1),
         )
         write_plot_csv(csvs_dir, 'bfactor_sensitivity_spearman_rho_hist.png', rho_df)
+
+
+def run_bfactor_rho_pooled(args):
+    """Pooled (across every dataset in datasets.txt) counterpart of
+    run_bfactor_sensitivity_plots' spearman-rho histogram only - not the
+    two RSCC-vs-bfactor line plots, which don't pool meaningfully since
+    each line is already one residue's full bfactor sweep (drawing
+    ~200-per-dataset lines from every dataset on one plot would just be
+    noise, unlike a rho value which condenses each residue down to a single
+    number). Combines every dataset's canonical per-residue spearmans_rho
+    (see _dataset_final_rscc_b_lines) into one histogram, with a matching
+    csv (now including a 'dataset' column) in args.graphs_dir/csvs/.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    rows = []
+    for dataset in datasets:
+        lines = _dataset_final_rscc_b_lines(dataset, args)
+        if not lines:
+            print(f'  {dataset}: no bfactor-sweep data found; skipping.')
+            continue
+        for _, _, rho, residue in lines:
+            if rho is not None:
+                rows.append({'dataset': dataset, 'residue': residue, 'spearmans_rho': rho})
+
+    if not rows:
+        print('  No bfactor-sweep data found for any dataset; skipping pooled plot.')
+        return
+    rho_df = pd.DataFrame(rows, columns=['dataset', 'residue', 'spearmans_rho'])
+
+    graphs_dir = Path(args.graphs_dir)
+    csvs_dir = graphs_dir / 'csvs'
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    csvs_dir.mkdir(parents=True, exist_ok=True)
+
+    out_name = 'bfactor_sensitivity_spearman_rho_hist_pooled.png'
+    plot_rscc_histogram(
+        rho_df['spearmans_rho'],
+        title='Spearman ρ of RSCC vs B-factor (canonical event map per residue) (pooled)',
+        xlabel='Spearman ρ',
+        out_path=graphs_dir / out_name,
+        value_range=(-1.1, 1.1),
+    )
+    write_plot_csv(csvs_dir, out_name, rho_df)
+
+
+def run_cluster_reps_pooled(args):
+    """Pooled (across every dataset in datasets.txt) counterpart of
+    plot_cluster_reps_rscc.py's cluster_reps_1/cluster_reps_2 histograms:
+    combines every dataset's cluster_reps.csv 'rscc' column (see
+    cluster_rep_rscc_values) into one histogram per stage
+    (filter_run_name / filter2_run_name) instead of one per dataset. Not a
+    scatter plot, so no density coloring applies here - a histogram's bar
+    heights already are the density. Plots go into args.graphs_dir, with a
+    matching csv (now including a 'dataset' column) in the sibling
+    args.graphs_dir/csvs/ folder.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    stage1_rows, stage2_rows = [], []
+    for dataset in datasets:
+        dataset_dir = Path(args.datasets_dir) / dataset
+
+        csv1 = (dataset_dir / args.run_name / args.placer_run_name /
+                args.filter_run_name / 'cluster_reps.csv')
+        values1_df = cluster_rep_rscc_values(csv1)
+        if not values1_df.empty:
+            values1_df = values1_df.copy()
+            values1_df['dataset'] = dataset
+            stage1_rows.append(values1_df)
+
+        csv2 = (dataset_dir / args.run_name / args.placer_run_name / args.filter_run_name /
+                args.placer2_run_name / args.filter2_run_name / 'cluster_reps.csv')
+        values2_df = cluster_rep_rscc_values(csv2)
+        if not values2_df.empty:
+            values2_df = values2_df.copy()
+            values2_df['dataset'] = dataset
+            stage2_rows.append(values2_df)
+
+    graphs_dir = Path(args.graphs_dir)
+    csvs_dir = graphs_dir / 'csvs'
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    csvs_dir.mkdir(parents=True, exist_ok=True)
+
+    for rows, out_name, stage_label in [
+        (stage1_rows, 'cluster_reps_1_pooled.png', args.filter_run_name),
+        (stage2_rows, 'cluster_reps_2_pooled.png', args.filter2_run_name),
+    ]:
+        if not rows:
+            print(f'  No data found for {out_name}; skipping.')
+            continue
+        pooled_df = pd.concat(rows, ignore_index=True)
+        plot_rscc_histogram(
+            pooled_df['rscc'],
+            title=f'Cluster-Rep RSCC ({stage_label}) (pooled)',
+            xlabel='RSCC',
+            out_path=graphs_dir / out_name,
+        )
+        write_plot_csv(csvs_dir, out_name, pooled_df[['dataset', 'cluster_rep_index', 'rscc']])
 
 
 def _round1_index_from_placer_file(placer_file, dataset):
