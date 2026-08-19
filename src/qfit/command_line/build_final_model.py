@@ -119,6 +119,25 @@ class FinalModelBuilder():
     def _load_apo_structure(self):
         self.apo_model = Structure.fromfile(str(self.apo_structure))
 
+    def _cluster_reps_csv_path(self):
+        """cluster_reps.csv sits beside self.multimodel_pdb (cluster_rep_models.pdb) -
+        both are written by the same filter/filter2 run, from the same
+        cluster_reps dict, so a cluster_rep_models.pdb with N models always
+        has a cluster_reps.csv with N data rows, and vice versa."""
+        return Path(self.multimodel_pdb).parent / 'cluster_reps.csv'
+
+    def _countClusterReps(self):
+        """Returns the number of data rows (i.e. accepted cluster reps) in
+        cluster_reps.csv, or 0 if that csv is missing, empty, or header-only -
+        which happens when filter/filter2 rejected every candidate for this
+        dataset (e.g. every cluster failed the count/rscc/clash cutoffs)."""
+        csv_path = self._cluster_reps_csv_path()
+        if not csv_path.exists():
+            return 0
+        with open(csv_path) as f:
+            lines = [line for line in f if line.strip()]
+        return max(len(lines) - 1, 0)
+
     def run(self):
         """Rescores the protein binding-site residues around the ligand(s) in a
         multimodel pdb (e.g. filter_all.py's cluster_rep_models.pdb), pooling
@@ -127,6 +146,13 @@ class FinalModelBuilder():
         conformation of each residue (falling back to the apo conformation when
         needed), plus every ligand pose from the multimodel pdb - to
         output_folder/final_model.pdb.
+
+        Writes nothing (returns early, no final_model.pdb) if cluster_reps.csv
+        (beside multimodel_pdb) has no accepted cluster reps - i.e. filter/
+        filter2 rejected every candidate for this dataset. Without that check,
+        a dataset in this state would still get a final_model.pdb built from
+        placer2's protein-only conformers with zero ligand poses in it, which
+        looks superficially complete but can never pass refinement.
 
         All print() output is mirrored to output_folder/log.txt in addition to
         the console.
@@ -139,6 +165,14 @@ class FinalModelBuilder():
         sys.stdout = _Tee(original_stdout, log_file)
 
         try:
+            n_cluster_reps = self._countClusterReps()
+            print(f'{n_cluster_reps} cluster rep row(s) found in {self._cluster_reps_csv_path()}')
+            if n_cluster_reps == 0:
+                print('No cluster reps found (filter/filter2 rejected every candidate for this '
+                      'dataset) - there is no ligand pose to build a final model around, so '
+                      'final_model.pdb is not being written.')
+                return
+
             print(self.multimodel_pdb)
             self.multimodel_models = Structure.fromfile(str(self.multimodel_pdb)).split_models()
             print(f'{len(self.multimodel_models)} model(s) in multimodel pdb')

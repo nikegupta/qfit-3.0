@@ -25,7 +25,7 @@ from rscc_common import build_common_argparser, run_rscc_aggregator
 
 def main():
     args = build_common_argparser(__doc__).parse_args()
-    run_rscc_aggregator(args, mode='protein')
+    run_rscc_aggregator(args)
 
 
 if __name__ == '__main__':

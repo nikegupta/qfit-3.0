@@ -20,7 +20,7 @@ from rscc_common import build_pooled_argparser, run_rscc_aggregator_pooled
 
 def main():
     args = build_pooled_argparser(__doc__).parse_args()
-    run_rscc_aggregator_pooled(args, mode='protein')
+    run_rscc_aggregator_pooled(args)
 
 
 if __name__ == '__main__':

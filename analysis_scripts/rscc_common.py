@@ -93,6 +93,46 @@ def build_pooled_argparser(description):
     return p
 
 
+def build_despot_argparser(description):
+    """Argparser for the per-dataset DESPOT energy-score plot: the six
+    pipeline run names plus despot_run_name (needed to locate
+    <despot_run_name>/<dataset>_DESPOT.csv), plus the datasets dir/file."""
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument('run_name')
+    p.add_argument('placer_run_name')
+    p.add_argument('filter_run_name')
+    p.add_argument('placer2_run_name')
+    p.add_argument('filter2_run_name')
+    p.add_argument('final_run_name')
+    p.add_argument('despot_run_name')
+    p.add_argument('--datasets-dir', default=DEFAULT_DATASETS_DIR,
+                    help='Root directory containing per-dataset folders')
+    p.add_argument('--datasets-file', default=DEFAULT_DATASETS_FILE,
+                    help='Path to newline-delimited list of dataset names')
+    return p
+
+
+def build_despot_pooled_argparser(description):
+    """Argparser for the pooled (cross-dataset) DESPOT energy-score plot:
+    same seven positional run names as build_despot_argparser, plus
+    --graphs-dir for the pooled plot output location."""
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument('run_name')
+    p.add_argument('placer_run_name')
+    p.add_argument('filter_run_name')
+    p.add_argument('placer2_run_name')
+    p.add_argument('filter2_run_name')
+    p.add_argument('final_run_name')
+    p.add_argument('despot_run_name')
+    p.add_argument('--datasets-dir', default=DEFAULT_DATASETS_DIR,
+                    help='Root directory containing per-dataset folders')
+    p.add_argument('--datasets-file', default=DEFAULT_DATASETS_FILE,
+                    help='Path to newline-delimited list of dataset names')
+    p.add_argument('--graphs-dir', required=True,
+                    help='Output directory for the pooled (cross-dataset) plot')
+    return p
+
+
 def build_placer_sampling_argparser(description):
     """Argparser for calc_placer_sampling.py / calc_placer_sampling_unrefined.py.
     Like build_ref_argparser, but run_name/placer_run_name are always
@@ -480,7 +520,7 @@ def residue_label_from_key(chain_id, res_id, altloc):
     return label
 
 
-def _dataset_lig_vs_ref(dataset, args, run_dir):
+def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
     """For one dataset, matches every reference LIG conformation in
     ref_pdb_path(args, dataset) to the nearest cluster-rep ligand pose in
     run_dir/cluster_rep_models.pdb (by centroid distance, no RSCC
@@ -489,6 +529,13 @@ def _dataset_lig_vs_ref(dataset, args, run_dir):
     the i-th MODEL block, same pipeline-wide indexing convention used
     everywhere else) and ref_rscc_csv_path(args, dataset)'s per-residue
     RSCC for the already-computed values on each side.
+
+    alive_rows: optional set of 1-indexed cluster_reps.csv/cluster_rep_models.pdb
+    row numbers to restrict matching to (e.g. despot_filter.py survivors - see
+    plot_lig_vs_ref_despot.py). A row not in this set is treated exactly like
+    a MODEL block with no LIG atoms: never matched, and not counted as excess
+    either (it isn't "extra" pipeline output, it was deliberately filtered
+    out). None (default) means every row is eligible, the original behavior.
 
     Returns (matched_ref_rscc, matched_pipeline_rscc, n_unmatched_ref,
     n_excess_pipeline).
@@ -522,6 +569,9 @@ def _dataset_lig_vs_ref(dataset, args, run_dir):
 
     pipeline_centroids = []
     for i in range(n_models):
+        if alive_rows is not None and (i + 1) not in alive_rows:
+            pipeline_centroids.append(None)
+            continue
         lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
         pipeline_centroids.append(
             np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
@@ -561,7 +611,7 @@ def _dataset_lig_vs_ref(dataset, args, run_dir):
     return matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline
 
 
-def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name):
+def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None):
     """Pools stage-appropriate cluster_reps.csv ligand RSCC vs matched
     reference ligand RSCC across every dataset in datasets.txt into a single
     scatter plot (Reference on x, Pipeline on y - qfit compare_lig_rscc's
@@ -569,6 +619,10 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name):
 
     run_dir_for_dataset(dataset) -> Path to the directory holding that
     dataset's cluster_reps.csv + cluster_rep_models.pdb for this stage.
+
+    alive_rows_for_dataset(dataset) -> optional; if given, restricts that
+    dataset's cluster_reps.csv rows to this set (see _dataset_lig_vs_ref's
+    alive_rows) instead of considering every row eligible.
     """
     datasets = read_datasets(args.datasets_file)
     all_ref, all_pipeline = [], []
@@ -576,7 +630,10 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name):
 
     for dataset in datasets:
         run_dir = run_dir_for_dataset(dataset)
-        ref_vals, pipeline_vals, n_unmatched, n_excess = _dataset_lig_vs_ref(dataset, args, run_dir)
+        alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
+        ref_vals, pipeline_vals, n_unmatched, n_excess = _dataset_lig_vs_ref(
+            dataset, args, run_dir, alive_rows=alive_rows
+        )
         all_ref.extend(ref_vals)
         all_pipeline.extend(pipeline_vals)
         total_unmatched += n_unmatched
@@ -643,6 +700,11 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
     collect_restrict_labels(dataset) -> set of '{chain}{resnum}' labels to
     additionally restrict to (e.g. refined_residues.csv or
     residues_with_placer_conformers.csv).
+
+    Pooling every dataset's residues into one plot can put tens of thousands
+    of points on it, so - like the pooled protein_final_vs_apo-style plots -
+    these are colored by point density (plot_rscc_scatter's
+    color_by_density) rather than a flat color.
     """
     datasets = read_datasets(args.datasets_file)
     all_pairs, restricted_pairs = [], []
@@ -670,6 +732,7 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
             xlabel='Reference RSCC', ylabel=f'{structure_label} RSCC',
             title=f'{structure_label} RSCC vs Reference{title_suffix}',
             out_path=graphs_dir / f'{out_prefix}_vs_reference_rscc{suffix}.png',
+            color_by_density=True,
         )
 
 
@@ -707,6 +770,98 @@ def write_plot_csv(csvs_dir, plot_filename, df):
     csv_path = Path(csvs_dir) / (Path(plot_filename).stem + '.csv')
     df.to_csv(csv_path, index=False)
     print(f'  Plot data csv saved to: {csv_path}')
+
+
+def despot_csv_path(datasets_dir, dataset, args):
+    """<final_run_name>/<despot_run_name>/<dataset>_DESPOT.csv - written by
+    program.sh's despot_process_dataset (DESPOT's score_complex.py, via its
+    own -o argument)."""
+    return dataset_final_dir(datasets_dir, dataset, args) / args.despot_run_name / f'{dataset}_DESPOT.csv'
+
+
+def read_despot_csv(path):
+    """Reads a DESPOT score_complex.py output csv (ligand,score). Returns an
+    empty DataFrame with the right columns if the file doesn't exist."""
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame(columns=['ligand', 'score'])
+    return pd.read_csv(path)
+
+
+def run_despot_energies_single(args):
+    """For every dataset independently (no pooling across datasets), plots a
+    histogram of DESPOT ligand binding-energy scores already written by
+    program.sh's despot stage into
+    .../<final_run_name>/<despot_run_name>/<dataset>_DESPOT.csv - no scores
+    are computed here. Written into that dataset's existing
+    .../<final_run_name>/graphs/ and csvs/ folders (not nested under
+    despot_run_name), the same per-dataset location every other analysis
+    plot in this file uses:
+      despot_energies.png
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    for dataset in datasets:
+        csv_path = despot_csv_path(args.datasets_dir, dataset, args)
+        df = read_despot_csv(csv_path)
+        if df.empty:
+            print(f'  {dataset}: no DESPOT scores found ({csv_path}); skipping.')
+            continue
+
+        graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
+        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
+        out_name = 'despot_energies.png'
+
+        plot_rscc_histogram(
+            df['score'], title=f'DESPOT Ligand Binding Energies ({dataset})',
+            xlabel='DESPOT Energy Score', out_path=graphs_dir / out_name,
+            value_range=None,
+        )
+        write_plot_csv(csvs_dir, out_name, df[['ligand', 'score']])
+
+
+def run_despot_energies_pooled(args):
+    """Pooled (across every dataset in datasets.txt) counterpart of
+    run_despot_energies_single: every dataset's DESPOT scores combined into
+    one histogram, into args.graphs_dir - program.sh points this at
+    GRAPHS_DIR/.../<final_run_name>/<despot_run_name>/, nested under
+    despot_run_name (unlike the other stage 7/8 pooled plots), since the
+    scores themselves are specific to one despot_run_name - with a matching
+    csv (now including a 'dataset' column) in the sibling
+    args.graphs_dir/csvs/ folder:
+      ligand_energies.png
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    pooled_rows = []
+    for dataset in datasets:
+        csv_path = despot_csv_path(args.datasets_dir, dataset, args)
+        df = read_despot_csv(csv_path)
+        if df.empty:
+            print(f'  {dataset}: no DESPOT scores found ({csv_path}); skipping.')
+            continue
+        df = df.copy()
+        df['dataset'] = dataset
+        pooled_rows.append(df)
+
+    if not pooled_rows:
+        print('  No DESPOT scores found for any dataset; skipping pooled plot.')
+        return
+
+    pooled_df = pd.concat(pooled_rows, ignore_index=True)
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    csvs_dir = graphs_dir / 'csvs'
+    csvs_dir.mkdir(parents=True, exist_ok=True)
+
+    out_name = 'ligand_energies.png'
+    plot_rscc_histogram(
+        pooled_df['score'], title='DESPOT Ligand Binding Energies (pooled)',
+        xlabel='DESPOT Energy Score', out_path=graphs_dir / out_name,
+        value_range=None,
+    )
+    write_plot_csv(csvs_dir, out_name, pooled_df[['dataset', 'ligand', 'score']])
 
 
 def read_datasets(datasets_file):
@@ -861,7 +1016,10 @@ def _auto_axis_range(x, y, pad_frac=0.05):
 # to [-1, 1], but real values are seldom that negative, so a fixed [0, 1] or
 # [-1, 1] axis either clips negative RSCCs or wastes a lot of space; when
 # left at this default, both functions instead compute the range from the
-# data itself as (min(data) - 1, 1).
+# data itself: plot_rscc_scatter uses (min(x, y) - 0.1, 1) (a small pad
+# below the lowest plotted point, not the whole [-1, 1] worth of headroom -
+# a flat "- 1" swallowed most of the plot in empty space below any real
+# data); plot_rscc_histogram still uses (min(values) - 1, 1).
 _RSCC_RANGE_DEFAULT = object()
 
 
@@ -887,9 +1045,10 @@ def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None,
     extra_text, if given, is appended to the stats box (e.g. a lost-ligand
     count) below the mean/median lines.
 
-    axis_range: (min, max) applied to both axes and the unity line. Left at
-    its default, computed from the data as (min(x, y) - 1, 1) - see
-    _RSCC_RANGE_DEFAULT. Pass an explicit (min, max) tuple (e.g.
+    axis_range: (min, max) applied to both axes and the unity line, so the
+    two axes always share one scale and stay directly visually comparable.
+    Left at its default, computed from the data as (min(x, y) - 0.1, 1) -
+    see _RSCC_RANGE_DEFAULT. Pass an explicit (min, max) tuple (e.g.
     _auto_axis_range(x, y)) for unbounded metrics like Z-scores.
 
     color_by_density: colors each point by its local (gaussian-KDE) point
@@ -906,7 +1065,7 @@ def plot_rscc_scatter(x, y, xlabel, ylabel, title, out_path, extra_text=None,
         return
 
     if axis_range is _RSCC_RANGE_DEFAULT:
-        axis_range = (float(np.concatenate([x, y]).min()) - 1, 1)
+        axis_range = (float(np.concatenate([x, y]).min()) - 0.1, 1)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     density = _point_density(x, y) if color_by_density else None
@@ -988,10 +1147,12 @@ def plot_rscc_histogram(values, title, xlabel, out_path, color='steelblue',
     print(f'  Histogram saved to: {out_path}')
 
 
-def _collect_dataset_rscc(datasets_dir, dataset, args, mode):
+def _collect_dataset_rscc(datasets_dir, dataset, args):
     """Builds this dataset's residue-level apo/backbone/final RSCC rows,
-    restricted per `mode` ('protein' keeps everything but the identified LIG
-    residue; 'lig' keeps only it). Only reads csvs already written by
+    restricted to protein residues (everything but the identified LIG
+    residue - a ligand-vs-apo RSCC comparison never has data, since the apo
+    structure has no ligand; see aggregate_lig_rscc.py for the ligand
+    comparison that does make sense). Only reads csvs already written by
     calc_apo_rscc/calc_backbone_refined_rscc/calc_final_refined_rscc - no
     RSCC values are computed here."""
     dataset_dir = Path(datasets_dir) / dataset
@@ -1044,9 +1205,7 @@ def _collect_dataset_rscc(datasets_dir, dataset, args, mode):
     all_bases = set(apo_vals) | set(backbone_vals) | set(final_vals)
     for base in all_bases:
         is_lig = base is not None and (base == backbone_lig_base or base == final_lig_base)
-        if mode == 'protein' and is_lig:
-            continue
-        if mode == 'lig' and not is_lig:
+        if is_lig:
             continue
         rows.append({
             'residue': base,
@@ -1059,39 +1218,30 @@ def _collect_dataset_rscc(datasets_dir, dataset, args, mode):
     return pd.DataFrame(rows, columns=['residue', 'apo', 'backbone', 'final', 'has_conformer'])
 
 
-def run_rscc_aggregator(args, mode):
+def run_rscc_aggregator(args):
     """For every dataset independently (no pooling across datasets), builds
-    and saves scatter plots (backbone-vs-apo, final-vs-apo, and - for
-    'protein' only - final-vs-backbone), restricted to that dataset's
+    and saves protein-residue scatter plots (backbone-vs-apo, final-vs-apo,
+    final-vs-backbone), restricted to that dataset's
     residues_with_placer_conformers.csv, into that dataset's own
     .../<final_run_name>/graphs/ folder, plus a csv of each plot's
     underlying data (residue label + both RSCC columns) into the sibling
     .../<final_run_name>/csvs/ folder. The unrestricted (all-residues)
     variant of these plots was dropped - it carried no information beyond
     the placer-conformer-restricted one and only added noise.
-
-    mode: 'protein' keeps every residue except the identified LIG residue;
-          'lig' keeps only the identified LIG residue. final-vs-backbone is
-          skipped for 'lig' since plot_filter2_vs_filter1_lig_rscc already
-          covers that comparison (matched via cluster_reps.csv, not the
-          per-residue calc_rscc csvs) and would otherwise be redundant.
     """
     datasets = read_datasets(args.datasets_file)
-    label = mode.capitalize()
+    label = 'Protein'
 
     comparisons = [
         ('apo', 'backbone', f'{label} RSCC: Backbone-Refined vs Apo', 'backbone_vs_apo'),
         ('apo', 'final', f'{label} RSCC: Final-Refined vs Apo', 'final_vs_apo'),
+        ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined', 'final_vs_backbone'),
     ]
-    if mode != 'lig':
-        comparisons.append(
-            ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined', 'final_vs_backbone')
-        )
 
     for dataset in datasets:
-        df = _collect_dataset_rscc(args.datasets_dir, dataset, args, mode)
+        df = _collect_dataset_rscc(args.datasets_dir, dataset, args)
         if df.empty:
-            print(f'  {dataset}: no {mode} RSCC data found; skipping plots for this dataset.')
+            print(f'  {dataset}: no protein RSCC data found; skipping plots for this dataset.')
             continue
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
@@ -1100,11 +1250,8 @@ def run_rscc_aggregator(args, mode):
         conformer_df = df[df['has_conformer']]
         for xcol, ycol, title, tag in comparisons:
             paired = conformer_df.dropna(subset=[xcol, ycol])
-            out_name = f'{mode}_{tag}_rscc_placer_conformers.png'
+            out_name = f'protein_{tag}_rscc_placer_conformers.png'
             if paired.empty:
-                # e.g. every 'vs apo' comparison in mode='lig': the apo structure
-                # has no ligand, so this pair of columns is always all-NaN. Skip
-                # entirely rather than writing an empty plot/csv.
                 print(f'  {dataset}: no data points for {out_name}; skipping.')
                 continue
             plot_rscc_scatter(
@@ -1121,9 +1268,9 @@ def run_rscc_aggregator(args, mode):
             )
 
 
-def run_rscc_aggregator_pooled(args, mode):
+def run_rscc_aggregator_pooled(args):
     """Pooled (across every dataset in datasets.txt) counterpart of
-    run_rscc_aggregator: the same per-residue apo/backbone/final RSCC
+    run_rscc_aggregator: the same per-residue protein apo/backbone/final RSCC
     comparisons (restricted to residues_with_placer_conformers.csv),
     combined into a single scatter plot per comparison instead of one per
     dataset, colored by point density (plot_rscc_scatter's
@@ -1134,30 +1281,27 @@ def run_rscc_aggregator_pooled(args, mode):
     the sibling args.graphs_dir/csvs/ folder.
     """
     datasets = read_datasets(args.datasets_file)
-    label = mode.capitalize()
+    label = 'Protein'
 
     comparisons = [
         ('apo', 'backbone', f'{label} RSCC: Backbone-Refined vs Apo (pooled)', 'backbone_vs_apo'),
         ('apo', 'final', f'{label} RSCC: Final-Refined vs Apo (pooled)', 'final_vs_apo'),
+        ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined (pooled)',
+         'final_vs_backbone'),
     ]
-    if mode != 'lig':
-        comparisons.append(
-            ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined (pooled)',
-             'final_vs_backbone')
-        )
 
     pooled_rows = []
     for dataset in datasets:
-        df = _collect_dataset_rscc(args.datasets_dir, dataset, args, mode)
+        df = _collect_dataset_rscc(args.datasets_dir, dataset, args)
         if df.empty:
-            print(f'  {dataset}: no {mode} RSCC data found; skipping.')
+            print(f'  {dataset}: no protein RSCC data found; skipping.')
             continue
         df = df[df['has_conformer']].copy()
         df['dataset'] = dataset
         pooled_rows.append(df)
 
     if not pooled_rows:
-        print(f'  No {mode} RSCC data found for any dataset; skipping pooled plots.')
+        print('  No protein RSCC data found for any dataset; skipping pooled plots.')
         return
     pooled_df = pd.concat(pooled_rows, ignore_index=True)
 
@@ -1168,7 +1312,7 @@ def run_rscc_aggregator_pooled(args, mode):
 
     for xcol, ycol, title, tag in comparisons:
         paired = pooled_df.dropna(subset=[xcol, ycol])
-        out_name = f'{mode}_{tag}_rscc_placer_conformers_pooled.png'
+        out_name = f'protein_{tag}_rscc_placer_conformers_pooled.png'
         if paired.empty:
             print(f'  No data points for {out_name}; skipping.')
             continue

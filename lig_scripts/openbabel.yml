@@ -1,0 +1,7 @@
+name: openbabel
+channels:
+  - conda-forge
+dependencies:
+  - python
+  - openbabel
+  - pdb2pqr
