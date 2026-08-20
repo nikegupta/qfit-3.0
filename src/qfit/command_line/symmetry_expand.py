@@ -70,12 +70,13 @@ def build_argparser():
         '--strip',
         action='store_true',
         help='Before doing anything else, strip hydrogen atoms off every ligand (resname '
-             'LIG) residue and remove explicit water (resname HOH) residues entirely. '
-             'Meant for reference-set structures (e.g. a PanDDA model), which - unlike '
-             'this pipeline\'s own final_model_refined.pdb - carry explicit ligand '
-             'hydrogens and ordered waters that DESPOT scoring is not set up to handle. '
-             'A final_model_refined.pdb already has neither, so this is a no-op on one; '
-             'kept as an explicit, toggleable flag rather than always-on for control.'
+             'LIG) residue and remove explicit water (resname HOH) and DMSO (resname DMS) '
+             'residues entirely. Meant for reference-set structures (e.g. a PanDDA model), '
+             'which - unlike this pipeline\'s own final_model_refined.pdb - carry explicit '
+             'ligand hydrogens and ordered solvent/cryoprotectant molecules that DESPOT '
+             'scoring is not set up to handle. A final_model_refined.pdb already has none '
+             'of these, so this is a no-op on one; kept as an explicit, toggleable flag '
+             'rather than always-on for control.'
     )
     return p
 
@@ -104,6 +105,31 @@ def _reassign_chain_ids(mate_structure, used_chain_ids):
         atom.chain().id = mapping[orig_id]
 
 
+def _full_atom_mask(struct, subset_mask):
+    """Translates subset_mask - a boolean array aligned to struct's own (possibly
+    already-filtered) atom order, i.e. len(subset_mask) == struct.natoms - into a
+    boolean mask aligned to struct's full, underlying (pre-selection) atom array.
+
+    Structure.extract() applies a raw (non-string) selection array directly against the
+    object's full underlying atom array, not against the object's own current selection -
+    so handing it a mask built in struct's own atom order silently selects the wrong
+    atoms wherever that order has a gap relative to the full array. struct='not resname
+    LIG' (as find_protein_symmetry_mates below builds `protein`) has exactly that kind of
+    gap unless every ligand atom happens to sit after every kept atom in the input file -
+    true for this pipeline's own final_model_refined.pdb (build_final_model.py always
+    appends LIG residues last), but not guaranteed for reference-set/PanDDA-derived
+    structures, where a ligand can be interleaved anywhere among the protein chains.
+    Translating first makes struct.extract(...) safe regardless of where the excluded
+    atoms happened to be."""
+    full_mask = np.zeros(struct.total_length, dtype=bool)
+    if struct.selection is None:
+        full_mask[:] = subset_mask
+    else:
+        full_indices = np.array(list(struct.selection))
+        full_mask[full_indices[subset_mask]] = True
+    return full_mask
+
+
 def find_protein_symmetry_mates(structure, distance_cutoff):
     """
     Finds every crystallographic symmetry mate of structure's protein atoms
@@ -120,6 +146,8 @@ def find_protein_symmetry_mates(structure, distance_cutoff):
     This keeps the expanded structure's atom count close to what's actually
     needed for a local (ligand-centered) energy calculation, rather than
     growing with the size of whichever mates happen to touch the cutoff.
+    Each keep_mask is translated via _full_atom_mask before being handed to
+    protein.extract() - see that function's docstring for why.
 
     Candidate symmetry operations are generated with UnitCell's own
     iter_struct_orth_symops (the same broad-phase search qfit.py uses to find
@@ -168,7 +196,7 @@ def find_protein_symmetry_mates(structure, distance_cutoff):
                   f'minimum atom-atom distance to ligand = {min_dist:.2f} Å, '
                   f'keeping {keep_mask.sum()}/{protein.natoms} atom(s) '
                   f'({len(residues_in_range)} residue(s)) within {distance_cutoff} Å')
-            mates.append(protein.extract(keep_mask).copy())
+            mates.append(protein.extract(_full_atom_mask(protein, keep_mask)).copy())
         protein.coor = protein_baseline_coor
     return mates
 
@@ -180,10 +208,14 @@ def main():
 
     if args.strip:
         n_before = structure.natoms
-        keep_mask = ~(((structure.resn == 'LIG') & (structure.e == 'H')) | (structure.resn == 'HOH'))
+        keep_mask = ~(
+            ((structure.resn == 'LIG') & (structure.e == 'H'))
+            | (structure.resn == 'HOH')
+            | (structure.resn == 'DMS')
+        )
         structure = structure.extract(keep_mask)
         print(f'--strip: removed {n_before - structure.natoms} atom(s) (ligand hydrogens + '
-              f'HOH waters); {structure.natoms} atom(s) remain.')
+              f'HOH waters + DMS residues); {structure.natoms} atom(s) remain.')
 
     # Always taken from the command line, never from the input pdb's own CRYST1 record (which,
     # for this pipeline's structures, is never correct/meaningful).

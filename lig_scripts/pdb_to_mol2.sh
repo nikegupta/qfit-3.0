@@ -10,16 +10,18 @@
 #      basename>.sdf beside the input pdb.
 #   2. (obabel_env) obabel: converts that sdf to <ligand_pdb basename>.mol2.
 #
-# conda_sh/rdkit_env/obabel_env are passed in (not hardcoded here) so the caller - program.sh -
-# is the single place that names conda environments.
+# conda_sh/rdkit_env/obabel_env/assign_bond_orders_py are passed in (not hardcoded here) so
+# the caller - program.sh - is the single place that names conda environments and script
+# locations (assign_bond_orders.py lives in this same lig_scripts/ directory - see
+# program.sh's ASSIGN_BOND_ORDERS_PY).
 #
 # Usage:
-#   pdb_to_mol2.sh <ligand_pdb> <smiles> <conda_sh> <rdkit_env> <obabel_env>
+#   pdb_to_mol2.sh <ligand_pdb> <smiles> <conda_sh> <rdkit_env> <obabel_env> <assign_bond_orders_py>
 
 set -uo pipefail
 
-if [[ $# -ne 5 ]]; then
-    echo "Usage: $0 <ligand_pdb> <smiles> <conda_sh> <rdkit_env> <obabel_env>" >&2
+if [[ $# -ne 6 ]]; then
+    echo "Usage: $0 <ligand_pdb> <smiles> <conda_sh> <rdkit_env> <obabel_env> <assign_bond_orders_py>" >&2
     exit 1
 fi
 
@@ -28,14 +30,12 @@ smiles="$2"
 CONDA_SH="$3"
 CONDA_ENV_RDKIT="$4"
 CONDA_ENV_OBABEL="$5"
+ASSIGN_BOND_ORDERS_PY="$6"
 
 if [[ ! -f "$ligand_pdb" ]]; then
     echo "Error: ligand pdb not found: ${ligand_pdb}" >&2
     exit 1
 fi
-
-SCRIPT_DIR="/home/ngupta/main/program_exp"
-ASSIGN_BOND_ORDERS_PY="${SCRIPT_DIR}/assign_bond_orders.py"
 
 if [[ ! -f "$ASSIGN_BOND_ORDERS_PY" ]]; then
     echo "Error: required script not found: ${ASSIGN_BOND_ORDERS_PY}" >&2
