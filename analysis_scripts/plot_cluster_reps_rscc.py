@@ -12,8 +12,9 @@ directory:
   cluster_reps_2.png : filter2_run_name's cluster_reps.csv  (post-round-2 filter)
 
 The rscc values behind each histogram are also written to a matching csv
-(same basename, .csv instead of .png) in the sibling csvs/ folder, indexed
-by cluster_rep_index - each row's 1-based position in that cluster_reps.csv
+(same basename, .csv instead of .png) alongside the plot in that same
+graphs/ folder, indexed by cluster_rep_index - each row's 1-based position
+in that cluster_reps.csv
 (same position-based indexing convention used throughout the pipeline).
 For cluster_reps_2.csv specifically, this index equals the LIG residue
 number that row ends up as in final_model.pdb.
@@ -25,7 +26,7 @@ Usage:
 from pathlib import Path
 
 from rscc_common import (
-    build_common_argparser, dataset_graphs_dir, dataset_csvs_dir, read_datasets,
+    build_common_argparser, dataset_graphs_dir, read_datasets,
     plot_rscc_histogram, write_plot_csv, cluster_rep_rscc_values,
 )
 
@@ -37,7 +38,6 @@ def main():
     for dataset in datasets:
         dataset_dir = Path(args.datasets_dir) / dataset
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
 
         print(f'=== {dataset}: cluster_reps_1 (filter_run_name) ===')
         csv1 = (dataset_dir / args.run_name / args.placer_run_name /
@@ -49,7 +49,7 @@ def main():
             xlabel='RSCC',
             out_path=graphs_dir / 'cluster_reps_1.png',
         )
-        write_plot_csv(csvs_dir, 'cluster_reps_1.png', values1_df)
+        write_plot_csv(graphs_dir, 'cluster_reps_1.png', values1_df)
 
         print(f'=== {dataset}: cluster_reps_2 (filter2_run_name) ===')
         csv2 = (dataset_dir / args.run_name / args.placer_run_name / args.filter_run_name /
@@ -61,7 +61,7 @@ def main():
             xlabel='RSCC',
             out_path=graphs_dir / 'cluster_reps_2.png',
         )
-        write_plot_csv(csvs_dir, 'cluster_reps_2.png', values2_df)
+        write_plot_csv(graphs_dir, 'cluster_reps_2.png', values2_df)
 
 
 if __name__ == '__main__':

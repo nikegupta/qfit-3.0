@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Pooled (across every dataset in datasets.txt) counterpart of
-plot_despot_energies.py: every dataset's DESPOT ligand binding-energy scores
+plot_despot_energies.py: every dataset's heavy-atom-normalized DESPOT ligand
+binding-energy scores (despot_filtered_scores.csv's normalized_score column)
 combined into a single histogram.
 
 Unlike the other stage 7/8 pooled plots, this one's --graphs-dir is pointed

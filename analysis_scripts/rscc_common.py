@@ -407,7 +407,10 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
     many MODEL/ENDMDL blocks (e.g. PLACER's own multimodel *_model.pdb
     outputs); every block is scored independently. If a block has no LIG
     under model_chain/model_resi, falls back to any LIG in that block.
-    Empty list if model_dir/ref_path don't exist or nothing matches."""
+    Empty list if model_dir/ref_path don't exist or nothing matches.
+
+    Returns a list of {ref_chain, ref_resi, ref_altloc, rmsd} dicts, one per
+    matched reference LIG conformation."""
     if not model_dir.exists() or not ref_path.exists():
         return []
 
@@ -441,7 +444,10 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
                     if rmsd is not None and rmsd < min_rmsds[ref_key]:
                         min_rmsds[ref_key] = rmsd
 
-    return [v for v in min_rmsds.values() if np.isfinite(v)]
+    return [
+        {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'rmsd': v}
+        for key, v in min_rmsds.items() if np.isfinite(v)
+    ]
 
 
 def plot_distance_histogram(values, title, xlabel, out_path, bin_width=1.0, color='steelblue'):
@@ -538,7 +544,15 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
     out). None (default) means every row is eligible, the original behavior.
 
     Returns (matched_ref_rscc, matched_pipeline_rscc, n_unmatched_ref,
-    n_excess_pipeline).
+    n_excess_pipeline, matched_rows). matched_rows has one dict per matched
+    pair - {ref_chain, ref_resi, ref_altloc, ref_rscc, cluster_rep_index,
+    pipeline_chain, pipeline_rscc} - for callers that want to write out the
+    full match, not just the pooled RSCC values. cluster_rep_index/
+    pipeline_chain identify the matched cluster_reps.csv row (1-indexed) and
+    that row's ligand's chain id in cluster_rep_models.pdb - the same
+    (chain, resi=cluster_rep_index) pair that row's ligand keeps all the way
+    through final_model(_refined).pdb and, if it survives, despot_filtered.pdb
+    (build_final_model.py/despot_filter.py never renumber it).
     """
     ref_pdb = ref_pdb_path(args, dataset)
     ref_csv = ref_rscc_csv_path(args, dataset)
@@ -549,12 +563,12 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
         print(f'  {dataset}: missing required file(s) for lig-vs-reference comparison '
               f'(ref_pdb={ref_pdb.exists()}, ref_rscc={ref_csv.exists()}, '
               f'cluster_reps={cluster_csv.exists()}, cluster_rep_models={cluster_pdb.exists()}); skipping.')
-        return [], [], 0, 0
+        return [], [], 0, 0, []
 
     ref_ligs = lig_conformations(read_pdb_raw_atoms(ref_pdb))
     if not ref_ligs:
         print(f'  {dataset}: no LIG residue found in reference {ref_pdb}; skipping.')
-        return [], [], 0, 0
+        return [], [], 0, 0, []
     ref_rscc_df = read_calc_rscc_csv(ref_csv)
     ref_rscc = dict(zip(ref_rscc_df['residue'], ref_rscc_df['rscc']))
 
@@ -568,17 +582,20 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
               f'cluster_reps.csv has {len(pipeline_rscc_by_row)} row(s); using first {n_models}.')
 
     pipeline_centroids = []
+    pipeline_chains = []
     for i in range(n_models):
         if alive_rows is not None and (i + 1) not in alive_rows:
             pipeline_centroids.append(None)
+            pipeline_chains.append(None)
             continue
         lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
         pipeline_centroids.append(
             np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
         )
+        pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
 
     used_rows = set()
-    matched_ref, matched_pipeline = [], []
+    matched_ref, matched_pipeline, matched_rows = [], [], []
     n_unmatched_ref = 0
     for (chain_id, res_id, altloc), ref_centroid in ref_ligs.items():
         ref_label = residue_label_from_key(chain_id, res_id, altloc)
@@ -601,21 +618,31 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
             n_unmatched_ref += 1
             continue
 
+        pipeline_val = pipeline_rscc_by_row[best_row]
         matched_ref.append(ref_val)
-        matched_pipeline.append(pipeline_rscc_by_row[best_row])
+        matched_pipeline.append(pipeline_val)
+        matched_rows.append({
+            'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc, 'ref_rscc': ref_val,
+            'cluster_rep_index': best_row + 1, 'pipeline_chain': pipeline_chains[best_row],
+            'pipeline_rscc': pipeline_val,
+        })
         used_rows.add(best_row)
 
     n_excess_pipeline = sum(
         1 for i in range(n_models) if pipeline_centroids[i] is not None and i not in used_rows
     )
-    return matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline
+    return matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline, matched_rows
 
 
-def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None):
+def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None,
+                     resi_col_name='cluster_rep_index', chain_col_name='pipeline_chain'):
     """Pools stage-appropriate cluster_reps.csv ligand RSCC vs matched
     reference ligand RSCC across every dataset in datasets.txt into a single
     scatter plot (Reference on x, Pipeline on y - qfit compare_lig_rscc's
-    convention), with unmatched-reference/excess-pipeline counts labeled.
+    convention), with unmatched-reference/excess-pipeline counts labeled -
+    plus the exact matched pairs (dataset, reference ligand chain/resi/altloc/
+    rscc, matched cluster_reps.csv row/chain, pipeline rscc) written to
+    <graphs_dir>/<out_name stem>.csv, alongside the plot itself.
 
     run_dir_for_dataset(dataset) -> Path to the directory holding that
     dataset's cluster_reps.csv + cluster_rep_models.pdb for this stage.
@@ -623,21 +650,32 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
     alive_rows_for_dataset(dataset) -> optional; if given, restricts that
     dataset's cluster_reps.csv rows to this set (see _dataset_lig_vs_ref's
     alive_rows) instead of considering every row eligible.
+
+    resi_col_name/chain_col_name: column names for the matched row's
+    (cluster_rep_index, pipeline_chain) pair in the output csv - override
+    these when that pair means something more specific to the caller (e.g.
+    plot_lig_vs_ref_despot.py uses despot_filtered_resi/despot_filtered_chain,
+    since for despot's survivors that pair is exactly the ligand's residue
+    number and chain in despot_filtered.pdb - see _dataset_lig_vs_ref).
     """
     datasets = read_datasets(args.datasets_file)
-    all_ref, all_pipeline = [], []
+    all_ref, all_pipeline, all_rows = [], [], []
     total_unmatched, total_excess = 0, 0
 
     for dataset in datasets:
         run_dir = run_dir_for_dataset(dataset)
         alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
-        ref_vals, pipeline_vals, n_unmatched, n_excess = _dataset_lig_vs_ref(
+        ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows = _dataset_lig_vs_ref(
             dataset, args, run_dir, alive_rows=alive_rows
         )
         all_ref.extend(ref_vals)
         all_pipeline.extend(pipeline_vals)
         total_unmatched += n_unmatched
         total_excess += n_excess
+        for row in matched_rows:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_rows.append(row_out)
         print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
               f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
 
@@ -652,13 +690,20 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
                     f'Excess pipeline LIGs: {total_excess}'),
     )
 
+    if all_rows:
+        rows_df = pd.DataFrame(all_rows).rename(
+            columns={'cluster_rep_index': resi_col_name, 'pipeline_chain': chain_col_name}
+        )[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc',
+           chain_col_name, resi_col_name, 'pipeline_rscc']]
+        write_plot_csv(graphs_dir, out_name, rows_df)
+
 
 def _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels):
     """Matches a dataset's already-collected {residue_label: rscc}
     structure_rscc dict against that dataset's reference per-residue RSCC
     (ref_rscc_csv_path), by residue_base (chain+resnum, altloc-insensitive).
-    Returns (all_pairs, restricted_pairs), each a list of (ref_val,
-    structure_val) tuples; restricted_pairs is further limited to residues
+    Returns (all_pairs, restricted_pairs), each a list of {residue, ref_rscc,
+    structure_rscc} dicts; restricted_pairs is further limited to residues
     whose base label is in restrict_labels."""
     ref_csv = ref_rscc_csv_path(args, dataset)
     ref_df = read_calc_rscc_csv(ref_csv)
@@ -680,7 +725,7 @@ def _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels):
 
     all_pairs, restricted_pairs = [], []
     for base in set(ref_vals) & set(struct_vals):
-        pair = (ref_vals[base], struct_vals[base])
+        pair = {'residue': base, 'ref_rscc': ref_vals[base], 'structure_rscc': struct_vals[base]}
         all_pairs.append(pair)
         if base in restrict_labels:
             restricted_pairs.append(pair)
@@ -713,6 +758,8 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
         structure_rscc = collect_structure_rscc(dataset)
         restrict_labels = collect_restrict_labels(dataset)
         pairs, r_pairs = _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels)
+        for pair in pairs:
+            pair['dataset'] = dataset
         all_pairs.extend(pairs)
         restricted_pairs.extend(r_pairs)
         print(f'  {dataset}: {len(pairs)} residue(s) matched to reference, '
@@ -725,15 +772,19 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
         (all_pairs, '', ''),
         (restricted_pairs, '_restricted', ' (restricted residues)'),
     ]:
-        xs = [p[0] for p in pairs]
-        ys = [p[1] for p in pairs]
+        xs = [p['ref_rscc'] for p in pairs]
+        ys = [p['structure_rscc'] for p in pairs]
+        out_name = f'{out_prefix}_vs_reference_rscc{suffix}.png'
         plot_rscc_scatter(
             xs, ys,
             xlabel='Reference RSCC', ylabel=f'{structure_label} RSCC',
             title=f'{structure_label} RSCC vs Reference{title_suffix}',
-            out_path=graphs_dir / f'{out_prefix}_vs_reference_rscc{suffix}.png',
+            out_path=graphs_dir / out_name,
             color_by_density=True,
         )
+        if pairs:
+            write_plot_csv(graphs_dir, out_name,
+                            pd.DataFrame(pairs)[['dataset', 'residue', 'ref_rscc', 'structure_rscc']])
 
 
 def dataset_final_dir(datasets_dir, dataset, args):
@@ -753,30 +804,13 @@ def dataset_graphs_dir(datasets_dir, dataset, args):
     return graphs_dir
 
 
-def dataset_csvs_dir(datasets_dir, dataset, args):
-    """Sibling of dataset_graphs_dir: each dataset's final_run_name
-    directory also gets its own csvs/ folder, holding the exact data
-    plotted into the matching file under graphs/ (same basename, .csv
-    instead of .png): .../<final_run_name>/csvs/"""
-    csvs_dir = dataset_final_dir(datasets_dir, dataset, args) / 'csvs'
-    csvs_dir.mkdir(parents=True, exist_ok=True)
-    return csvs_dir
-
-
-def write_plot_csv(csvs_dir, plot_filename, df):
+def write_plot_csv(graphs_dir, plot_filename, df):
     """Writes the exact data underlying a plot named plot_filename (e.g.
-    'foo.png', as saved into dataset_graphs_dir) to csvs_dir/foo.csv - same
-    basename as the plot, .csv extension instead of .png."""
-    csv_path = Path(csvs_dir) / (Path(plot_filename).stem + '.csv')
+    'foo.png') to graphs_dir/foo.csv - the same directory the plot itself was
+    saved into, same basename, .csv extension instead of .png."""
+    csv_path = Path(graphs_dir) / (Path(plot_filename).stem + '.csv')
     df.to_csv(csv_path, index=False)
     print(f'  Plot data csv saved to: {csv_path}')
-
-
-def despot_csv_path(datasets_dir, dataset, args):
-    """<final_run_name>/<despot_run_name>/<dataset>_DESPOT.csv - written by
-    program.sh's despot_process_dataset (DESPOT's score_complex.py, via its
-    own -o argument)."""
-    return dataset_final_dir(datasets_dir, dataset, args) / args.despot_run_name / f'{dataset}_DESPOT.csv'
 
 
 def read_despot_csv(path):
@@ -790,57 +824,66 @@ def read_despot_csv(path):
 
 def run_despot_energies_single(args):
     """For every dataset independently (no pooling across datasets), plots a
-    histogram of DESPOT ligand binding-energy scores already written by
-    program.sh's despot stage into
-    .../<final_run_name>/<despot_run_name>/<dataset>_DESPOT.csv - no scores
-    are computed here. Written into that dataset's existing
-    .../<final_run_name>/graphs/ and csvs/ folders (not nested under
-    despot_run_name), the same per-dataset location every other analysis
-    plot in this file uses:
+    histogram of heavy-atom-normalized DESPOT ligand binding-energy scores
+    already written by despot_filter.py into
+    .../<final_run_name>/<despot_run_name>/despot_filtered_scores.csv - one
+    row per ligand instance that got a DESPOT score (kept or not; instances
+    with no matching score, normalized_score == NaN, are excluded here, same
+    as everywhere else that reads this csv). despot_filter.py already did
+    the heavy-atom normalization (see its own docstring/_heavy_atom_count) -
+    no score is computed or normalized here, and the raw (un-normalized)
+    <dataset>_DESPOT.csv score is not plotted anywhere in this pipeline
+    (raw scores of different-sized ligands aren't comparable to each other).
+    Written into that dataset's existing .../<final_run_name>/graphs/ folder
+    (not nested under despot_run_name), the same per-dataset location every
+    other analysis plot in this file uses:
       despot_energies.png
     """
     datasets = read_datasets(args.datasets_file)
 
     for dataset in datasets:
-        csv_path = despot_csv_path(args.datasets_dir, dataset, args)
-        df = read_despot_csv(csv_path)
+        csv_path = despot_filtered_scores_csv_path(args.datasets_dir, dataset, args)
+        df = read_despot_filtered_scores_csv(csv_path)
+        df = df[df['normalized_score'].notna()]
         if df.empty:
             print(f'  {dataset}: no DESPOT scores found ({csv_path}); skipping.')
             continue
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
         out_name = 'despot_energies.png'
 
         plot_rscc_histogram(
-            df['score'], title=f'DESPOT Ligand Binding Energies ({dataset})',
-            xlabel='DESPOT Energy Score', out_path=graphs_dir / out_name,
+            df['normalized_score'],
+            title=f'DESPOT Ligand Binding Energies, normalized ({dataset})',
+            xlabel='Normalized DESPOT Score (per heavy atom)', out_path=graphs_dir / out_name,
             value_range=None,
         )
-        write_plot_csv(csvs_dir, out_name, df[['ligand', 'score']])
+        write_plot_csv(graphs_dir, out_name,
+                        df[['ligand', 'chain', 'resi', 'icode', 'normalized_score', 'kept']])
 
 
 def run_despot_energies_pooled(args):
     """Pooled (across every dataset in datasets.txt) counterpart of
-    run_despot_energies_single: every dataset's DESPOT scores combined into
-    one histogram, into args.graphs_dir - program.sh points this at
+    run_despot_energies_single: every dataset's heavy-atom-normalized DESPOT
+    scores (despot_filtered_scores.csv) combined into one histogram, into
+    args.graphs_dir - program.sh points this at
     GRAPHS_DIR/.../<final_run_name>/<despot_run_name>/, nested under
     despot_run_name (unlike the other stage 7/8 pooled plots), since the
     scores themselves are specific to one despot_run_name - with a matching
-    csv (now including a 'dataset' column) in the sibling
-    args.graphs_dir/csvs/ folder:
+    csv (now including a 'dataset' column) saved alongside it in
+    args.graphs_dir:
       ligand_energies.png
     """
     datasets = read_datasets(args.datasets_file)
 
     pooled_rows = []
     for dataset in datasets:
-        csv_path = despot_csv_path(args.datasets_dir, dataset, args)
-        df = read_despot_csv(csv_path)
+        csv_path = despot_filtered_scores_csv_path(args.datasets_dir, dataset, args)
+        df = read_despot_filtered_scores_csv(csv_path)
+        df = df[df['normalized_score'].notna()].copy()
         if df.empty:
             print(f'  {dataset}: no DESPOT scores found ({csv_path}); skipping.')
             continue
-        df = df.copy()
         df['dataset'] = dataset
         pooled_rows.append(df)
 
@@ -852,16 +895,432 @@ def run_despot_energies_pooled(args):
 
     graphs_dir = Path(args.graphs_dir)
     graphs_dir.mkdir(parents=True, exist_ok=True)
-    csvs_dir = graphs_dir / 'csvs'
-    csvs_dir.mkdir(parents=True, exist_ok=True)
 
     out_name = 'ligand_energies.png'
     plot_rscc_histogram(
-        pooled_df['score'], title='DESPOT Ligand Binding Energies (pooled)',
-        xlabel='DESPOT Energy Score', out_path=graphs_dir / out_name,
+        pooled_df['normalized_score'],
+        title='DESPOT Ligand Binding Energies, normalized (pooled)',
+        xlabel='Normalized DESPOT Score (per heavy atom)', out_path=graphs_dir / out_name,
         value_range=None,
     )
-    write_plot_csv(csvs_dir, out_name, pooled_df[['dataset', 'ligand', 'score']])
+    write_plot_csv(graphs_dir, out_name,
+                    pooled_df[['dataset', 'ligand', 'chain', 'resi', 'icode',
+                               'normalized_score', 'kept']])
+
+
+def despot_filtered_scores_csv_path(datasets_dir, dataset, args):
+    """<final_run_name>/<despot_run_name>/despot_filtered_scores.csv - written
+    by despot_filter.py alongside despot_filtered.pdb: one row per ligand
+    instance (ligand, chain, resi, icode, raw_score, normalized_score, kept) -
+    'kept' is True iff that instance survived into despot_filtered.pdb."""
+    return dataset_final_dir(datasets_dir, dataset, args) / args.despot_run_name / 'despot_filtered_scores.csv'
+
+
+def read_despot_filtered_scores_csv(path):
+    """Reads despot_filter.py's per-instance score csv. Returns an empty
+    DataFrame with the right columns if the file doesn't exist."""
+    path = Path(path)
+    cols = ['ligand', 'chain', 'resi', 'icode', 'raw_score', 'normalized_score', 'kept']
+    if not path.exists():
+        return pd.DataFrame(columns=cols)
+    return pd.read_csv(path)
+
+
+def plot_ligand_summary_scatter(x, y, out_path, labels=None,
+                                 xlabel='Normalized DESPOT Score (per heavy atom)',
+                                 ylabel='Ligand RSCC', title='Ligand Summary'):
+    """Flat-color scatter of an arbitrary x metric against RSCC on y. Unlike
+    plot_rscc_scatter, x and y here aren't the same kind of value (one's a
+    DESPOT score, unbounded; the other's an RSCC), so there's no unity line,
+    shared axis range, or forced-equal aspect - each axis is scaled to its
+    own data independently.
+
+    x axis is reversed (high -> low, left -> right): a more negative DESPOT
+    score is more favorable, so the more-favorable direction reads left-to-
+    right like the rest of the plot's positive-is-better convention.
+
+    labels: optional list of per-point text labels (same length/order as
+    x/y, e.g. 'C1' for chain C, residue 1), annotated in red just above/right
+    of each point. Meant for plots with few enough points to label
+    individually (e.g. one dataset's own surviving ligands) - leave as None
+    for pooled, cross-dataset plots, where many overlapping labels would be
+    unreadable."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(x) == 0:
+        print(f'  Skipping {out_path.name}: no data points.')
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(x, y, color='steelblue', s=12, edgecolor='none')
+    if labels is not None:
+        for xi, yi, label in zip(x, y, labels):
+            ax.annotate(label, (xi, yi), color='red', fontsize=9,
+                        xytext=(4, 4), textcoords='offset points')
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(f'{title} (n={len(x)})')
+    ax.grid(True, alpha=0.3)
+    ax.invert_xaxis()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f'  Scatterplot saved to: {out_path}')
+
+
+def run_despot_ligand_summary(args):
+    """Pooled (across every dataset in datasets.txt) scatter of every
+    surviving ligand's (i.e. present in despot_run_name/despot_filtered.pdb -
+    see despot_filtered_scores.csv's 'kept' column) heavy-atom-normalized
+    DESPOT score against its filter2_run_name/cluster_reps.csv RSCC. No RSCC
+    is recomputed here - it's read straight off cluster_reps.csv, matched by
+    the same resi-as-row-index convention plot_lig_vs_ref_despot.py uses
+    (despot_filtered_scores.csv already records each instance's resi
+    directly, so no pdb parsing is needed to make that match). Into
+    args.graphs_dir (program.sh points this at
+    GRAPHS_DIR/.../<final_run_name>/<despot_run_name>/, nested under
+    despot_run_name like the other despot-specific pooled plots):
+      ligand_summary.png
+    with the exact plotted data saved alongside it, in args.graphs_dir/ligand_summary.csv.
+    Doesn't need -c/the reference set - RSCC here comes from cluster_reps.csv,
+    not a reference structure.
+    """
+    datasets = read_datasets(args.datasets_file)
+    pooled_rows = []
+
+    for dataset in datasets:
+        scores_csv = despot_filtered_scores_csv_path(args.datasets_dir, dataset, args)
+        scores_df = read_despot_filtered_scores_csv(scores_csv)
+        kept_df = scores_df[scores_df['kept'] == True]  # noqa: E712 (pandas boolean-column filter)
+        if kept_df.empty:
+            print(f'  {dataset}: no surviving (despot_filter-kept) ligand(s) ({scores_csv}); skipping.')
+            continue
+
+        cluster_csv = (Path(args.datasets_dir) / dataset / args.run_name / args.placer_run_name /
+                        args.filter_run_name / args.placer2_run_name / args.filter2_run_name /
+                        'cluster_reps.csv')
+        if not cluster_csv.exists():
+            print(f'  {dataset}: {cluster_csv} not found; skipping.')
+            continue
+        cluster_rscc_by_row = list(pd.read_csv(cluster_csv)['rscc'])
+
+        n_matched = 0
+        for _, row in kept_df.iterrows():
+            row_idx = int(row['resi']) - 1
+            if row_idx < 0 or row_idx >= len(cluster_rscc_by_row):
+                print(f'  {dataset}: {row["ligand"]} (resi {row["resi"]}) has no matching '
+                      f'cluster_reps.csv row; skipping.')
+                continue
+            pooled_rows.append({
+                'dataset': dataset, 'ligand': row['ligand'],
+                'normalized_score': row['normalized_score'],
+                'rscc': cluster_rscc_by_row[row_idx],
+            })
+            n_matched += 1
+        print(f'  {dataset}: {n_matched} surviving ligand(s) matched to cluster_reps.csv RSCC')
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    out_name = 'ligand_summary.png'
+
+    if not pooled_rows:
+        print('  No surviving ligand(s) found for any dataset; skipping ligand summary plot.')
+        return
+
+    pooled_df = pd.DataFrame(pooled_rows)
+    plot_ligand_summary_scatter(
+        pooled_df['normalized_score'], pooled_df['rscc'], graphs_dir / out_name,
+    )
+    write_plot_csv(graphs_dir, out_name, pooled_df)
+
+
+def run_despot_ligand_summary_single(args):
+    """For every dataset independently (no pooling across datasets),
+    scatters that dataset's own surviving (despot_filter-kept) ligands'
+    heavy-atom-normalized DESPOT score against their filter2_run_name/
+    cluster_reps.csv RSCC - same matching run_despot_ligand_summary (the
+    pooled counterpart) uses, just restricted to one dataset. Written
+    directly into that dataset's own .../<final_run_name>/<despot_run_name>/
+    directory (not graphs_dir - despot_run_name is already a per-dataset
+    location, unlike every other pooled plot in this file, so there's no
+    separate cross-dataset destination needed for a single-dataset plot):
+      ligand_summary.png
+    with a matching csv (ligand, chain, resi, icode, normalized_score, rscc)
+    saved alongside it. A single dataset typically has only a handful of
+    surviving ligands, so - unlike the pooled plot - each point is labeled
+    in red with its chain+resi (e.g. 'C1' for chain C, residue 1).
+    Doesn't need -c/the reference set - RSCC here comes from cluster_reps.csv,
+    not a reference structure.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    for dataset in datasets:
+        scores_csv = despot_filtered_scores_csv_path(args.datasets_dir, dataset, args)
+        scores_df = read_despot_filtered_scores_csv(scores_csv)
+        kept_df = scores_df[scores_df['kept'] == True]  # noqa: E712 (pandas boolean-column filter)
+        if kept_df.empty:
+            print(f'  {dataset}: no surviving (despot_filter-kept) ligand(s) ({scores_csv}); skipping.')
+            continue
+
+        cluster_csv = (Path(args.datasets_dir) / dataset / args.run_name / args.placer_run_name /
+                        args.filter_run_name / args.placer2_run_name / args.filter2_run_name /
+                        'cluster_reps.csv')
+        if not cluster_csv.exists():
+            print(f'  {dataset}: {cluster_csv} not found; skipping.')
+            continue
+        cluster_rscc_by_row = list(pd.read_csv(cluster_csv)['rscc'])
+
+        rows = []
+        for _, row in kept_df.iterrows():
+            row_idx = int(row['resi']) - 1
+            if row_idx < 0 or row_idx >= len(cluster_rscc_by_row):
+                print(f'  {dataset}: {row["ligand"]} (resi {row["resi"]}) has no matching '
+                      f'cluster_reps.csv row; skipping.')
+                continue
+            rows.append({
+                'ligand': row['ligand'], 'chain': row['chain'], 'resi': row['resi'],
+                'icode': row['icode'], 'normalized_score': row['normalized_score'],
+                'rscc': cluster_rscc_by_row[row_idx],
+            })
+
+        if not rows:
+            print(f'  {dataset}: no surviving ligand(s) matched to cluster_reps.csv RSCC; skipping.')
+            continue
+        print(f'  {dataset}: {len(rows)} surviving ligand(s) matched to cluster_reps.csv RSCC')
+
+        despot_dir = dataset_final_dir(args.datasets_dir, dataset, args) / args.despot_run_name
+        despot_dir.mkdir(parents=True, exist_ok=True)
+        out_name = 'ligand_summary.png'
+
+        df = pd.DataFrame(rows)
+        labels = [f'{chain}{resi}' for chain, resi in zip(df['chain'], df['resi'])]
+        plot_ligand_summary_scatter(
+            df['normalized_score'], df['rscc'], despot_dir / out_name,
+            labels=labels, title=f'Ligand Summary ({dataset})',
+        )
+        write_plot_csv(despot_dir, out_name, df)
+
+
+def ref_despot_csv_path(args, dataset):
+    """program.sh's Stage 0d (ref_set_despot) writes REF_SET/<dataset>/
+    <dataset>_DESPOT.csv directly alongside the reference structure - same
+    sibling-file convention as ref_rscc_csv_path."""
+    return ref_pdb_path(args, dataset).parent / f'{dataset}_DESPOT.csv'
+
+
+def _ref_despot_conformations(dataset, args):
+    """Returns {(chain, resi, altloc): (centroid, normalized_score)} for
+    every LIG conformation in this dataset's reference structure that has a
+    matching DESPOT score, normalizing ref_despot_csv_path's raw per-instance
+    score by that instance's own heavy-atom count (non-'H'-element atom
+    count, element inferred from atom name via _element_of) - the same
+    normalization despot_filter.py applies on the pipeline side (see
+    despot_filter.py's _heavy_atom_count). Instance labels are built the same
+    way assign_bond_orders.py named them (f'lig{chain}{resi}'; icode is
+    assumed blank - reference structures carry no insertion codes in this
+    pipeline). A conformation with zero heavy atoms, or no matching score in
+    ref_despot_csv_path, is left out. Empty dict if the reference structure
+    or its DESPOT csv is missing, or has no LIG atoms."""
+    ref_pdb = ref_pdb_path(args, dataset)
+    despot_csv = ref_despot_csv_path(args, dataset)
+    if not (ref_pdb.exists() and despot_csv.exists()):
+        return {}
+
+    groups = lig_atom_groups(read_pdb_raw_atoms(ref_pdb))
+    if not groups:
+        return {}
+
+    scores_df = read_despot_csv(despot_csv)
+    scores_by_label = dict(zip(scores_df['ligand'], scores_df['score']))
+
+    result = {}
+    for (chain_id, resi, altloc), atom_list in groups.items():
+        n_heavy = sum(1 for a in atom_list if _element_of(a['name']) != 'H')
+        if n_heavy == 0:
+            continue
+        label = f'lig{chain_id}{resi}'
+        raw_score = scores_by_label.get(label)
+        if raw_score is None:
+            continue
+        centroid = np.array([a['coord'] for a in atom_list]).mean(axis=0)
+        result[(chain_id, resi, altloc)] = (centroid, raw_score / n_heavy)
+    return result
+
+
+def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
+    """For one dataset, matches every reference LIG conformation with a
+    heavy-atom-normalized DESPOT score (_ref_despot_conformations) to the
+    nearest cluster-rep ligand pose in run_dir/cluster_rep_models.pdb (by
+    centroid distance) - the exact same matching strategy _dataset_lig_vs_ref
+    uses for RSCC, just gated on DESPOT-score presence instead of RSCC
+    presence. The matched row's own normalized DESPOT score is then read
+    from despot_run_name/despot_filtered_scores.csv, keyed by resi ==
+    cluster_rep_index (the same position-based indexing convention used
+    throughout the pipeline - see despot_filter.py). A matched row with no
+    despot_filtered_scores.csv entry (e.g. despot never scored it) is
+    treated like a reference ligand with no eligible pipeline match -
+    counted as unmatched, not plotted.
+
+    alive_rows: optional set of 1-indexed cluster_reps.csv/cluster_rep_models.pdb
+    row numbers to restrict matching to - same meaning and same set
+    plot_lig_vs_ref_despot.py passes to _dataset_lig_vs_ref (despot_filter.py
+    survivors, from despot_filtered.pdb), so despot_vs_reference.png matches
+    the exact same reference-to-pipeline pairs as lig_vs_reference_rscc.png
+    in the same despot_run_name folder. None (default) means every row is
+    eligible.
+
+    Returns (matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline,
+    matched_rows), matching _dataset_lig_vs_ref's return shape - matched_rows
+    has one dict per matched pair: {ref_chain, ref_resi, ref_altloc,
+    ref_despot_normalized, cluster_rep_index, pipeline_chain,
+    pipeline_despot_normalized}.
+    """
+    ref_conformations = _ref_despot_conformations(dataset, args)
+    if not ref_conformations:
+        print(f'  {dataset}: no reference DESPOT score(s) found; skipping.')
+        return [], [], 0, 0, []
+
+    cluster_csv = run_dir / 'cluster_reps.csv'
+    cluster_pdb = run_dir / 'cluster_rep_models.pdb'
+    scores_csv = despot_filtered_scores_csv_path(args.datasets_dir, dataset, args)
+
+    if not (cluster_csv.exists() and cluster_pdb.exists() and scores_csv.exists()):
+        print(f'  {dataset}: missing required file(s) for despot-vs-reference comparison '
+              f'(cluster_reps={cluster_csv.exists()}, cluster_rep_models={cluster_pdb.exists()}, '
+              f'despot_filtered_scores={scores_csv.exists()}); skipping.')
+        return [], [], 0, 0, []
+
+    pipeline_scores_df = read_despot_filtered_scores_csv(scores_csv)
+    pipeline_normalized_by_resi = dict(zip(pipeline_scores_df['resi'], pipeline_scores_df['normalized_score']))
+
+    model_blocks = split_pdb_models(cluster_pdb)
+    n_models = len(model_blocks)
+
+    pipeline_centroids = []
+    pipeline_chains = []
+    for i in range(n_models):
+        if alive_rows is not None and (i + 1) not in alive_rows:
+            pipeline_centroids.append(None)
+            pipeline_chains.append(None)
+            continue
+        lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
+        pipeline_centroids.append(
+            np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
+        )
+        pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
+
+    used_rows = set()
+    matched_ref, matched_pipeline, matched_rows = [], [], []
+    n_unmatched_ref = 0
+    for (chain_id, res_id, altloc), (ref_centroid, ref_val) in ref_conformations.items():
+        best_row, best_dist = None, float('inf')
+        for i in range(n_models):
+            c = pipeline_centroids[i]
+            if c is None:
+                continue
+            dist = float(np.linalg.norm(c - ref_centroid))
+            if dist < best_dist:
+                best_dist = dist
+                best_row = i
+
+        if best_row is None or best_dist > args.centroid_cutoff:
+            n_unmatched_ref += 1
+            continue
+
+        pipeline_val = pipeline_normalized_by_resi.get(best_row + 1)
+        if pipeline_val is None or pd.isna(pipeline_val):
+            n_unmatched_ref += 1
+            continue
+
+        matched_ref.append(ref_val)
+        matched_pipeline.append(pipeline_val)
+        matched_rows.append({
+            'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+            'ref_despot_normalized': ref_val,
+            'cluster_rep_index': best_row + 1, 'pipeline_chain': pipeline_chains[best_row],
+            'pipeline_despot_normalized': pipeline_val,
+        })
+        used_rows.add(best_row)
+
+    n_excess_pipeline = sum(
+        1 for i in range(n_models) if pipeline_centroids[i] is not None and i not in used_rows
+    )
+    return matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline, matched_rows
+
+
+def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None):
+    """Pools per-dataset heavy-atom-normalized DESPOT score comparisons
+    (reference structure vs matched pipeline cluster-rep ligand - same
+    centroid-distance matching plot_lig_vs_ref uses for RSCC, see
+    _dataset_despot_vs_ref) across every dataset in datasets.txt into a
+    single scatter plot (Reference on x, Pipeline on y), with unmatched-
+    reference/excess-pipeline counts labeled - plus the exact matched pairs
+    (dataset, reference ligand chain/resi/altloc/normalized score, matched
+    cluster_reps.csv row/chain, pipeline normalized score) written to
+    <graphs_dir>/<out_name stem>.csv, alongside the plot itself.
+
+    Unlike plot_lig_vs_ref, the axis range is computed from the data
+    (_auto_axis_range) rather than plot_rscc_scatter's [x, 1]-ish RSCC
+    default - a DESPOT score is an unbounded energy, not a bounded
+    correlation coefficient.
+
+    run_dir_for_dataset(dataset) -> Path to the directory holding that
+    dataset's cluster_reps.csv + cluster_rep_models.pdb (filter2_run_name).
+
+    alive_rows_for_dataset(dataset) -> optional; if given, restricts that
+    dataset's cluster_reps.csv rows to this set (see _dataset_despot_vs_ref's
+    alive_rows) instead of considering every row eligible. Pass the same
+    despot_filtered.pdb-derived set plot_lig_vs_ref_despot.py uses so this
+    plot's matched pairs - and its unmatched/excess counts - agree exactly
+    with lig_vs_reference_rscc.png in the same despot_run_name folder.
+    """
+    datasets = read_datasets(args.datasets_file)
+    all_ref, all_pipeline, all_rows = [], [], []
+    total_unmatched, total_excess = 0, 0
+
+    for dataset in datasets:
+        run_dir = run_dir_for_dataset(dataset)
+        alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
+        ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows = _dataset_despot_vs_ref(
+            dataset, args, run_dir, alive_rows=alive_rows
+        )
+        all_ref.extend(ref_vals)
+        all_pipeline.extend(pipeline_vals)
+        total_unmatched += n_unmatched
+        total_excess += n_excess
+        for row in matched_rows:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_rows.append(row_out)
+        print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
+              f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    if not all_ref:
+        print(f'  No matched ligand(s) found for any dataset; skipping {out_name}.')
+        return
+
+    plot_rscc_scatter(
+        all_ref, all_pipeline,
+        xlabel='Reference DESPOT Score (normalized)',
+        ylabel='Pipeline DESPOT Score (normalized)',
+        title=title,
+        out_path=graphs_dir / out_name,
+        extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
+                    f'Excess pipeline LIGs: {total_excess}'),
+        axis_range=_auto_axis_range(all_ref, all_pipeline),
+    )
+
+    rows_df = pd.DataFrame(all_rows)[
+        ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized',
+         'pipeline_chain', 'cluster_rep_index', 'pipeline_despot_normalized']
+    ]
+    write_plot_csv(graphs_dir, out_name, rows_df)
 
 
 def read_datasets(datasets_file):
@@ -1224,10 +1683,10 @@ def run_rscc_aggregator(args):
     final-vs-backbone), restricted to that dataset's
     residues_with_placer_conformers.csv, into that dataset's own
     .../<final_run_name>/graphs/ folder, plus a csv of each plot's
-    underlying data (residue label + both RSCC columns) into the sibling
-    .../<final_run_name>/csvs/ folder. The unrestricted (all-residues)
-    variant of these plots was dropped - it carried no information beyond
-    the placer-conformer-restricted one and only added noise.
+    underlying data (residue label + both RSCC columns) saved alongside it
+    in that same folder. The unrestricted (all-residues) variant of these
+    plots was dropped - it carried no information beyond the
+    placer-conformer-restricted one and only added noise.
     """
     datasets = read_datasets(args.datasets_file)
     label = 'Protein'
@@ -1245,7 +1704,6 @@ def run_rscc_aggregator(args):
             continue
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
 
         conformer_df = df[df['has_conformer']]
         for xcol, ycol, title, tag in comparisons:
@@ -1261,7 +1719,7 @@ def run_rscc_aggregator(args):
                 out_path=graphs_dir / out_name,
             )
             write_plot_csv(
-                csvs_dir, out_name,
+                graphs_dir, out_name,
                 paired[['residue', xcol, ycol]].rename(
                     columns={xcol: f'{xcol}_rscc', ycol: f'{ycol}_rscc'}
                 ),
@@ -1277,8 +1735,8 @@ def run_rscc_aggregator_pooled(args):
     color_by_density) since pooling every dataset's residues creates far
     more overplotting than any single dataset's plot has. Plots go into
     args.graphs_dir, with a matching csv of each plot's underlying data
-    (now including a 'dataset' column, since rows are pooled from many) in
-    the sibling args.graphs_dir/csvs/ folder.
+    (now including a 'dataset' column, since rows are pooled from many)
+    saved alongside it in that same folder.
     """
     datasets = read_datasets(args.datasets_file)
     label = 'Protein'
@@ -1306,9 +1764,7 @@ def run_rscc_aggregator_pooled(args):
     pooled_df = pd.concat(pooled_rows, ignore_index=True)
 
     graphs_dir = Path(args.graphs_dir)
-    csvs_dir = graphs_dir / 'csvs'
     graphs_dir.mkdir(parents=True, exist_ok=True)
-    csvs_dir.mkdir(parents=True, exist_ok=True)
 
     for xcol, ycol, title, tag in comparisons:
         paired = pooled_df.dropna(subset=[xcol, ycol])
@@ -1324,7 +1780,7 @@ def run_rscc_aggregator_pooled(args):
             color_by_density=True,
         )
         write_plot_csv(
-            csvs_dir, out_name,
+            graphs_dir, out_name,
             paired[['dataset', 'residue', xcol, ycol]].rename(
                 columns={xcol: f'{xcol}_rscc', ycol: f'{ycol}_rscc'}
             ),
@@ -1395,8 +1851,7 @@ def run_z_aggregator(args):
     the residues listed in final_run_name's residues_with_placer_conformers.csv
     - same restriction as the RSCC vs-apo plots. Plots go into that
     dataset's own .../<final_run_name>/graphs/ folder, plus a matching csv
-    of each plot's underlying data into the sibling
-    .../<final_run_name>/csvs/ folder.
+    of each plot's underlying data saved alongside it in that same folder.
 
     Unlike RSCC (bounded to [0, 1]), Z-scores are unbounded and roughly
     centered on 0, so each plot's axis range is computed from its own data
@@ -1418,7 +1873,6 @@ def run_z_aggregator(args):
             continue
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
 
         for xcol, ycol, title, tag in comparisons:
             paired = df.dropna(subset=[xcol, ycol])
@@ -1435,7 +1889,7 @@ def run_z_aggregator(args):
                 axis_range=_auto_axis_range(paired[xcol], paired[ycol]),
             )
             write_plot_csv(
-                csvs_dir, out_name,
+                graphs_dir, out_name,
                 paired[['residue', xcol, ycol]],
             )
 
@@ -1447,7 +1901,7 @@ def run_z_aggregator_pooled(args):
     combined into a single scatter plot per statistic instead of one per
     dataset, colored by point density (see run_rscc_aggregator_pooled).
     Plots go into args.graphs_dir, with a matching csv (now including a
-    'dataset' column) in the sibling args.graphs_dir/csvs/ folder.
+    'dataset' column) saved alongside it in that same folder.
     """
     datasets = read_datasets(args.datasets_file)
 
@@ -1473,9 +1927,7 @@ def run_z_aggregator_pooled(args):
     pooled_df = pd.concat(pooled_rows, ignore_index=True)
 
     graphs_dir = Path(args.graphs_dir)
-    csvs_dir = graphs_dir / 'csvs'
     graphs_dir.mkdir(parents=True, exist_ok=True)
-    csvs_dir.mkdir(parents=True, exist_ok=True)
 
     for xcol, ycol, title, tag in comparisons:
         paired = pooled_df.dropna(subset=[xcol, ycol])
@@ -1492,7 +1944,7 @@ def run_z_aggregator_pooled(args):
             axis_range=_auto_axis_range(paired[xcol], paired[ycol]),
             color_by_density=True,
         )
-        write_plot_csv(csvs_dir, out_name, paired[['dataset', 'residue', xcol, ycol]])
+        write_plot_csv(graphs_dir, out_name, paired[['dataset', 'residue', xcol, ycol]])
 
 
 def _final_lig_z_values(dataset, args):
@@ -1542,7 +1994,7 @@ def run_final_lig_z_histograms(args):
     residues_with_placer_conformers.csv or any other restriction). Plots go
     into that dataset's own .../<final_run_name>/graphs/ folder, plus a
     matching csv of each plot's underlying data (resnum + residue label +
-    that plot's value) into the sibling .../<final_run_name>/csvs/ folder.
+    that plot's value) saved alongside it in that same folder.
     """
     datasets = read_datasets(args.datasets_file)
 
@@ -1560,7 +2012,6 @@ def run_final_lig_z_histograms(args):
             continue
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
 
         for col, title in comparisons:
             values_df = df.dropna(subset=[col])
@@ -1576,7 +2027,7 @@ def run_final_lig_z_histograms(args):
                 value_range=None,
             )
             write_plot_csv(
-                csvs_dir, out_name,
+                graphs_dir, out_name,
                 values_df[['resnum', 'residue', col]],
             )
 
@@ -1661,8 +2112,8 @@ def run_bfactor_sensitivity_plots(args):
     canonical-event-map bfactor sweep (see _dataset_final_rscc_b_lines,
     reading final_model_refined_rscc_b.csv) into that dataset's own
     .../<final_run_name>/graphs/ folder, plus a matching csv of each plot's
-    underlying data (same basename, .csv instead of .png) into the sibling
-    .../<final_run_name>/csvs/ folder:
+    underlying data (same basename, .csv instead of .png) saved alongside
+    it in that same folder:
 
       bfactor_sensitivity_lines.png             RSCC vs bfactor, one line
                                                  per residue (its canonical
@@ -1686,7 +2137,6 @@ def run_bfactor_sensitivity_plots(args):
         print(f'  {dataset}: {len(lines)} residue(s) with a canonical bfactor sweep')
 
         graphs_dir = dataset_graphs_dir(args.datasets_dir, dataset, args)
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
 
         # --- Plot 1: raw RSCC vs bfactor ---
         _plot_bfactor_lines(
@@ -1701,7 +2151,7 @@ def run_bfactor_sensitivity_plots(args):
             for b, r in zip(bfactors, rsccs)
         ]
         write_plot_csv(
-            csvs_dir, 'bfactor_sensitivity_lines.png',
+            graphs_dir, 'bfactor_sensitivity_lines.png',
             pd.DataFrame(raw_csv_rows, columns=['residue', 'bfactor', 'rscc']),
         )
 
@@ -1722,7 +2172,7 @@ def run_bfactor_sensitivity_plots(args):
             ylabel='RSCC - RSCC(lowest bfactor)',
         )
         write_plot_csv(
-            csvs_dir, 'bfactor_sensitivity_lines_normalized.png',
+            graphs_dir, 'bfactor_sensitivity_lines_normalized.png',
             pd.DataFrame(norm_csv_rows, columns=['residue', 'bfactor', 'rscc', 'normalized_rscc']),
         )
 
@@ -1739,7 +2189,7 @@ def run_bfactor_sensitivity_plots(args):
             out_path=graphs_dir / 'bfactor_sensitivity_spearman_rho_hist.png',
             value_range=(-1.1, 1.1),
         )
-        write_plot_csv(csvs_dir, 'bfactor_sensitivity_spearman_rho_hist.png', rho_df)
+        write_plot_csv(graphs_dir, 'bfactor_sensitivity_spearman_rho_hist.png', rho_df)
 
 
 def run_bfactor_rho_pooled(args):
@@ -1751,7 +2201,7 @@ def run_bfactor_rho_pooled(args):
     noise, unlike a rho value which condenses each residue down to a single
     number). Combines every dataset's canonical per-residue spearmans_rho
     (see _dataset_final_rscc_b_lines) into one histogram, with a matching
-    csv (now including a 'dataset' column) in args.graphs_dir/csvs/.
+    csv (now including a 'dataset' column) saved alongside it in args.graphs_dir.
     """
     datasets = read_datasets(args.datasets_file)
 
@@ -1771,9 +2221,7 @@ def run_bfactor_rho_pooled(args):
     rho_df = pd.DataFrame(rows, columns=['dataset', 'residue', 'spearmans_rho'])
 
     graphs_dir = Path(args.graphs_dir)
-    csvs_dir = graphs_dir / 'csvs'
     graphs_dir.mkdir(parents=True, exist_ok=True)
-    csvs_dir.mkdir(parents=True, exist_ok=True)
 
     out_name = 'bfactor_sensitivity_spearman_rho_hist_pooled.png'
     plot_rscc_histogram(
@@ -1783,7 +2231,7 @@ def run_bfactor_rho_pooled(args):
         out_path=graphs_dir / out_name,
         value_range=(-1.1, 1.1),
     )
-    write_plot_csv(csvs_dir, out_name, rho_df)
+    write_plot_csv(graphs_dir, out_name, rho_df)
 
 
 def run_cluster_reps_pooled(args):
@@ -1794,8 +2242,8 @@ def run_cluster_reps_pooled(args):
     (filter_run_name / filter2_run_name) instead of one per dataset. Not a
     scatter plot, so no density coloring applies here - a histogram's bar
     heights already are the density. Plots go into args.graphs_dir, with a
-    matching csv (now including a 'dataset' column) in the sibling
-    args.graphs_dir/csvs/ folder.
+    matching csv (now including a 'dataset' column) saved alongside it in
+    that same folder.
     """
     datasets = read_datasets(args.datasets_file)
 
@@ -1820,9 +2268,7 @@ def run_cluster_reps_pooled(args):
             stage2_rows.append(values2_df)
 
     graphs_dir = Path(args.graphs_dir)
-    csvs_dir = graphs_dir / 'csvs'
     graphs_dir.mkdir(parents=True, exist_ok=True)
-    csvs_dir.mkdir(parents=True, exist_ok=True)
 
     for rows, out_name, stage_label in [
         (stage1_rows, 'cluster_reps_1_pooled.png', args.filter_run_name),
@@ -1838,7 +2284,7 @@ def run_cluster_reps_pooled(args):
             xlabel='RSCC',
             out_path=graphs_dir / out_name,
         )
-        write_plot_csv(csvs_dir, out_name, pooled_df[['dataset', 'cluster_rep_index', 'rscc']])
+        write_plot_csv(graphs_dir, out_name, pooled_df[['dataset', 'cluster_rep_index', 'rscc']])
 
 
 def _round1_index_from_placer_file(placer_file, dataset):
@@ -1869,8 +2315,9 @@ def plot_filter2_vs_filter1_lig_rscc(args):
     always 1:1, never many:1.
 
     Also writes the matched (filter_1_cluster_rep_index, filter_2_cluster_rep_index,
-    filter_1_rscc, filter_2_rscc) rows to a csv under .../<final_run_name>/csvs/,
-    matching the plot's filename. filter_1_cluster_rep_index is the round-1
+    filter_1_rscc, filter_2_rscc) rows to a csv alongside the plot itself in
+    that dataset's .../<final_run_name>/graphs/ folder, matching the plot's
+    filename. filter_1_cluster_rep_index is the round-1
     index embedded in the placer_file column (1-based position in
     filter_run_name/cluster_reps.csv); filter_2_cluster_rep_index is that
     matched row's own 1-based position in filter2_run_name/cluster_reps.csv,
@@ -1949,9 +2396,8 @@ def plot_filter2_vs_filter1_lig_rscc(args):
             out_path=graphs_dir / out_name,
             extra_text=f'Lost filter_1 -> filter_2: {n_lost}/{n_total_filter1}',
         )
-        csvs_dir = dataset_csvs_dir(args.datasets_dir, dataset, args)
         write_plot_csv(
-            csvs_dir, out_name,
+            graphs_dir, out_name,
             pd.DataFrame({
                 'filter_1_cluster_rep_index': matched_filter1_idx,
                 'filter_2_cluster_rep_index': matched_filter2_idx,

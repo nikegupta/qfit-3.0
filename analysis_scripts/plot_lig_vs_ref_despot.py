@@ -53,11 +53,10 @@ def main():
 
     plot_lig_vs_ref(
         args, run_dir_for_dataset,
-        title=(f'Ligand RSCC vs Reference, DESPOT-filtered ({args.run_name}/'
-               f'{args.placer_run_name}/{args.filter_run_name}/{args.placer2_run_name}/'
-               f'{args.filter2_run_name}/{args.despot_run_name})'),
+        title='Ligand RSCC vs Reference, DESPOT-filtered',
         out_name='lig_vs_reference_rscc.png',
         alive_rows_for_dataset=alive_rows_for_dataset,
+        resi_col_name='despot_filtered_resi', chain_col_name='despot_filtered_chain',
     )
 
 

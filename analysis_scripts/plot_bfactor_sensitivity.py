@@ -11,7 +11,7 @@ For each residue, the "canonical" event map is whichever one contains that
 residue's single highest RSCC value across all of its (event_map, bfactor)
 rows. Three plots are produced per dataset, into that dataset's own
 .../<final_run_name>/graphs/ folder, plus a matching csv of each plot's
-underlying data into the sibling .../<final_run_name>/csvs/ folder:
+underlying data saved alongside it in that same folder:
 
   bfactor_sensitivity_lines.png             RSCC (y) vs bfactor (x), one
                                              line per residue, using its

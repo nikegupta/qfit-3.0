@@ -9,6 +9,11 @@
 #   0b. calc_apo_rscc                   -> <dataset>/<dataset>-aligned-structure_rscc.csv
 #       + calc_apo_z                    -> <dataset>/<dataset>-aligned-structure_z.csv
 #   0c. calc_ref_set_rscc (only with -c) -> REF_SET/<dataset>/<REF_SET_PDB_PATTERN%.pdb>_rscc.csv
+#   0d. ref_set_despot (only with -c and <despot_run_name>): symmetry_expand
+#       (--strip, dropping ligand hydrogens + HOH waters first) the reference
+#       structure, convert to mol2, score with DESPOT's score_complex.py -
+#       same workflow as Stage 7a, run once per dataset (not nested under any
+#       run_name)                        -> REF_SET/<dataset>/<dataset>_DESPOT.csv
 #   1a. fit_ligand                      -> <run_name>/
 #   1b. plot_fit_ligand_counts (always) -> GRAPHS_DIR/<run_name>/
 #   1c. centroid_rmsd_all (only with -c) -> GRAPHS_DIR/<run_name>/
@@ -44,15 +49,28 @@
 #                                        -> .../<final_run_name>/<despot_run_name>/
 #       + despot_filter final_model_refined.pdb against its own DESPOT csv,
 #         normalized per heavy atom, dropping any ligand pose scoring above
-#         --despot_threshold (default 0.0) as physically implausible
+#         --despot_threshold (unset: despot_filter's own default) as
+#         physically implausible, and recording every instance's normalized
+#         score (kept or not) to despot_filtered_scores.csv
 #                                        -> .../<final_run_name>/<despot_run_name>/despot_filtered.pdb
-#   7b. plot_despot_energies (per-dataset histogram)
-#                                        -> .../<final_run_name>/graphs/ + csvs/
+#                                           + despot_filtered_scores.csv
+#   7b. plot_despot_energies (per-dataset histogram, heavy-atom-normalized)
+#                                        -> .../<final_run_name>/graphs/
 #       + plot_despot_energies_pooled   -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
 #   7c. plot_lig_vs_ref_despot (only with -c): despot_filtered.pdb's
 #       surviving ligands' cluster_reps.csv RSCC vs the reference set,
 #       matched the same way as stages 3d/5b - see rscc_common.py's
 #       alive_rows
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
+#   7d. plot_despot_ligand_summary: every surviving ligand's normalized
+#       DESPOT score vs its cluster_reps.csv RSCC, no -c needed
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
+#       + plot_despot_ligand_summary_single (per-dataset, chain+resi-labeled)
+#                                        -> .../<final_run_name>/<despot_run_name>/
+#   7e. plot_despot_vs_ref (only with -c): each dataset's reference-set
+#       DESPOT score (Stage 0d) vs the matched pipeline ligand's DESPOT
+#       score, both normalized per heavy atom, matched the same way as
+#       stages 3d/5b/7c
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
 #   8.  analysis_scripts/*.py           -> .../<final_run_name>/graphs/
 #       (cluster-rep and per-residue RSCC plots, filter_2-vs-filter_1 ligand
@@ -80,15 +98,15 @@
 # given, independent of stage 7.
 #
 # Idempotency: every step checks whether its own actual output file(s)
-# already exist - for a given dataset (main pipeline steps 0b-7a) or for the
-# whole run (graphing steps 1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 8) - and skips
+# already exist - for a given dataset (main pipeline steps 0b-0d, 7a) or for the
+# whole run (graphing steps 1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8) - and skips
 # just that piece of work if so, so previous runs are never overwritten.
 # Main pipeline steps with a variable number of outputs per dataset (PLACER
 # and RSR rounds) use a loose "at least one matching output exists" check -
 # a partially-failed dataset is treated as done and needs --overwrite to
 # resume. Pass --overwrite to force every step to re-run in place regardless
 # of existing output (including the graphing steps), or --replot to force
-# just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 8) to redo.
+# just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8) to redo.
 # Stage 8 has no readiness precondition of its own - it runs whenever
 # <final_run_name> is given, and its own idempotency check (like every other
 # graphing step) simply skips any dataset that doesn't yet have the output
@@ -131,22 +149,27 @@ Options:
   -p <num_parallel>        CPU parallelism for every non-PLACER stage (calc_apo_rscc, calc_apo_z,
                             fit_ligand, rsr_placer, filter, rsr_backbone, calc_backbone_refined_rscc,
                             rsr_placer2, filter2, build_final, rsr_final, calc_final_refined_rscc,
-                            calc_final_refined_z, despot). Default: 1
+                            calc_final_refined_z, despot, ref_set_despot). Default: 1
   -c                       Also compare results to the reference set (REF_SET). Runs
                             calc_ref_set_rscc as stage 0c: per dataset, computes RSCC of
                             REF_SET/<dataset>/<REF_SET_PDB_PATTERN>, skipping any dataset whose
-                            output csv already exists. Also runs pooled (cross-dataset)
-                            ligand/residue comparison plots into GRAPHS_DIR: stage 1c
-                            (centroid_rmsd_all), 2c and 4c (calc_placer_sampling, refined
+                            output csv already exists. When <despot_run_name> is also given, also
+                            runs ref_set_despot as stage 0d: per dataset, DESPOT-scores
+                            REF_SET/<dataset>/<REF_SET_PDB_PATTERN> (symmetry_expand --strip,
+                            mol2 conversion, score_complex.py) into
+                            REF_SET/<dataset>/<dataset>_DESPOT.csv. Also runs pooled
+                            (cross-dataset) ligand/residue comparison plots into GRAPHS_DIR: stage
+                            1c (centroid_rmsd_all), 2c and 4c (calc_placer_sampling, refined
                             + unrefined), 3d (plot_lig_vs_ref_filter1, plot_residues_vs_ref_backbone),
-                            5b (plot_lig_vs_ref_filter2), 6d (plot_residues_vs_ref_final), and 7c
-                            (plot_lig_vs_ref_despot, only when <despot_run_name> is also given).
+                            5b (plot_lig_vs_ref_filter2), 6d (plot_residues_vs_ref_final), and (only
+                            when <despot_run_name> is also given) 7c (plot_lig_vs_ref_despot) and 7e
+                            (plot_despot_vs_ref).
   --overwrite              Force every requested step to re-run in place, even if its output
                             already exists (normally such a step is skipped - see "Idempotency"
                             in the header comment). Applies to every stage, including the
                             graphing steps. Does not affect stage 8's precondition that stage 6
                             already be complete for every dataset.
-  --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 8) to
+  --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8) to
                             re-run in place, even if their output already exists. Does not
                             affect the main pipeline steps (use --overwrite for those too).
   --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
@@ -255,6 +278,9 @@ PLOT_BFACTOR_RHO_POOLED_PY="${ANALYSIS_SCRIPTS_DIR}/plot_bfactor_rho_pooled.py"
 PLOT_DESPOT_ENERGIES_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_energies.py"
 PLOT_DESPOT_ENERGIES_POOLED_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_energies_pooled.py"
 PLOT_LIG_VS_REF_DESPOT_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_despot.py"
+PLOT_DESPOT_LIGAND_SUMMARY_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand_summary.py"
+PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand_summary_single.py"
+PLOT_DESPOT_VS_REF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_vs_ref.py"
 ASSIGN_BOND_ORDERS_PY="${LIG_SCRIPTS_DIR}/assign_bond_orders.py"
 PDB_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/pdb_to_mol2.sh"
 PROTEIN_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/protein_to_mol2.sh"
@@ -268,7 +294,8 @@ for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN"
          "$PLOT_BFACTOR_SENSITIVITY_PY" "$ASSIGN_BOND_ORDERS_PY" "$PLOT_CLUSTER_REPS_POOLED_PY" \
          "$PLOT_PROTEIN_RSCC_POOLED_PY" "$PLOT_Z_POOLED_PY" \
          "$PLOT_BFACTOR_RHO_POOLED_PY" "$PLOT_DESPOT_ENERGIES_PY" "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
-         "$PLOT_LIG_VS_REF_DESPOT_PY" \
+         "$PLOT_LIG_VS_REF_DESPOT_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
+         "$PLOT_DESPOT_VS_REF_PY" \
          "$PDB_TO_MOL2_SH" "$PROTEIN_TO_MOL2_SH" "$DESPOT_SCRIPT"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
@@ -544,7 +571,9 @@ export PLOT_FINAL_LIG_Z_PY
 export PLOT_BFACTOR_SENSITIVITY_PY
 export PLOT_CLUSTER_REPS_POOLED_PY PLOT_PROTEIN_RSCC_POOLED_PY
 export PLOT_Z_POOLED_PY PLOT_BFACTOR_RHO_POOLED_PY
-export PLOT_DESPOT_ENERGIES_PY PLOT_DESPOT_ENERGIES_POOLED_PY PLOT_LIG_VS_REF_DESPOT_PY
+export PLOT_DESPOT_ENERGIES_PY PLOT_DESPOT_ENERGIES_POOLED_PY PLOT_LIG_VS_REF_DESPOT_PY PLOT_DESPOT_LIGAND_SUMMARY_PY
+export PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY
+export PLOT_DESPOT_VS_REF_PY
 export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE EXPAND_DISTANCE_CUTOFF
 export REF_SET REF_SET_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_OBABEL CONDA_ENV_DESPOT
@@ -660,7 +689,7 @@ run_step_pooled() {
 }
 
 # run_step_replot <description> <check_fn> <run_fn>
-# For graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 8): skips run_fn (via
+# For graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8): skips run_fn (via
 # run_step) when check_fn - a function name taking no args - returns success
 # (0, "all of this step's outputs already exist"), UNLESS --replot or
 # --overwrite was given.
@@ -1054,6 +1083,134 @@ do_calc_ref_set_rscc() {
     printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_ref_set_rscc_process_dataset {}
     echo "All jobs completed"
     print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 0d: ref_set_despot (only runs when -c and despot_run_name are given)
+######################################################################
+# Scores each dataset's reference-set structure (REF_SET/<dataset>/<REF_SET_PDB_PATTERN>)
+# with DESPOT, the same way as Stage 7a's own final_model_refined.pdb: symmetry_expand
+# into a realistic crystal environment (EXPAND_DISTANCE_CUTOFF), convert the expanded
+# protein and split-out ligand to mol2, score with DESPOT's score_complex.py. Unlike
+# Stage 7a's input, the reference structure still carries explicit ligand hydrogens and
+# ordered waters (e.g. from PanDDA) - symmetry_expand's own --strip flag removes both
+# before anything else runs, since DESPOT scoring isn't set up to expect either. Every
+# output, including the intermediate expanded/mol2 files, is written directly into
+# REF_SET/<dataset>/ (one reference structure per dataset, no run-name nesting needed -
+# reused as-is across every run_name/despot_run_name combination scored against the same
+# reference set), alongside the reference RSCC csv Stage 0c already writes there.
+
+ref_set_despot_process_dataset() {
+    local dataset=$1
+    local reference_dataset_dir="${REF_SET}/${dataset}"
+
+    if [ ! -d "$reference_dataset_dir" ]; then
+        echo "Warning [${dataset}]: reference set folder ${reference_dataset_dir} not found, skipping."
+        return 1
+    fi
+
+    local pdb_pattern="${REF_SET_PDB_PATTERN//\{dataset\}/${dataset}}"
+    local structure="${reference_dataset_dir}/${pdb_pattern}"
+    local despot_csv="${reference_dataset_dir}/${dataset}_DESPOT.csv"
+
+    if [ "$overwrite" -ne 1 ] && files_exist "$despot_csv"; then
+        echo "Skipping [${dataset}]: ref_set_despot already complete (${despot_csv} exists)."
+        return 0
+    fi
+
+    if [ ! -f "$structure" ]; then
+        echo "Warning [${dataset}]: reference structure not found: ${structure}, skipping."
+        return 1
+    fi
+
+    local cell_lookup=$(grep "^${dataset} " "$DESPOT_CELL_LOOKUP_FILE")
+    if [ -z "$cell_lookup" ]; then
+        echo "Warning [${dataset}]: no crystal cell/space group info found in ${CSV_FILE}, skipping."
+        return 1
+    fi
+    local cl_dataset a b c alpha beta gamma space_group
+    read -r cl_dataset a b c alpha beta gamma space_group <<< "$cell_lookup"
+
+    local smiles_lookup=$(grep "^${dataset} " "$LIG_SMILES_LOOKUP_FILE")
+    local smiles=$(echo "$smiles_lookup" | awk '{print $2}')
+    if [ -z "$smiles" ]; then
+        echo "Warning [${dataset}]: no SMILES found, skipping."
+        return 1
+    fi
+
+    echo "Processing ${dataset}: space_group=${space_group}, cell=(${a} ${b} ${c} ${alpha} ${beta} ${gamma})"
+
+    local ref_despot_log="${reference_dataset_dir}/despot_log.txt"
+    exec > >(tee "$ref_despot_log") 2>&1
+
+    local dataset_start_time=$(date +%s)
+
+    local expanded_pdb="${reference_dataset_dir}/expanded.pdb"
+    local ligs_pdb="${reference_dataset_dir}/ligs.pdb"
+    local ligs_mol2="${reference_dataset_dir}/ligs.mol2"
+    local expanded_mol2="${reference_dataset_dir}/expanded.mol2"
+
+    local step_start_time=$(date +%s)
+    conda_activate "$CONDA_ENV_QFIT"
+    symmetry_expand --strip "$structure" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
+        "$EXPAND_DISTANCE_CUTOFF" "$ligs_pdb"
+    local status=$?
+    conda_deactivate
+    print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
+    if [ $status -ne 0 ]; then
+        echo "ERROR [${dataset}]: symmetry_expand failed with exit code ${status}"
+        print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
+        return 1
+    fi
+
+    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL"
+    status=$?
+    if [ $status -ne 0 ]; then
+        echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
+        print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
+        return 1
+    fi
+
+    step_start_time=$(date +%s)
+    "$PROTEIN_TO_MOL2_SH" "$expanded_pdb" "$CONDA_SH" "$CONDA_ENV_OBABEL"
+    status=$?
+    print_elapsed "$step_start_time" "[${dataset}] pdb2pqr"
+    if [ $status -ne 0 ]; then
+        echo "ERROR [${dataset}]: protein_to_mol2.sh failed on ${expanded_pdb} with exit code ${status}"
+        print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
+        return 1
+    fi
+
+    step_start_time=$(date +%s)
+    conda_activate "$CONDA_ENV_DESPOT"
+    python "$DESPOT_SCRIPT" -p "$expanded_mol2" -l "$ligs_mol2" -o "$despot_csv" --database "$DESPOT_DATABASE"
+    status=$?
+    conda_deactivate
+    print_elapsed "$step_start_time" "[${dataset}] despot score_complex.py"
+    if [ $status -ne 0 ]; then
+        echo "ERROR [${dataset}]: DESPOT score_complex.py failed with exit code ${status}"
+        print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${despot_csv}"
+    print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
+}
+export -f ref_set_despot_process_dataset
+
+do_ref_set_despot() {
+    # See do_despot's identical comment: pins BLAS/OpenMP/numba threading in
+    # DESPOT's score_complex.py to 1 thread per process, scoped to just this
+    # stage, so `parallel`'s fan-out doesn't oversubscribe the machine.
+    export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMBA_NUM_THREADS=1
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" --line-buffer ref_set_despot_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+
+    unset OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS NUMBA_NUM_THREADS
 }
 
 ######################################################################
@@ -2912,12 +3069,15 @@ do_despot() {
 ######################################################################
 # Stage 7b: plot_despot_energies + plot_despot_energies_pooled
 ######################################################################
-# Per-dataset histogram of DESPOT ligand binding-energy scores, read from
-# .../<final_run_name>/<despot_run_name>/<dataset>_DESPOT.csv, written into
-# that dataset's existing .../<final_run_name>/graphs/ and csvs/ folders -
-# the same per-dataset location every other stage-8 plot uses (not nested
-# under despot_run_name) - plus the pooled (cross-dataset) counterpart:
-# every dataset's DESPOT scores combined into one histogram,
+# Per-dataset histogram of heavy-atom-normalized DESPOT ligand binding-energy
+# scores, read from .../<final_run_name>/<despot_run_name>/despot_filtered_scores.csv
+# (despot_filter.py's own per-instance normalized_score column - not the raw,
+# un-normalized <dataset>_DESPOT.csv score, which isn't comparable across
+# differently-sized ligands), written into that dataset's existing
+# .../<final_run_name>/graphs/ folder (plot data csv saved alongside it there
+# too) - the same per-dataset location every other stage-8 plot uses (not
+# nested under despot_run_name) - plus the pooled (cross-dataset) counterpart:
+# every dataset's normalized DESPOT scores combined into one histogram,
 # GRAPHS_DIR/<run>/.../<final_run_name>/<despot_run_name>/ligand_energies.png
 # (nested under despot_run_name, unlike the other pooled plots, since the
 # scores are specific to one despot_run_name). The pooled half is still
@@ -3002,6 +3162,103 @@ do_plot_lig_vs_ref_despot() {
 
 despot_lig_vs_ref_outputs_exist() {
     files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/lig_vs_reference_rscc.png"
+}
+
+######################################################################
+# Stage 7d: plot_despot_ligand_summary + plot_despot_ligand_summary_single
+######################################################################
+# Pooled scatter of every surviving (despot_filter-kept) ligand's heavy-atom-
+# normalized DESPOT score (x) against its filter2_run_name/cluster_reps.csv
+# RSCC (y) - see plot_despot_ligand_summary.py. Doesn't need -c: RSCC here
+# comes from cluster_reps.csv, not the reference set. Nested under
+# despot_run_name, like Stage 7b/7c, since the surviving ligands are specific
+# to one despot_run_name/--despot_threshold. Plus the per-dataset counterpart:
+# each dataset's own surviving ligands only, written directly into that
+# dataset's own .../<final_run_name>/<despot_run_name>/ directory (not
+# graphs_dir) with each point labeled (chain+resi, e.g. 'C1') since a single
+# dataset typically has few enough surviving ligands for that to stay
+# readable - see plot_despot_ligand_summary_single.py.
+
+do_plot_despot_ligand_summary() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_DESPOT_LIGAND_SUMMARY_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+do_plot_despot_ligand_summary_single() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+do_despot_ligand_summary_plots() {
+    do_plot_despot_ligand_summary_single
+    do_plot_despot_ligand_summary
+}
+
+# despot_ligand_summary_outputs_exist: pooled ligand_summary.png exists, AND
+# every dataset that actually has at least one despot_filter-kept ligand
+# (despot_filtered_scores.csv has a 'kept'=True row) also has its own
+# per-dataset ligand_summary.png (datasets with no kept ligand never get a
+# plot - single-dataset or pooled - so they're not required).
+despot_ligand_summary_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    files_exist "${out_dir}/ligand_summary.png" || return 1
+
+    local dataset
+    for dataset in "${DATASETS[@]}"; do
+        local despot_dir="${DATASETS_DIR}/${dataset}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+        local scores_csv="${despot_dir}/despot_filtered_scores.csv"
+        if [ -f "$scores_csv" ] && grep -q ',True$' "$scores_csv" && [ ! -f "${despot_dir}/ligand_summary.png" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+######################################################################
+# Stage 7e: plot_despot_vs_ref (only with -c)
+######################################################################
+# Pooled scatter of each dataset's reference-set DESPOT score (Stage 0d's
+# REF_SET/<dataset>/<dataset>_DESPOT.csv) against the matched pipeline
+# ligand's DESPOT score (despot_run_name/despot_filtered_scores.csv), both
+# heavy-atom-normalized, matched by centroid distance the same way stages
+# 3d/5b/7c do - see plot_despot_vs_ref.py. Nested under despot_run_name,
+# like Stage 7b/7c/7d, since the pipeline-side scores are specific to one
+# despot_run_name/--despot_threshold.
+
+do_plot_despot_vs_ref() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_DESPOT_VS_REF_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+despot_vs_ref_outputs_exist() {
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/despot_vs_reference.png"
 }
 
 ######################################################################
@@ -3099,7 +3356,7 @@ do_plot_final_lig_z() {
 # plot_bfactor_sensitivity: per-dataset RSCC-vs-bfactor line plots (raw and
 # normalized) plus a spearmans_rho histogram, built from that dataset's own
 # final_model_refined_rscc_b.csv (stage 6c), into .../<final_run_name>/graphs/
-# with matching csvs in .../<final_run_name>/csvs/.
+# with each plot's underlying data saved alongside it there too.
 do_plot_bfactor_sensitivity() {
     conda_activate "$CONDA_ENV_EVAL"
 
@@ -3247,6 +3504,9 @@ stage0_apo_rscc() {
     run_step "Stage 0b: calc_apo_z" do_calc_apo_z
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step "Stage 0c: calc_ref_set_rscc" do_calc_ref_set_rscc
+        if [ -n "$despot_run_name" ]; then
+            run_step "Stage 0d: ref_set_despot" do_ref_set_despot
+        fi
     fi
 }
 
@@ -3315,6 +3575,12 @@ stage7_despot() {
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 7c: plot_lig_vs_ref_despot (${despot_run_name})" \
             despot_lig_vs_ref_outputs_exist do_plot_lig_vs_ref_despot
+    fi
+    run_step_pooled_replot "Stage 7d: plot_despot_ligand_summary + plot_despot_ligand_summary_single (${despot_run_name})" \
+        despot_ligand_summary_outputs_exist do_despot_ligand_summary_plots
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 7e: plot_despot_vs_ref (${despot_run_name})" \
+            despot_vs_ref_outputs_exist do_plot_despot_vs_ref
     fi
 }
 

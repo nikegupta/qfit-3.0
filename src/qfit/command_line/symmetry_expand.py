@@ -66,6 +66,17 @@ def build_argparser():
              'all in a single pdb, keeping each ligand\'s original chain id and residue '
              'number. Not written at all if the input structure has no LIG atoms.'
     )
+    p.add_argument(
+        '--strip',
+        action='store_true',
+        help='Before doing anything else, strip hydrogen atoms off every ligand (resname '
+             'LIG) residue and remove explicit water (resname HOH) residues entirely. '
+             'Meant for reference-set structures (e.g. a PanDDA model), which - unlike '
+             'this pipeline\'s own final_model_refined.pdb - carry explicit ligand '
+             'hydrogens and ordered waters that DESPOT scoring is not set up to handle. '
+             'A final_model_refined.pdb already has neither, so this is a no-op on one; '
+             'kept as an explicit, toggleable flag rather than always-on for control.'
+    )
     return p
 
 
@@ -166,6 +177,14 @@ def main():
     args = build_argparser().parse_args()
 
     structure = Structure.fromfile(str(args.input_pdb))
+
+    if args.strip:
+        n_before = structure.natoms
+        keep_mask = ~(((structure.resn == 'LIG') & (structure.e == 'H')) | (structure.resn == 'HOH'))
+        structure = structure.extract(keep_mask)
+        print(f'--strip: removed {n_before - structure.natoms} atom(s) (ligand hydrogens + '
+              f'HOH waters); {structure.natoms} atom(s) remain.')
+
     # Always taken from the command line, never from the input pdb's own CRYST1 record (which,
     # for this pipeline's structures, is never correct/meaningful).
     crystal_symmetry = crystal.symmetry(

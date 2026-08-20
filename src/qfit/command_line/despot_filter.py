@@ -59,10 +59,14 @@ def _instance_key(chain_id, resi, icode):
 
 
 def filter_ligands(structure, scores_by_label, threshold):
-    """Returns (kept_mask, n_kept, n_removed, n_missing_score): a boolean mask
-    over structure.atoms (True = keep) that drops every atom belonging to a
-    ligand (resname LIG) instance whose DESPOT score, normalized by heavy-atom
-    count, is above threshold. Every non-ligand atom is always kept.
+    """Returns (kept_mask, rows): a boolean mask over structure.atoms (True =
+    keep) that drops every atom belonging to a ligand (resname LIG) instance
+    whose DESPOT score, normalized by heavy-atom count, is above threshold
+    (every non-ligand atom is always kept), and one row per ligand instance -
+    {ligand, chain, resi, icode, raw_score, normalized_score, kept} - the same
+    per-instance table main() writes to <output_pdb's parent>/despot_filtered_scores.csv.
+    An instance with no matching ligand_energy_csv row is kept unfiltered,
+    with raw_score/normalized_score left as None (written as an empty cell).
 
     Every distinct (chain, resi, icode) LIG instance is treated as one pose of
     the same ligand molecule - final_model_refined.pdb's ligand instances are
@@ -70,7 +74,9 @@ def filter_ligands(structure, scores_by_label, threshold):
     position-based indexing convention as filter2_run_name/cluster_reps.csv's
     rows, so instance resi i corresponds to cluster_reps.csv's i-th data row -
     but that correspondence isn't needed here, since ligand_energy_csv already
-    identifies each instance by its own (chain, resnum) label directly.
+    identifies each instance by its own (chain, resnum) label directly (it's
+    recorded in the output rows/csv anyway, for exactly that correspondence to
+    be usable downstream - see plot_despot_ligand_summary.py).
     """
     chain_arr = structure.chain
     resi_arr = structure.resi
@@ -79,7 +85,7 @@ def filter_ligands(structure, scores_by_label, threshold):
 
     ligand = structure.extract('resname LIG')
     if ligand.natoms == 0:
-        return np.ones(structure.natoms, dtype=bool), 0, 0, 0
+        return np.ones(structure.natoms, dtype=bool), []
 
     n_heavy_atoms = _heavy_atom_count(ligand, chain_arr[is_lig][0], resi_arr[is_lig][0], icode_arr[is_lig][0])
     print(f'{n_heavy_atoms} heavy atom(s) per ligand instance (normalization divisor)')
@@ -94,31 +100,34 @@ def filter_ligands(structure, scores_by_label, threshold):
     instances.sort(key=lambda k: (k[1], k[0], k[2]))
 
     kept_mask = np.ones(structure.natoms, dtype=bool)
-    n_kept, n_removed, n_missing_score = 0, 0, 0
+    rows = []
 
     for chain_id, resi, icode in instances:
         label = _instance_key(chain_id, resi, icode)
         if label not in scores_by_label:
             print(f'  WARNING: no DESPOT score found for {label} in ligand_energy_csv; '
                   f'keeping it unfiltered.')
-            n_missing_score += 1
+            rows.append({'ligand': label, 'chain': chain_id, 'resi': resi, 'icode': icode,
+                         'raw_score': None, 'normalized_score': None, 'kept': True})
             continue
 
         raw_score = scores_by_label[label]
         normalized_score = raw_score / n_heavy_atoms
         instance_mask = is_lig & (chain_arr == chain_id) & (resi_arr == resi) & (icode_arr == icode)
+        kept = normalized_score <= threshold
 
-        if normalized_score > threshold:
-            kept_mask[instance_mask] = False
-            n_removed += 1
-            print(f'  Removing {label}: score={raw_score:.3f}, normalized={normalized_score:.4f} '
-                  f'> threshold {threshold}')
-        else:
-            n_kept += 1
+        if kept:
             print(f'  Keeping {label}: score={raw_score:.3f}, normalized={normalized_score:.4f} '
                   f'<= threshold {threshold}')
+        else:
+            kept_mask[instance_mask] = False
+            print(f'  Removing {label}: score={raw_score:.3f}, normalized={normalized_score:.4f} '
+                  f'> threshold {threshold}')
 
-    return kept_mask, n_kept, n_removed, n_missing_score
+        rows.append({'ligand': label, 'chain': chain_id, 'resi': resi, 'icode': icode,
+                     'raw_score': raw_score, 'normalized_score': normalized_score, 'kept': kept})
+
+    return kept_mask, rows
 
 
 def _heavy_atom_count(ligand, chain_id, resi, icode):
@@ -140,14 +149,20 @@ def main():
     scores_df = pd.read_csv(args.ligand_energy_csv)
     scores_by_label = dict(zip(scores_df['ligand'], scores_df['score']))
 
-    kept_mask, n_kept, n_removed, n_missing_score = filter_ligands(
-        structure, scores_by_label, args.threshold
-    )
+    kept_mask, rows = filter_ligands(structure, scores_by_label, args.threshold)
 
     filtered = structure.extract(kept_mask).copy()
     args.output_pdb.parent.mkdir(parents=True, exist_ok=True)
     filtered.tofile(str(args.output_pdb))
 
+    scores_csv = args.output_pdb.parent / 'despot_filtered_scores.csv'
+    pd.DataFrame(rows, columns=['ligand', 'chain', 'resi', 'icode', 'raw_score',
+                                 'normalized_score', 'kept']).to_csv(scores_csv, index=False)
+    print(f'Normalized score(s) written to {scores_csv}.')
+
+    n_kept = sum(1 for r in rows if r['kept'])
+    n_removed = sum(1 for r in rows if not r['kept'] and r['raw_score'] is not None)
+    n_missing_score = sum(1 for r in rows if r['raw_score'] is None)
     print(f'Kept {n_kept} ligand instance(s), removed {n_removed} (normalized DESPOT score > '
           f'{args.threshold}), {n_missing_score} with no DESPOT score (kept unfiltered). '
           f'Wrote {args.output_pdb}.')

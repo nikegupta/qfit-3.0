@@ -15,8 +15,9 @@ dataset gets its own graphs/ folder inside its own final_run_name directory:
   final_lig_average_z.png
 
 The values behind each histogram are also written to a matching csv (same
-basename, .csv instead of .png) in the sibling csvs/ folder, indexed by
-resnum - each LIG residue's own residue number in final_model_refined.pdb
+basename, .csv instead of .png) alongside the plot in that same graphs/
+folder, indexed by resnum - each LIG residue's own residue number in
+final_model_refined.pdb
 (the same position-based indexing convention as filter2_run_name's
 cluster_reps.csv rows - see cluster_reps_2.csv).
 
