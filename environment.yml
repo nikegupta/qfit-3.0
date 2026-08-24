@@ -1,4 +1,4 @@
-name: nikhils_program
+name: nikhils_program_exp
 channels:
   - conda-forge
   - bioconda

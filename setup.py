@@ -70,12 +70,17 @@ def main():
                 "calc_chi = qfit.command_line.calc_chi:main",
                 "prep_placer = qfit.command_line.prep_placer:main",
                 "fit_ligand = qfit.command_line.fit_ligand:main",
+                "fit_dmso = qfit.command_line.fit_dmso:main",
                 "phenix_ligandfit = qfit.command_line.phenix_ligandfit:main",
                 "filter = qfit.command_line.filter:main",
                 "rotamer_optimize = qfit.command_line.rotamer_optimize:main",
                 "calc_rscc = qfit.command_line.calc_rscc:main",
+                "calc_rscc_b = qfit.command_line.calc_rscc_b:main",
+                "calc_z = qfit.command_line.calc_z:main",
                 "compare_lig_rscc = qfit.command_line.compare_lig_rscc:main",
                 "build_final_model = qfit.command_line.build_final_model:main",
+                "symmetry_expand = qfit.command_line.symmetry_expand:main",
+                "despot_filter = qfit.command_line.despot_filter:main",
             ]
         },
         scripts=[

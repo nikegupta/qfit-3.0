@@ -17,7 +17,12 @@ import argparse
 import csv
 from pathlib import Path
 
-from rscc_common import DEFAULT_DATASETS_DIR, DEFAULT_DATASETS_FILE, read_datasets, plot_count_histogram
+import pandas as pd
+
+from rscc_common import (
+    DEFAULT_DATASETS_DIR, DEFAULT_DATASETS_FILE, read_datasets, plot_count_histogram,
+    write_plot_csv,
+)
 
 
 def count_manifest_rows(manifest_path):
@@ -39,7 +44,7 @@ def main():
     args = parser.parse_args()
 
     datasets = read_datasets(args.datasets_file)
-    counts = []
+    rows = []
     for dataset in datasets:
         manifest_path = Path(args.datasets_dir) / dataset / args.run_name / 'fit_ligand_manifest.csv'
         if not manifest_path.exists():
@@ -47,16 +52,19 @@ def main():
             continue
         n = count_manifest_rows(manifest_path)
         print(f'  {dataset}: {n} fit_ligand output pose(s)')
-        counts.append(n)
+        rows.append({'dataset': dataset, 'count': n})
 
     out_dir = Path(args.graphs_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = 'fit_ligand_counts.png'
     plot_count_histogram(
-        counts,
+        [row['count'] for row in rows],
         title=f'Fit-Ligand Output Poses per Dataset ({args.run_name})',
         xlabel='Number of fit_ligand Output Poses',
-        out_path=out_dir / 'fit_ligand_counts.png',
+        out_path=out_dir / out_name,
     )
+    if rows:
+        write_plot_csv(out_dir, out_name, pd.DataFrame(rows))
 
 
 if __name__ == '__main__':

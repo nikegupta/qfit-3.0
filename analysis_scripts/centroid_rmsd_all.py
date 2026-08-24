@@ -25,12 +25,13 @@ Usage:
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import biotite.structure as struc
 import biotite.structure.io.pdb as pdb
 
 from rscc_common import (
     build_ref_argparser, read_datasets, read_pdb_raw_atoms, lig_conformations_filtered,
-    plot_distance_histogram, ref_pdb_path,
+    plot_distance_histogram, ref_pdb_path, write_plot_csv,
 )
 
 
@@ -68,9 +69,9 @@ def align_to_reference(mobile_struct, target_struct):
 
 
 def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
-    """Returns a list of min-centroid-distance values, one per reference LIG
-    conformation matched against the closest ligand pose (after CA
-    superposition) across every *.pdb file directly in run_dir."""
+    """Returns a list of {ref_chain, ref_resi, ref_altloc, dist} dicts, one
+    per reference LIG conformation matched against the closest ligand pose
+    (after CA superposition) across every *.pdb file directly in run_dir."""
     if not run_dir.exists() or not ref_path.exists():
         return []
 
@@ -108,30 +109,39 @@ def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
                 if dist < min_dists[ref_key]:
                     min_dists[ref_key] = dist
 
-    return [dist for dist in min_dists.values() if np.isfinite(dist)]
+    return [
+        {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'dist': dist}
+        for key, dist in min_dists.items() if np.isfinite(dist)
+    ]
 
 
 def main():
     args = build_ref_argparser(__doc__, ['run_name']).parse_args()
 
     datasets = read_datasets(args.datasets_file)
-    all_dists = []
+    all_rows = []
     for dataset in datasets:
         run_dir = Path(args.datasets_dir) / dataset / args.run_name
         ref_path = ref_pdb_path(args, dataset)
-        dists = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1)
-        print(f'  {dataset}: {len(dists)} ref LIG conformation(s) matched')
-        all_dists.extend(dists)
+        rows = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1)
+        print(f'  {dataset}: {len(rows)} ref LIG conformation(s) matched')
+        for row in rows:
+            row['dataset'] = dataset
+        all_rows.extend(rows)
 
     out_dir = Path(args.graphs_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = 'centroid_rmsd_all.png'
     plot_distance_histogram(
-        all_dists,
+        [row['dist'] for row in all_rows],
         title=f'Ligand Centroid Distance: fit_ligand Structures vs Reference ({args.run_name})',
         xlabel='Minimum Centroid Distance to Closest fit_ligand Pose (Å)',
-        out_path=out_dir / 'centroid_rmsd_all.png',
+        out_path=out_dir / out_name,
         bin_width=1.0,
     )
+    if all_rows:
+        write_plot_csv(out_dir, out_name,
+                        pd.DataFrame(all_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'dist']])
 
 
 if __name__ == '__main__':

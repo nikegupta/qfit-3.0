@@ -39,9 +39,11 @@ Output:
 """
 from pathlib import Path
 
+import pandas as pd
+
 from rscc_common import (
     build_placer_sampling_argparser, resolve_placer_sampling_mode, read_datasets,
-    process_placer_sampling_dataset, plot_distance_histogram, ref_pdb_path,
+    process_placer_sampling_dataset, plot_distance_histogram, ref_pdb_path, write_plot_csv,
 )
 
 
@@ -50,7 +52,7 @@ def main():
     mode_b, run_tag = resolve_placer_sampling_mode(args)
 
     datasets = read_datasets(args.datasets_file)
-    all_rmsds = []
+    all_rows = []
     for dataset in datasets:
         base = Path(args.datasets_dir) / dataset / args.run_name / args.placer_run_name
         if mode_b:
@@ -60,22 +62,28 @@ def main():
             model_dir = base
             file_pattern = '*_refined.pdb'
 
-        rmsds = process_placer_sampling_dataset(
+        rows = process_placer_sampling_dataset(
             model_dir, ref_pdb_path(args, dataset), file_pattern,
             args.model_chain, args.model_resi,
         )
-        print(f'  {dataset}: {len(rmsds)} ref LIG conformation(s) matched')
-        all_rmsds.extend(rmsds)
+        print(f'  {dataset}: {len(rows)} ref LIG conformation(s) matched')
+        for row in rows:
+            row['dataset'] = dataset
+        all_rows.extend(rows)
 
     out_dir = Path(args.graphs_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = 'placer_sampling.png'
     plot_distance_histogram(
-        all_rmsds,
+        [row['rmsd'] for row in all_rows],
         title=f'Placer Sampling (Refined): Reference Ligand to Nearest Sampled Model\n{run_tag}',
         xlabel='Minimum Ligand RMSD to Closest Sampled+Refined Model (Å)',
-        out_path=out_dir / 'placer_sampling.png',
+        out_path=out_dir / out_name,
         bin_width=0.25,
     )
+    if all_rows:
+        write_plot_csv(out_dir, out_name,
+                        pd.DataFrame(all_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'rmsd']])
 
 
 if __name__ == '__main__':
