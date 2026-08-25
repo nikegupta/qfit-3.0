@@ -219,10 +219,11 @@ class FinalModelBuilder():
                 print(f'FLAG: {len(missing_residues)} residue(s) had no conformers in '
                       f'any placer file (not a dealbreaker, just flagging for awareness): {missing_str}')
 
-            #score every conformer of every residue (pooled mask per residue, max
-            #across event maps), reject any that clash with a ligand pose from the
-            #multimodel pdb, and keep the single best-scoring non-clashing conformer
-            #per residue - falling back to the apo conformation if none qualify
+            #score every conformer of every residue (pooled mask per residue, MSE
+            #against the first event map only - see _scoreResidueConformers),
+            #reject any that clash with a ligand pose from the multimodel pdb, and
+            #keep the single best-scoring (lowest MSE) non-clashing conformer per
+            #residue - falling back to the apo conformation if none qualify
             time0 = time.time()
             self.best_conformers = self._scoreAndSelectBest(output_folder)
             print(f'scored and selected best conformers in {time.time() - time0:.2f}s')
@@ -363,41 +364,52 @@ class FinalModelBuilder():
 
     def _scoreResidueConformers(self, template, coor_list):
         """Scores every conformer coordinate set of one protein residue against
-        every event map, pooling all of that residue's conformers together into
-        a single mask per event map (rather than masking each conformer
-        separately). Returns one score per conformer: the max RSCC across all
-        event maps.
+        the FIRST event map only (self.event_maps is insertion-ordered by
+        _load_event_maps's sorted glob, so this is the lowest-numbered event
+        map), pooling all of that residue's conformers together into a single
+        mask (rather than masking each conformer separately). Returns one MSE
+        score per conformer (map density vs. model density - LOWER is better,
+        unlike RSCC).
+
+        Scores against only one map, and by MSE rather than correlation, on
+        purpose: this step dominates build_final_model's runtime (one
+        correlation per conformer per event map, for every residue), and per
+        residue the maps mostly agree on which conformer fits best - trading a
+        small amount of accuracy (occasionally picking a conformer the full
+        multi-map RSCC comparison would not have) for a large speedup was an
+        explicit, deliberate call, not an oversight.
         """
         scaled_bulk_solvent = 0 #from qfit, maybe should be different
         default_bfactor = 20 #can change
         n_conf = len(coor_list)
 
-        per_conformer_scores = [[] for _ in range(n_conf)]
+        event_map_name = next(iter(self.event_maps))
 
-        for event_map_name in list(self.event_maps.keys()):
-            #make a transformer for this residue
-            transformer = get_transformer("qfit", template, self.event_maps_models[event_map_name])
+        #make a transformer for this residue
+        transformer = get_transformer("qfit", template, self.event_maps_models[event_map_name])
 
-            #pooled mask covering every conformer of this residue together
-            mask = transformer.get_conformers_mask(coor_list, self._rmask)
-            target = self.event_maps[event_map_name].array[mask]
+        #pooled mask covering every conformer of this residue together
+        mask = transformer.get_conformers_mask(coor_list, self._rmask)
+        target = self.event_maps[event_map_name].array[mask]
 
-            for i, density in enumerate(transformer.get_conformers_densities(coor_list, [default_bfactor] * n_conf)):
-                model = density[mask]
-                np.maximum(model, scaled_bulk_solvent, out=model)
-                correlation_matrix = np.corrcoef(model, target)
-                rscc = correlation_matrix[0, 1]
-                per_conformer_scores[i].append(rscc)
+        per_conformer_scores = []
+        for density in transformer.get_conformers_densities(coor_list, [default_bfactor] * n_conf):
+            model = density[mask]
+            np.maximum(model, scaled_bulk_solvent, out=model)
+            mse = np.mean((model - target) ** 2)
+            per_conformer_scores.append(mse)
 
-        return [max(scores) for scores in per_conformer_scores]
+        return per_conformer_scores
 
     def _scoreAndSelectBest(self, output_folder):
         """For every residue: scores every gathered conformer (see
-        _scoreResidueConformers), and - in descending score order - keeps the
-        first conformer that doesn't clash with any ligand pose from the
-        multimodel pdb (see _clashesWithLigands). If every conformer clashes,
-        or no conformer was ever found for the residue, falls back to the apo
-        structure's conformation of that residue and prints a message saying so.
+        _scoreResidueConformers - MSE against the first event map, lower is
+        better), and - in ascending score order (lowest MSE, i.e. best, first)
+        - keeps the first conformer that doesn't clash with any ligand pose
+        from the multimodel pdb (see _clashesWithLigands). If every conformer
+        clashes, or no conformer was ever found for the residue, falls back to
+        the apo structure's conformation of that residue and prints a message
+        saying so.
 
         Also writes two CSVs to output_folder:
           - residue_scores.csv: unchanged, one row per residue that had at
@@ -409,8 +421,8 @@ class FinalModelBuilder():
             PLACER conformer, regardless of whether that conformer ended up
             clashing and falling back to apo.
 
-        Returns: {(chain_id, res_num): (best_coor, best_rscc, template)}
-        best_rscc is None for residues that fell back to the apo conformation.
+        Returns: {(chain_id, res_num): (best_coor, best_mse, template)}
+        best_mse is None for residues that fell back to the apo conformation.
         """
         best_conformers = {}
         summary_rows = []
@@ -438,9 +450,9 @@ class FinalModelBuilder():
             coor_list = [c[0] for c in conformers]
             scores = self._scoreResidueConformers(template, coor_list)
 
-            # try conformers best-scoring first, skipping any that clash with a
-            # ligand pose from the multimodel pdb
-            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            # try conformers best-scoring (lowest MSE) first, skipping any that
+            # clash with a ligand pose from the multimodel pdb
+            order = sorted(range(len(scores)), key=lambda i: scores[i])
             chosen_idx = None
             for idx in order:
                 if not self._clashesWithLigands(template, coor_list[idx]):
@@ -449,13 +461,13 @@ class FinalModelBuilder():
 
             if chosen_idx is not None:
                 best_coor, best_placer_file, best_model_idx = conformers[chosen_idx]
-                best_rscc = scores[chosen_idx]
+                best_mse = scores[chosen_idx]
 
-                best_conformers[(chain_id, res_num)] = (best_coor, best_rscc, template)
-                summary_rows.append((chain_id, res_num, len(conformers), best_rscc,
+                best_conformers[(chain_id, res_num)] = (best_coor, best_mse, template)
+                summary_rows.append((chain_id, res_num, len(conformers), best_mse,
                                       best_placer_file, best_model_idx))
 
-                print(f'{chain_id}{res_num}: best rscc {best_rscc:.4f} from {best_placer_file} '
+                print(f'{chain_id}{res_num}: best mse {best_mse:.4f} from {best_placer_file} '
                       f'model {best_model_idx} (of {len(conformers)} conformer(s))')
             else:
                 print(f'{chain_id}{res_num}: all {len(conformers)} conformer(s) clashed with a '
@@ -472,10 +484,10 @@ class FinalModelBuilder():
 
     def _write_residue_scores_csv(self, rows, path):
         with open(path, 'w+') as f:
-            f.write('chain,resid,num_conformers,best_rscc,best_placer_file,best_model_idx')
+            f.write('chain,resid,num_conformers,best_mse,best_placer_file,best_model_idx')
             f.write('\n')
-            for chain_id, res_num, num_conformers, best_rscc, best_placer_file, best_model_idx in rows:
-                f.write(f'{chain_id},{res_num},{num_conformers},{best_rscc},'
+            for chain_id, res_num, num_conformers, best_mse, best_placer_file, best_model_idx in rows:
+                f.write(f'{chain_id},{res_num},{num_conformers},{best_mse},'
                         f'{best_placer_file},{best_model_idx}')
                 f.write('\n')
 
@@ -518,7 +530,7 @@ class FinalModelBuilder():
         pieces = []
 
         #best-scoring (or apo-fallback) protein residue conformations
-        for (chain_id, res_num), (best_coor, best_rscc, template) in self.best_conformers.items():
+        for (chain_id, res_num), (best_coor, best_mse, template) in self.best_conformers.items():
             residue_model = template.copy()
             residue_model.coor = best_coor
             residue_model.b = 20
