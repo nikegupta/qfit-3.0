@@ -120,7 +120,7 @@ def build_argparser():
     )
     p.add_argument(
         "--clustering_mode",
-        default="all-atom",
+        default="centroid",
         choices=["all-atom", "centroid"],
         help="Distance metric used for spatial clustering of ligand "
              "conformers. 'all-atom' (default) clusters on the per-atom RMSD "
@@ -132,7 +132,7 @@ def build_argparser():
     )
     p.add_argument(
         "--clustering_cutoff",
-        default=4.0,
+        default=2.0,
         metavar="<float>",
         type=float,
         help="Distance cutoff (Å) used to cut the hierarchical clustering "
