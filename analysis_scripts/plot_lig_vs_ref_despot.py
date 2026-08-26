@@ -2,11 +2,13 @@
 """
 Pooled (across every dataset in datasets.txt) ligand RSCC comparison,
 restricted to the ligand poses that survived despot_filter.py's physical-
-plausibility filter (despot_run_name/despot_filtered.pdb): filter2_run_name/
-cluster_reps.csv's cluster-rep ligand RSCCs (already on disk, no RSCC
-recomputed here) for just the surviving instances, vs the reference set's
-matched ligand RSCC - same centroid-distance matching plot_lig_vs_ref_filter1.py/
-plot_lig_vs_ref_filter2.py use.
+plausibility filter (despot_run_name/despot_filtered.pdb): despot_run_name/
+cluster_reps.csv's despot_rscc column (despot_filter.py's own reselected-winner
+RSCC, individually computed - NOT filter2_run_name/cluster_reps.csv's rscc,
+which is the original, possibly-superseded representative's value) for just the
+surviving instances, vs the reference set's matched ligand RSCC - same
+centroid-distance matching plot_lig_vs_ref_filter1.py/plot_lig_vs_ref_filter2.py
+use.
 
 Despot filtering runs on final_model_refined.pdb, built from filter2_run_name/
 cluster_rep_models.pdb - a despot_filtered.pdb ligand instance's residue
@@ -51,12 +53,18 @@ def main():
                                 args.despot_run_name / 'despot_filtered.pdb')
         return {resnum for _, resnum in find_all_lig_residues(despot_filtered_pdb)}
 
+    def cluster_csv_override_for_dataset(dataset):
+        return (dataset_final_dir(args.datasets_dir, dataset, args) / args.despot_run_name
+                / 'cluster_reps.csv')
+
     plot_lig_vs_ref(
         args, run_dir_for_dataset,
         title='Ligand RSCC vs Reference, DESPOT-filtered',
         out_name='lig_vs_reference_rscc.png',
         alive_rows_for_dataset=alive_rows_for_dataset,
         resi_col_name='despot_filtered_resi', chain_col_name='despot_filtered_chain',
+        cluster_csv_override_for_dataset=cluster_csv_override_for_dataset,
+        rscc_column='despot_rscc',
     )
 
 

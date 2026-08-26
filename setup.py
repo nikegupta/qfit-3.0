@@ -73,6 +73,7 @@ def main():
                 "fit_dmso = qfit.command_line.fit_dmso:main",
                 "phenix_ligandfit = qfit.command_line.phenix_ligandfit:main",
                 "filter = qfit.command_line.filter:main",
+                "filter_dmso = qfit.command_line.filter_dmso:main",
                 "rotamer_optimize = qfit.command_line.rotamer_optimize:main",
                 "calc_rscc = qfit.command_line.calc_rscc:main",
                 "calc_rscc_b = qfit.command_line.calc_rscc_b:main",
@@ -81,6 +82,7 @@ def main():
                 "build_final_model = qfit.command_line.build_final_model:main",
                 "symmetry_expand = qfit.command_line.symmetry_expand:main",
                 "despot_filter = qfit.command_line.despot_filter:main",
+                "extract_ligand_conformers = qfit.command_line.extract_ligand_conformers:main",
             ]
         },
         scripts=[

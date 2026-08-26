@@ -10,7 +10,7 @@
 #       + calc_apo_z                    -> <dataset>/<dataset>-aligned-structure_z.csv
 #   0c. calc_ref_set_rscc (only with -c) -> REF_SET/<dataset>/<REF_SET_PDB_PATTERN%.pdb>_rscc.csv
 #   0d. ref_set_despot (only with -c and <despot_run_name>): symmetry_expand
-#       (--strip, dropping ligand hydrogens + HOH waters first) the reference
+#       (--strip, dropping ligand hydrogens + HOH waters + DMS residues first) the reference
 #       structure, convert to mol2, score with DESPOT's score_complex.py -
 #       same workflow as Stage 7a, run once per dataset (not nested under any
 #       run_name)                        -> REF_SET/<dataset>/<dataset>_DESPOT.csv
@@ -43,24 +43,33 @@
 #   6d. plot_residues_vs_ref_final (only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
 #   7a. despot (only runs when <despot_run_name> is given)
-#       symmetry_expand final_model_refined.pdb, convert the expanded protein
-#       and split-out ligand(s) to mol2 (lig_scripts/pdb_to_mol2.sh,
-#       lig_scripts/protein_to_mol2.sh), score with DESPOT's score_complex.py
+#       extract_ligand_conformers pools every placer2 round-2 conformer (not just filter2's
+#       selected representative) into one ligs.pdb; symmetry_expand --ligand-conformers-pdb
+#       expands final_model_refined.pdb's protein around all of them; convert the expanded
+#       protein and ligand conformers to mol2 (lig_scripts/pdb_to_mol2.sh,
+#       lig_scripts/protein_to_mol2.sh); score every conformer with DESPOT's score_complex.py
 #                                        -> .../<final_run_name>/<despot_run_name>/
-#       + despot_filter final_model_refined.pdb against its own DESPOT csv,
-#         normalized per heavy atom, dropping any ligand pose scoring above
-#         --despot_threshold (unset: despot_filter's own default) as
-#         physically implausible, and recording every instance's normalized
-#         score (kept or not) to despot_filtered_scores.csv
+#                                           <dataset>_DESPOT.csv + conformer_map.csv + ligs.pdb
+#       + despot_filter reselects, per filter2 cluster, the pose maximizing
+#         RSCC - --despot_rscc_weight*normalized_DESPOT among that cluster's MSE-vs-DESPOT
+#         Pareto front (RSCC computed internally via qfit's transformer, no external calc_rscc
+#         needed), keeping it only if it clears both --despot_rscc_threshold and
+#         --despot_threshold (both unset by default: despot_filter's own defaults apply) -
+#         see despot_filter.py's own docstring
 #                                        -> .../<final_run_name>/<despot_run_name>/despot_filtered.pdb
-#                                           + despot_filtered_scores.csv
-#   7b. plot_despot_energies (per-dataset histogram, heavy-atom-normalized)
+#                                           + despot_filtered_scores.csv (unchanged shape - now
+#                                             describing the reselected winner)
+#                                           + cluster_reps.csv (filter2's cluster_reps.csv, same
+#                                             row order, plus the reselected winner's own info -
+#                                             see despot_filter.py)
+#   7b. plot_despot_energies (per-dataset histogram, heavy-atom-normalized - now reflects every
+#       placer2 conformer's DESPOT score, not just the final poses)
 #                                        -> .../<final_run_name>/graphs/
 #       + plot_despot_energies_pooled   -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
 #   7c. plot_lig_vs_ref_despot (only with -c): despot_filtered.pdb's
-#       surviving ligands' cluster_reps.csv RSCC vs the reference set,
-#       matched the same way as stages 3d/5b - see rscc_common.py's
-#       alive_rows
+#       surviving ligands' RSCC (despot_run_name/cluster_reps.csv's despot_rscc - the
+#       reselected winner's own value) vs the reference set, matched the same way as
+#       stages 3d/5b - see rscc_common.py's alive_rows
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
 #   7d. plot_despot_ligand_summary: every surviving ligand's normalized
 #       DESPOT score vs its cluster_reps.csv RSCC, no -c needed
@@ -71,6 +80,10 @@
 #       DESPOT score (Stage 0d) vs the matched pipeline ligand's DESPOT
 #       score, both normalized per heavy atom, matched the same way as
 #       stages 3d/5b/7c
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
+#   7f. plot_rscc_despot_tradeoff (only with -c): per despot_filter-surviving, reference-matched
+#       ligand, pipeline RSCC - reference RSCC (y) vs reference DESPOT - pipeline DESPOT (x),
+#       reusing 7c/7e's own matching - see rscc_common.py
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
 #   8.  analysis_scripts/*.py           -> .../<final_run_name>/graphs/
 #       (cluster-rep and per-residue RSCC plots, filter_2-vs-filter_1 ligand
@@ -135,6 +148,7 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--f2_filter_proportion <float>] [--f2_min_cluster_proportion <float>]
            [--f2_rscc_cutoff <float>] [--f2_clustering_mode <all-atom|centroid>]
            [--f2_clustering_cutoff <float>] [--despot_threshold <float>]
+           [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
 
 Only <run_name> is required. Supplying fewer than all seven names runs only
 that many stages of the pipeline (see header comment for the stage list).
@@ -205,10 +219,19 @@ Options:
                                     filter's own argparse defaults apply. Stage 5a (filter2_run_name)
                                     now runs the same "filter" script as stage 3a (filter_run_name)
                                     instead of "filter_all" - see header comment.
-  --despot_threshold <float>       despot_filter --threshold for stage 7a: per-heavy-atom-
-                                    normalized DESPOT score above which a ligand pose is removed
-                                    as physically implausible. Left unset by default, so
-                                    despot_filter's own argparse default (0.0) applies.
+  --despot_threshold <float>       despot_filter --despot-threshold for stage 7a: the reselected
+                                    winning pose's per-heavy-atom-normalized DESPOT score must be
+                                    <= this to survive. Left unset by default, so despot_filter's
+                                    own argparse default (-1.0) applies.
+  --despot_rscc_threshold <float>  despot_filter --rscc-threshold for stage 7a: the reselected
+                                    winning pose's RSCC must be >= this to survive (both this and
+                                    --despot_threshold must pass). Left unset by default, so
+                                    despot_filter's own argparse default (0.6) applies.
+  --despot_rscc_weight <float>     despot_filter --rscc-weight for stage 7a: per filter2 cluster,
+                                    the Pareto-front (MSE vs normalized DESPOT) candidate
+                                    maximizing RSCC - despot_rscc_weight*normalized_DESPOT is
+                                    selected as that cluster's pose. Left unset by default, so
+                                    despot_filter's own argparse default (0.05) applies.
 
 Examples:
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1
@@ -281,6 +304,7 @@ PLOT_LIG_VS_REF_DESPOT_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_despot.py"
 PLOT_DESPOT_LIGAND_SUMMARY_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand_summary.py"
 PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand_summary_single.py"
 PLOT_DESPOT_VS_REF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_vs_ref.py"
+PLOT_RSCC_DESPOT_TRADEOFF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_rscc_despot_tradeoff.py"
 ASSIGN_BOND_ORDERS_PY="${LIG_SCRIPTS_DIR}/assign_bond_orders.py"
 PDB_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/pdb_to_mol2.sh"
 PROTEIN_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/protein_to_mol2.sh"
@@ -295,7 +319,7 @@ for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN"
          "$PLOT_PROTEIN_RSCC_POOLED_PY" "$PLOT_Z_POOLED_PY" \
          "$PLOT_BFACTOR_RHO_POOLED_PY" "$PLOT_DESPOT_ENERGIES_PY" "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
          "$PLOT_LIG_VS_REF_DESPOT_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
-         "$PLOT_DESPOT_VS_REF_PY" \
+         "$PLOT_DESPOT_VS_REF_PY" "$PLOT_RSCC_DESPOT_TRADEOFF_PY" \
          "$PDB_TO_MOL2_SH" "$PROTEIN_TO_MOL2_SH" "$DESPOT_SCRIPT"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
@@ -365,9 +389,11 @@ f2_rscc_cutoff=""
 f2_clustering_mode=""
 f2_clustering_cutoff=""
 
-# despot_filter tunable (stage 7a), left empty by default so despot_filter's
-# own argparse default (--threshold=0.0) applies.
+# despot_filter tunables (stage 7a), left empty by default so despot_filter's own argparse
+# defaults apply (--despot-threshold -1.0, --rscc-threshold 0.6, --rscc-weight 0.05).
 despot_threshold=""
+despot_rscc_threshold=""
+despot_rscc_weight=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -459,6 +485,14 @@ while [[ $# -gt 0 ]]; do
             despot_threshold="$2"
             shift 2
             ;;
+        --despot_rscc_threshold)
+            despot_rscc_threshold="$2"
+            shift 2
+            ;;
+        --despot_rscc_weight)
+            despot_rscc_weight="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -494,6 +528,34 @@ if [ -z "$run_name" ]; then
     echo "Error: <run_name> is required."
     usage
 fi
+
+# --- Full-run logging: every line this script (and everything it calls) prints from here on is
+# teed into BASE_DIR/logs/<run_name>/<placer_run_name>/.../<deepest run-name given>/log.txt -
+# the same hierarchical nesting convention as every dataset's own output tree. If that log.txt
+# already exists (a previous run at this same run-name path), this run's output goes to
+# log_2.txt instead, log_3.txt if that also exists, and so on - never overwriting a prior run's
+# log. Per-dataset `exec > >(tee ...) 2>&1` redirections (e.g. despot_process_dataset's own
+# despot_log) nest fine underneath this: each dataset job's stdout/stderr, relayed back through
+# parallel, still flows through to this top-level tee.
+log_dir="${BASE_DIR}/logs/${run_name}"
+for _log_run_name in "$placer_run_name" "$filter_run_name" "$placer2_run_name" \
+                     "$filter2_run_name" "$final_run_name" "$despot_run_name"; do
+    [ -n "$_log_run_name" ] && log_dir="${log_dir}/${_log_run_name}"
+done
+unset _log_run_name
+mkdir -p "$log_dir"
+
+log_file="${log_dir}/log.txt"
+if [ -f "$log_file" ]; then
+    log_n=2
+    while [ -f "${log_dir}/log_${log_n}.txt" ]; do
+        log_n=$((log_n + 1))
+    done
+    log_file="${log_dir}/log_${log_n}.txt"
+fi
+
+exec > >(tee "$log_file") 2>&1
+echo "Logging full run output to: ${log_file}"
 
 if [ "$compare_ref_set" -eq 1 ] && [ ! -d "$REF_SET" ]; then
     echo "Error: -c given but reference set directory not found: ${REF_SET}" >&2
@@ -558,7 +620,7 @@ export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
        f1_clustering_mode f1_clustering_cutoff
 export f2_filter_proportion f2_min_cluster_proportion f2_rscc_cutoff \
        f2_clustering_mode f2_clustering_cutoff
-export despot_threshold
+export despot_threshold despot_rscc_threshold despot_rscc_weight
 export BASE_DIR DATASETS_DIR DATASETS_FILE CSV_FILE LIG_PDB_DIR ASSIGN_BOND_ORDERS_PY
 export RSR_SCRIPT_LIGAND RSR_SCRIPT_PROTEIN RSR_SCRIPT_FINAL
 export ANALYSIS_SCRIPTS_DIR PLOT_CLUSTER_REPS_PY AGGREGATE_PROTEIN_RSCC_PY AGGREGATE_LIG_RSCC_PY
@@ -574,6 +636,7 @@ export PLOT_Z_POOLED_PY PLOT_BFACTOR_RHO_POOLED_PY
 export PLOT_DESPOT_ENERGIES_PY PLOT_DESPOT_ENERGIES_POOLED_PY PLOT_LIG_VS_REF_DESPOT_PY PLOT_DESPOT_LIGAND_SUMMARY_PY
 export PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY
 export PLOT_DESPOT_VS_REF_PY
+export PLOT_RSCC_DESPOT_TRADEOFF_PY
 export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE EXPAND_DISTANCE_CUTOFF
 export REF_SET REF_SET_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_OBABEL CONDA_ENV_DESPOT
@@ -1092,9 +1155,10 @@ do_calc_ref_set_rscc() {
 # with DESPOT, the same way as Stage 7a's own final_model_refined.pdb: symmetry_expand
 # into a realistic crystal environment (EXPAND_DISTANCE_CUTOFF), convert the expanded
 # protein and split-out ligand to mol2, score with DESPOT's score_complex.py. Unlike
-# Stage 7a's input, the reference structure still carries explicit ligand hydrogens and
-# ordered waters (e.g. from PanDDA) - symmetry_expand's own --strip flag removes both
-# before anything else runs, since DESPOT scoring isn't set up to expect either. Every
+# Stage 7a's input, the reference structure still carries explicit ligand hydrogens, ordered
+# waters, and DMSO (resname DMS, a common crystallization cryoprotectant) (e.g. from PanDDA) -
+# symmetry_expand's own --strip flag removes all three before anything else runs, since
+# DESPOT scoring isn't set up to expect any of them. Every
 # output, including the intermediate expanded/mol2 files, is written directly into
 # REF_SET/<dataset>/ (one reference structure per dataset, no run-name nesting needed -
 # reused as-is across every run_name/despot_run_name combination scored against the same
@@ -1163,7 +1227,7 @@ ref_set_despot_process_dataset() {
         return 1
     fi
 
-    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL"
+    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL" "$ASSIGN_BOND_ORDERS_PY"
     status=$?
     if [ $status -ne 0 ]; then
         echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
@@ -2924,25 +2988,37 @@ final_ref_comparison_outputs_exist() {
 ######################################################################
 # Stage 7a: despot
 ######################################################################
-# For each dataset (only runs when despot_run_name is given), symmetry-
-# expands final_model_refined.pdb into a realistic crystal environment
-# (EXPAND_DISTANCE_CUTOFF, default 10 A), converts the expanded protein and
-# split-out ligand(s) to mol2 (lig_scripts/pdb_to_mol2.sh,
-# lig_scripts/protein_to_mol2.sh - the same tools test_despot_workflow.sh
-# verified this workflow with), and scores the resulting protein-ligand
-# complex with DESPOT's score_complex.py. Every output is written into
-# .../<final_run_name>/<despot_run_name>/, following the same nested
+# For each dataset (only runs when despot_run_name is given), scores every placer2 round-2
+# conformer (not just the one pose filter2/build_final_model happened to select) against DESPOT:
+# extract_ligand_conformers pools every conformer into one ligs.pdb, symmetry_expand's
+# --ligand-conformers-pdb mode expands final_model_refined.pdb's protein into a crystal
+# environment realistic for all of them (EXPAND_DISTANCE_CUTOFF, default 10 A), the expanded
+# protein and ligand conformers are converted to mol2 (lig_scripts/pdb_to_mol2.sh,
+# lig_scripts/protein_to_mol2.sh), and DESPOT's score_complex.py scores every conformer at once.
+# despot_filter.py then reselects, per filter2 cluster, the pose that best trades off RSCC
+# against DESPOT (Pareto front over MSE/DESPOT, real RSCC computed internally via qfit's
+# transformer, winner = argmax(RSCC - rscc_weight*normalized_DESPOT), kept only if it clears both
+# --despot_rscc_threshold and --despot_threshold) - see despot_filter.py's own docstring. Every
+# output is written into .../<final_run_name>/<despot_run_name>/, following the same nested
 # run-name convention as every other stage.
+#
+# Note: since <dataset>_DESPOT.csv now scores every placer2 conformer rather than just the 4-ish
+# final poses, Stage 7b's per-conformer score histograms (plot_despot_energies.py) reflect that
+# larger, differently-shaped population - an expected consequence of scoring before selection.
 
 despot_process_dataset() {
     local dataset=$1
     local dataset_dir="${DATASETS_DIR}/${dataset}"
-    local final_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local placer2_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
+    local filter2_dir="${placer2_dir}/${filter2_run_name}"
+    local final_dir="${filter2_dir}/${final_run_name}"
     local final_model="${final_dir}/final_model_refined.pdb"
-    local despot_csv_check="${final_dir}/${despot_run_name}/${dataset}_DESPOT.csv"
-    local despot_filtered_check="${final_dir}/${despot_run_name}/despot_filtered.pdb"
+    local despot_dir="${final_dir}/${despot_run_name}"
+    local despot_csv_check="${despot_dir}/${dataset}_DESPOT.csv"
+    local conformer_map_check="${despot_dir}/conformer_map.csv"
+    local despot_filtered_check="${despot_dir}/despot_filtered.pdb"
 
-    if [ "$overwrite" -ne 1 ] && files_exist "$despot_csv_check" "$despot_filtered_check"; then
+    if [ "$overwrite" -ne 1 ] && files_exist "$despot_csv_check" "$conformer_map_check" "$despot_filtered_check"; then
         echo "Skipping [${dataset}]: despot already complete (${despot_filtered_check} exists)."
         return 0
     fi
@@ -2967,9 +3043,15 @@ despot_process_dataset() {
         return 1
     fi
 
-    echo "Processing ${dataset}: space_group=${space_group}, cell=(${a} ${b} ${c} ${alpha} ${beta} ${gamma})"
+    local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
+    if [ -z "$lookup" ]; then
+        echo "Warning [${dataset}]: no resolution found in ${LOOKUP_FILE}, skipping."
+        return 1
+    fi
+    local resolution=$(echo "$lookup" | awk '{print $3}')
 
-    local despot_dir="${final_dir}/${despot_run_name}"
+    echo "Processing ${dataset}: space_group=${space_group}, cell=(${a} ${b} ${c} ${alpha} ${beta} ${gamma}), resolution=${resolution}"
+
     mkdir -p "$despot_dir"
 
     local despot_log="${despot_dir}/log.txt"
@@ -2977,17 +3059,31 @@ despot_process_dataset() {
 
     local dataset_start_time=$(date +%s)
 
-    local expanded_pdb="${despot_dir}/expanded.pdb"
     local ligs_pdb="${despot_dir}/ligs.pdb"
+    local conformer_map_csv="${despot_dir}/conformer_map.csv"
+    local expanded_pdb="${despot_dir}/expanded.pdb"
+    local original_ligand_pdb="${despot_dir}/original_ligand.pdb"
     local ligs_mol2="${despot_dir}/ligs.mol2"
     local expanded_mol2="${despot_dir}/expanded.mol2"
     local despot_csv="${despot_dir}/${dataset}_DESPOT.csv"
 
     local step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"
-    symmetry_expand "$final_model" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
-        "$EXPAND_DISTANCE_CUTOFF" "$ligs_pdb"
+    extract_ligand_conformers "$placer2_dir" "$dataset" "$ligs_pdb" "$conformer_map_csv"
     local status=$?
+    conda_deactivate
+    print_elapsed "$step_start_time" "[${dataset}] extract_ligand_conformers"
+    if [ $status -ne 0 ]; then
+        echo "ERROR [${dataset}]: extract_ligand_conformers failed with exit code ${status}"
+        print_elapsed "$dataset_start_time" "[${dataset}] despot"
+        return 1
+    fi
+
+    step_start_time=$(date +%s)
+    conda_activate "$CONDA_ENV_QFIT"
+    symmetry_expand "$final_model" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
+        "$EXPAND_DISTANCE_CUTOFF" "$original_ligand_pdb" --ligand-conformers-pdb "$ligs_pdb"
+    status=$?
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
     if [ $status -ne 0 ]; then
@@ -2996,7 +3092,7 @@ despot_process_dataset() {
         return 1
     fi
 
-    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL"
+    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL" "$ASSIGN_BOND_ORDERS_PY"
     status=$?
     if [ $status -ne 0 ]; then
         echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
@@ -3026,13 +3122,25 @@ despot_process_dataset() {
         return 1
     fi
 
+    shopt -s nullglob
+    local event_maps=("${dataset_dir}/${dataset}-event_"*)
+    shopt -u nullglob
+    if [ ${#event_maps[@]} -eq 0 ]; then
+        echo "ERROR [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*"
+        print_elapsed "$dataset_start_time" "[${dataset}] despot"
+        return 1
+    fi
+
     local despot_filtered_pdb="${despot_dir}/despot_filtered.pdb"
     local despot_filter_args=()
-    [ -n "$despot_threshold" ] && despot_filter_args+=(--threshold "$despot_threshold")
+    [ -n "$despot_threshold" ] && despot_filter_args+=(--despot-threshold "$despot_threshold")
+    [ -n "$despot_rscc_threshold" ] && despot_filter_args+=(--rscc-threshold "$despot_rscc_threshold")
+    [ -n "$despot_rscc_weight" ] && despot_filter_args+=(--rscc-weight "$despot_rscc_weight")
 
     step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"
-    despot_filter "$final_model" "$despot_csv" "$despot_filtered_pdb" "${despot_filter_args[@]}"
+    despot_filter "$final_model" "$filter2_dir" "$despot_dir" "${event_maps[@]}" "$resolution" \
+        "$despot_filtered_pdb" "${despot_filter_args[@]}"
     status=$?
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] despot_filter"
@@ -3259,6 +3367,35 @@ do_plot_despot_vs_ref() {
 
 despot_vs_ref_outputs_exist() {
     files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/despot_vs_reference.png"
+}
+
+######################################################################
+# Stage 7f: plot_rscc_despot_tradeoff (only with -c)
+######################################################################
+# Pooled scatter of despot_filter.py's RSCC/DESPOT reselection tradeoff relative to the
+# reference structure, restricted to despot_filter survivors (same alive_rows as 7c/7e): y =
+# pipeline RSCC - reference RSCC, x = reference DESPOT - pipeline DESPOT (both normalized) - see
+# plot_rscc_despot_tradeoff.py. Nested under despot_run_name, like Stage 7b/7c/7d/7e, since the
+# pipeline-side scores are specific to one despot_run_name/--despot_threshold/
+# --despot_rscc_threshold/--despot_rscc_weight.
+
+do_plot_rscc_despot_tradeoff() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_RSCC_DESPOT_TRADEOFF_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+rscc_despot_tradeoff_outputs_exist() {
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/rscc_despot_tradeoff_vs_reference.png"
 }
 
 ######################################################################
@@ -3581,6 +3718,10 @@ stage7_despot() {
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 7e: plot_despot_vs_ref (${despot_run_name})" \
             despot_vs_ref_outputs_exist do_plot_despot_vs_ref
+    fi
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 7f: plot_rscc_despot_tradeoff (${despot_run_name})" \
+            rscc_despot_tradeoff_outputs_exist do_plot_rscc_despot_tradeoff
     fi
 }
 
