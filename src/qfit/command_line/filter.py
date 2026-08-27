@@ -268,7 +268,6 @@ class Filter():
             top_n = heapq.nsmallest(self.n,((val, key, idx) for key, lst in self.scores.items() for idx, val in enumerate(lst)))
 
             #write output files
-            output_path = output_folder + '/filtered_models.pdb'
             output_csv = output_folder + '/scores.csv'
             output_summary = output_folder + '/top_scores.csv'
 
@@ -291,11 +290,10 @@ class Filter():
                         f.write(f'{placer_file},{i},{score}')
                         f.write('\n')
 
-            #write multimodel output and score csv
+            #write top-N score csv
             with open(output_summary, 'w+') as f:
                 f.write('placer_file,index,mse')
                 f.write('\n')
-                bs_models = []
                 for entry in top_n:
                     # print(entry)
                     score = entry[0]
@@ -304,13 +302,6 @@ class Filter():
 
                     f.write(f'{placer_file},{index},{score}')
                     f.write('\n')
-
-                    bs_model = self.base_binding_sites[placer_file].copy()
-                    bs_model.coor = self.coor_sets[placer_file][index]
-                    bs_model.b = 20
-                    bs_models.append(bs_model)
-
-            self._write_multimodel_pdb(bs_models, output_path)
 
             #now write out spatially clustered models
             self._spatialClustering(top_n)
