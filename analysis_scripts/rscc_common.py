@@ -760,7 +760,7 @@ def _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels):
 
 
 def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
-                          out_dir, out_prefix, structure_label):
+                          out_dir, out_prefix, structure_label, outlier_min_diff=None):
     """Pools a per-residue RSCC comparison (structure vs matched reference
     residue) across every dataset in datasets.txt into two scatter plots:
     all residues, and residues restricted to collect_restrict_labels(dataset).
@@ -776,6 +776,14 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
     of points on it, so - like the pooled protein_final_vs_apo-style plots -
     these are colored by point density (plot_rscc_scatter's
     color_by_density) rather than a flat color.
+
+    If outlier_min_diff is given (not None), also writes
+    {out_prefix}_vs_reference_rscc_outliers.csv to out_dir: every RESTRICTED
+    residue (i.e. from collect_restrict_labels - the residues actually
+    modeled via PLACER, not just carried over from the apo/backbone
+    structure untouched) where ref_rscc - structure_rscc >= outlier_min_diff
+    - candidate cases where the pipeline picked a worse-fitting rotamer than
+    the reference structure has - sorted by that difference, biggest first.
     """
     datasets = read_datasets(args.datasets_file)
     all_pairs, restricted_pairs = [], []
@@ -811,6 +819,19 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
         if pairs:
             write_plot_csv(graphs_dir, out_name,
                             pd.DataFrame(pairs)[['dataset', 'residue', 'ref_rscc', 'structure_rscc']])
+
+    if outlier_min_diff is not None:
+        outliers_df = pd.DataFrame(restricted_pairs,
+                                    columns=['dataset', 'residue', 'ref_rscc', 'structure_rscc'])
+        outliers_df['rscc_diff'] = outliers_df['ref_rscc'] - outliers_df['structure_rscc']
+        outliers_df = outliers_df[outliers_df['rscc_diff'] >= outlier_min_diff]
+        outliers_df.sort_values('rscc_diff', ascending=False, inplace=True)
+
+        out_path = graphs_dir / f'{out_prefix}_vs_reference_rscc_outliers.csv'
+        outliers_df.to_csv(out_path, index=False)
+        print(f'  {len(outliers_df)} residue(s) with ref_rscc - structure_rscc >= '
+              f'{outlier_min_diff} out of {len(restricted_pairs)} restricted residue(s); '
+              f'written to {out_path}')
 
 
 def dataset_final_dir(datasets_dir, dataset, args):

@@ -8,6 +8,9 @@ sides are read from the calc_rscc csvs already on disk
 
 Produces two plots: one over every matched residue, and one restricted to
 the residues listed in final_run_name/residues_with_placer_conformers.csv.
+Also writes final_refined_vs_reference_rscc_outliers.csv: every restricted
+residue where ref_rscc - structure_rscc >= OUTLIER_MIN_DIFF (candidate cases
+where the pipeline picked a worse-fitting rotamer than the reference has).
 
 Run at the end of stage 6, only when -c (compare to reference set) is given.
 
@@ -21,6 +24,10 @@ from pathlib import Path
 from rscc_common import (
     build_ref_argparser, plot_residues_vs_ref, read_calc_rscc_csv, read_residue_conformer_list,
 )
+
+# minimum ref_rscc - structure_rscc to be written to
+# final_refined_vs_reference_rscc_outliers.csv (see plot_residues_vs_ref)
+OUTLIER_MIN_DIFF = 0.1
 
 
 def main():
@@ -45,6 +52,7 @@ def main():
     plot_residues_vs_ref(
         args, collect_structure_rscc, collect_restrict_labels,
         out_dir=args.graphs_dir, out_prefix='final_refined', structure_label='Final-Refined',
+        outlier_min_diff=OUTLIER_MIN_DIFF,
     )
 
 

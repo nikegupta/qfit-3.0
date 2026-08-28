@@ -53,7 +53,7 @@ mol2_file="${base}.mol2"
 conda_activate "$CONDA_ENV_OBABEL"
 
 echo "Protonating/assigning charges: ${protein_pdb} -> ${pqr_file}"
-pdb2pqr30 --ff=AMBER --with-ph=7.4 --titration-state-method=propka "$protein_pdb" "$pqr_file"
+pdb2pqr30 --ff=AMBER --with-ph=7.4 --titration-state-method=propka --log-level WARNING "$protein_pdb" "$pqr_file"
 status=$?
 if [[ $status -ne 0 ]]; then
     echo "Error: pdb2pqr30 failed for ${protein_pdb}" >&2
@@ -62,7 +62,12 @@ if [[ $status -ne 0 ]]; then
 fi
 
 echo "Converting to mol2: ${pqr_file} -> ${mol2_file}"
-obabel "$pqr_file" -O "$mol2_file"
+# obabel's PQR-format reader plugin unconditionally prints " charge : N" /
+# " radius : N" to stderr for every atom (a debug leftover that bypasses its
+# normal -q/--errorlevel message-level controls entirely, so it can't be
+# silenced with a flag) - filter just those lines out, leave everything else
+# on stderr untouched.
+obabel "$pqr_file" -O "$mol2_file" 2> >(grep -vE '^ (charge|radius) : ' >&2)
 status=$?
 conda_deactivate
 if [[ $status -ne 0 ]]; then
