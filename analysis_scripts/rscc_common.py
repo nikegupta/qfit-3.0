@@ -526,7 +526,8 @@ def residue_label_from_key(chain_id, res_id, altloc):
     return label
 
 
-def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
+def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_override=None,
+                         rscc_column='rscc'):
     """For one dataset, matches every reference LIG conformation in
     ref_pdb_path(args, dataset) to the nearest cluster-rep ligand pose in
     run_dir/cluster_rep_models.pdb (by centroid distance, no RSCC
@@ -535,6 +536,17 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
     the i-th MODEL block, same pipeline-wide indexing convention used
     everywhere else) and ref_rscc_csv_path(args, dataset)'s per-residue
     RSCC for the already-computed values on each side.
+
+    cluster_csv_override/rscc_column: optional - read the pipeline-side RSCC values from
+    cluster_csv_override's rscc_column column instead of run_dir/cluster_reps.csv's own 'rscc'
+    column (still by row position, same indexing). despot_filter.py can reselect a cluster's
+    final pose to a DIFFERENT conformer than filter2's own representative, so
+    plot_lig_vs_ref_despot.py passes despot_run_dir/cluster_reps.csv (despot_filter.py's own
+    traceability output - see its docstring) and rscc_column='despot_rscc', the reselected
+    winner's real RSCC, rather than the stale original-representative value filter2's
+    cluster_reps.csv would otherwise give. Every other caller (plot_lig_vs_ref_filter1.py/
+    plot_lig_vs_ref_filter2.py, where no reselection ever happens) leaves both at their
+    defaults and is unaffected.
 
     alive_rows: optional set of 1-indexed cluster_reps.csv/cluster_rep_models.pdb
     row numbers to restrict matching to (e.g. despot_filter.py survivors - see
@@ -572,8 +584,13 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
     ref_rscc_df = read_calc_rscc_csv(ref_csv)
     ref_rscc = dict(zip(ref_rscc_df['residue'], ref_rscc_df['rscc']))
 
-    cluster_df = pd.read_csv(cluster_csv)
-    pipeline_rscc_by_row = list(cluster_df['rscc'])
+    rscc_csv_path = cluster_csv_override if cluster_csv_override is not None else cluster_csv
+    if cluster_csv_override is not None and not cluster_csv_override.exists():
+        print(f'  {dataset}: missing {cluster_csv_override} for lig-vs-reference comparison; '
+              f'skipping.')
+        return [], [], 0, 0, []
+    cluster_df = pd.read_csv(rscc_csv_path)
+    pipeline_rscc_by_row = list(cluster_df[rscc_column])
 
     model_blocks = split_pdb_models(cluster_pdb)
     n_models = min(len(model_blocks), len(pipeline_rscc_by_row))
@@ -635,7 +652,8 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None):
 
 
 def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None,
-                     resi_col_name='cluster_rep_index', chain_col_name='pipeline_chain'):
+                     resi_col_name='cluster_rep_index', chain_col_name='pipeline_chain',
+                     cluster_csv_override_for_dataset=None, rscc_column='rscc'):
     """Pools stage-appropriate cluster_reps.csv ligand RSCC vs matched
     reference ligand RSCC across every dataset in datasets.txt into a single
     scatter plot (Reference on x, Pipeline on y - qfit compare_lig_rscc's
@@ -657,6 +675,9 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
     plot_lig_vs_ref_despot.py uses despot_filtered_resi/despot_filtered_chain,
     since for despot's survivors that pair is exactly the ligand's residue
     number and chain in despot_filtered.pdb - see _dataset_lig_vs_ref).
+
+    cluster_csv_override_for_dataset(dataset)/rscc_column: optional; threaded straight through
+    to _dataset_lig_vs_ref's cluster_csv_override/rscc_column - see that function's docstring.
     """
     datasets = read_datasets(args.datasets_file)
     all_ref, all_pipeline, all_rows = [], [], []
@@ -665,8 +686,13 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
     for dataset in datasets:
         run_dir = run_dir_for_dataset(dataset)
         alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
+        cluster_csv_override = (
+            cluster_csv_override_for_dataset(dataset) if cluster_csv_override_for_dataset
+            else None
+        )
         ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows = _dataset_lig_vs_ref(
-            dataset, args, run_dir, alive_rows=alive_rows
+            dataset, args, run_dir, alive_rows=alive_rows,
+            cluster_csv_override=cluster_csv_override, rscc_column=rscc_column,
         )
         all_ref.extend(ref_vals)
         all_pipeline.extend(pipeline_vals)
@@ -734,7 +760,7 @@ def _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels):
 
 
 def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
-                          out_dir, out_prefix, structure_label):
+                          out_dir, out_prefix, structure_label, outlier_min_diff=None):
     """Pools a per-residue RSCC comparison (structure vs matched reference
     residue) across every dataset in datasets.txt into two scatter plots:
     all residues, and residues restricted to collect_restrict_labels(dataset).
@@ -750,6 +776,14 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
     of points on it, so - like the pooled protein_final_vs_apo-style plots -
     these are colored by point density (plot_rscc_scatter's
     color_by_density) rather than a flat color.
+
+    If outlier_min_diff is given (not None), also writes
+    {out_prefix}_vs_reference_rscc_outliers.csv to out_dir: every RESTRICTED
+    residue (i.e. from collect_restrict_labels - the residues actually
+    modeled via PLACER, not just carried over from the apo/backbone
+    structure untouched) where ref_rscc - structure_rscc >= outlier_min_diff
+    - candidate cases where the pipeline picked a worse-fitting rotamer than
+    the reference structure has - sorted by that difference, biggest first.
     """
     datasets = read_datasets(args.datasets_file)
     all_pairs, restricted_pairs = [], []
@@ -785,6 +819,19 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
         if pairs:
             write_plot_csv(graphs_dir, out_name,
                             pd.DataFrame(pairs)[['dataset', 'residue', 'ref_rscc', 'structure_rscc']])
+
+    if outlier_min_diff is not None:
+        outliers_df = pd.DataFrame(restricted_pairs,
+                                    columns=['dataset', 'residue', 'ref_rscc', 'structure_rscc'])
+        outliers_df['rscc_diff'] = outliers_df['ref_rscc'] - outliers_df['structure_rscc']
+        outliers_df = outliers_df[outliers_df['rscc_diff'] >= outlier_min_diff]
+        outliers_df.sort_values('rscc_diff', ascending=False, inplace=True)
+
+        out_path = graphs_dir / f'{out_prefix}_vs_reference_rscc_outliers.csv'
+        outliers_df.to_csv(out_path, index=False)
+        print(f'  {len(outliers_df)} residue(s) with ref_rscc - structure_rscc >= '
+              f'{outlier_min_diff} out of {len(restricted_pairs)} restricted residue(s); '
+              f'written to {out_path}')
 
 
 def dataset_final_dir(datasets_dir, dataset, args):
@@ -1323,6 +1370,114 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
     write_plot_csv(graphs_dir, out_name, rows_df)
 
 
+def _dataset_rscc_despot_tradeoff(dataset, args, run_dir, alive_rows, cluster_csv_override):
+    """Joins _dataset_lig_vs_ref's (with cluster_csv_override/rscc_column='despot_rscc' - the
+    despot_filter.py-reselected winner's real, individually-computed RSCC, not filter2's stale
+    original-representative value) and _dataset_despot_vs_ref's matched pairs for one dataset,
+    by (ref_chain, ref_resi, ref_altloc) - both already use the identical centroid-distance
+    matching against the identical cluster_rep_models.pdb/alive_rows, so this reuses their work
+    rather than re-implementing a third matching pass. A reference ligand present on only one
+    side (e.g. has a DESPOT score but no RSCC) is simply not joined.
+
+    Returns one dict per joined pair: ref_chain, ref_resi, ref_altloc, cluster_rep_index,
+    pipeline_chain, ref_rscc, pipeline_rscc, ref_despot_normalized, pipeline_despot_normalized,
+    rscc_delta (= pipeline_rscc - ref_rscc), despot_delta (= ref_despot_normalized -
+    pipeline_despot_normalized)."""
+    _, _, _, _, rscc_rows = _dataset_lig_vs_ref(
+        dataset, args, run_dir, alive_rows=alive_rows,
+        cluster_csv_override=cluster_csv_override, rscc_column='despot_rscc',
+    )
+    _, _, _, _, despot_rows = _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=alive_rows)
+
+    rscc_by_key = {(r['ref_chain'], r['ref_resi'], r['ref_altloc']): r for r in rscc_rows}
+    joined = []
+    for d in despot_rows:
+        r = rscc_by_key.get((d['ref_chain'], d['ref_resi'], d['ref_altloc']))
+        if r is None:
+            continue
+        joined.append({
+            'ref_chain': d['ref_chain'], 'ref_resi': d['ref_resi'], 'ref_altloc': d['ref_altloc'],
+            'cluster_rep_index': d['cluster_rep_index'], 'pipeline_chain': d['pipeline_chain'],
+            'ref_rscc': r['ref_rscc'], 'pipeline_rscc': r['pipeline_rscc'],
+            'ref_despot_normalized': d['ref_despot_normalized'],
+            'pipeline_despot_normalized': d['pipeline_despot_normalized'],
+            'rscc_delta': r['pipeline_rscc'] - r['ref_rscc'],
+            'despot_delta': d['ref_despot_normalized'] - d['pipeline_despot_normalized'],
+        })
+    return joined
+
+
+def plot_rscc_despot_tradeoff(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset,
+                               cluster_csv_override_for_dataset):
+    """Pooled (across every dataset in datasets.txt) scatter of despot_filter.py's RSCC/DESPOT
+    reselection tradeoff, restricted to despot_filter survivors (same alive_rows_for_dataset as
+    plot_lig_vs_ref_despot.py/plot_despot_vs_ref.py, so the matched pairs agree with those two
+    plots): y = pipeline RSCC - reference RSCC, x = reference DESPOT - pipeline DESPOT (both
+    normalized) - see _dataset_rscc_despot_tradeoff. Written to <graphs_dir>/<out_name>, with the
+    joined per-ligand data alongside via write_plot_csv.
+
+    run_dir_for_dataset(dataset)/alive_rows_for_dataset(dataset)/cluster_csv_override_for_dataset
+    (dataset): same meaning as the equivalent arguments to plot_lig_vs_ref/plot_despot_vs_ref -
+    pass the exact same functions plot_lig_vs_ref_despot.py uses, for consistency.
+    """
+    datasets = read_datasets(args.datasets_file)
+    all_rows = []
+
+    for dataset in datasets:
+        run_dir = run_dir_for_dataset(dataset)
+        alive_rows = alive_rows_for_dataset(dataset)
+        cluster_csv_override = cluster_csv_override_for_dataset(dataset)
+        joined = _dataset_rscc_despot_tradeoff(
+            dataset, args, run_dir, alive_rows, cluster_csv_override)
+        for row in joined:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_rows.append(row_out)
+        print(f'  {dataset}: {len(joined)} matched ligand(s) with both RSCC and DESPOT deltas')
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    if not all_rows:
+        print(f'  No matched ligand(s) found for any dataset; skipping {out_name}.')
+        return
+
+    xs = [r['despot_delta'] for r in all_rows]
+    ys = [r['rscc_delta'] for r in all_rows]
+    median_x, mean_x = float(np.median(xs)), float(np.mean(xs))
+    median_y, mean_y = float(np.median(ys)), float(np.mean(ys))
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.axhline(0, color='gray', linewidth=0.8, zorder=0)
+    ax.axvline(0, color='gray', linewidth=0.8, zorder=0)
+    ax.axvline(median_x, color='tab:orange', linestyle='--', linewidth=1.2, zorder=1,
+               label=f'median Δdespot = {median_x:.3f}')
+    ax.axvline(mean_x, color='tab:green', linestyle=':', linewidth=1.2, zorder=1,
+               label=f'mean Δdespot = {mean_x:.3f}')
+    ax.axhline(median_y, color='tab:orange', linestyle='--', linewidth=1.2, zorder=1,
+               label=f'median Δrscc = {median_y:.3f}')
+    ax.axhline(mean_y, color='tab:green', linestyle=':', linewidth=1.2, zorder=1,
+               label=f'mean Δrscc = {mean_y:.3f}')
+    ax.scatter(xs, ys, s=18, alpha=0.7, edgecolors='none', color='steelblue', zorder=2)
+    ax.set_xlabel('Reference - Pipeline normalized DESPOT score\n'
+                  '(positive = pipeline pose is more favorable)')
+    ax.set_ylabel('Pipeline - Reference RSCC\n(positive = pipeline pose fits the density better)')
+    ax.set_title(f'{title} (n={len(all_rows)})')
+    ax.legend(loc='best', fontsize=7)
+    fig.tight_layout()
+    out_path = graphs_dir / out_name
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f'  Scatterplot saved to: {out_path}')
+
+    rows_df = pd.DataFrame(all_rows)[
+        ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'pipeline_chain', 'cluster_rep_index',
+         'ref_rscc', 'pipeline_rscc', 'rscc_delta', 'ref_despot_normalized',
+         'pipeline_despot_normalized', 'despot_delta']
+    ]
+    write_plot_csv(graphs_dir, out_name, rows_df)
+
+
 def read_datasets(datasets_file):
     with open(datasets_file) as f:
         return [line.strip() for line in f if line.strip()]
@@ -1785,6 +1940,50 @@ def run_rscc_aggregator_pooled(args):
                 columns={xcol: f'{xcol}_rscc', ycol: f'{ycol}_rscc'}
             ),
         )
+
+
+CLASH_GROUPS_CSV_COLUMNS = ['dataset', 'residues', 'original_residues', 'size', 'original_size',
+                            'original_mse', 'final_mse', 'hit_cap', 'unresolved']
+
+
+def run_clash_groups_aggregator(args):
+    """Pooled (cross-dataset) aggregation of the sidechain_clash_groups.csv
+    files build_final_model already writes into every dataset's own
+    .../<final_run_name>/ directory (one row per resolved sidechain-sidechain
+    clash group - see build_final_model.py's _write_clash_groups_csv). No new
+    clash detection or resolution happens here - this just concatenates what
+    build_final already wrote, with a 'dataset' column prepended so a
+    run-wide row still identifies which dataset it came from. A dataset with
+    no sidechain_clash_groups.csv (build_final_model never ran for it, e.g.
+    filter2 rejected every candidate) or an empty one (no clash groups found)
+    contributes no rows. Written to
+    args.graphs_dir/sidechain_clash_groups_combined.csv.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    pooled_rows = []
+    for dataset in datasets:
+        csv_path = dataset_final_dir(args.datasets_dir, dataset, args) / 'sidechain_clash_groups.csv'
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            continue
+        df.insert(0, 'dataset', dataset)
+        pooled_rows.append(df)
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    out_path = graphs_dir / 'sidechain_clash_groups_combined.csv'
+
+    if not pooled_rows:
+        print('  No sidechain_clash_groups.csv data found for any dataset; writing empty combined csv.')
+        pd.DataFrame(columns=CLASH_GROUPS_CSV_COLUMNS).to_csv(out_path, index=False)
+        return
+
+    pooled_df = pd.concat(pooled_rows, ignore_index=True)
+    pooled_df.to_csv(out_path, index=False)
+    print(f'  {len(pooled_df)} clash-group row(s) from {len(pooled_rows)} dataset(s) written to: {out_path}')
 
 
 def _dataset_z_values(z_csv):

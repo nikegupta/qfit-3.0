@@ -1,5 +1,7 @@
 import argparse
+import csv
 import glob
+from collections import namedtuple
 from pathlib import Path
 import time
 import numpy as np
@@ -12,7 +14,39 @@ from qfit.xtal.transformer import get_transformer
 
 import iotbx.pdb
 
-CLASH_VDW_SCALE = 0.75  # fraction of summed VDW radii below which two atoms are considered clashing
+# fraction of summed VDW radii below which two atoms are considered clashing
+# (used for sidechain-sidechain clash detection - see _resolveSidechainClashes)
+CLASH_VDW_SCALE = 0.75
+
+# looser scale applied instead of CLASH_VDW_SCALE when the clashing pair is
+# one N atom and one O atom - a real N-H...O or O-H...N hydrogen bond
+# legitimately sits closer than CLASH_VDW_SCALE would otherwise tolerate, so
+# without this a lot of real donor/acceptor pairs get misreported as clashes
+HBOND_CLASH_VDW_SCALE = 0.6
+
+BACKBONE_ATOM_NAMES = {'N', 'CA', 'C', 'O', 'OXT'}
+
+# safety caps for _resolveSidechainClashes - see its docstring
+MAX_CLASH_GROUP_SIZE = 8  # residues; stop absorbing new neighbors past this
+MAX_CLASH_GROUP_EXPANSIONS = 10  # rounds of "resolve, then absorb new external clashes"
+CLASH_DOMAIN_TOP_K = 25  # candidates considered per residue during joint solving
+CLASH_SOLVE_NODE_BUDGET = 200_000  # branch-and-bound search nodes before falling back to ICM
+
+# per-residue candidate pool built by _scoreAndSelectBest and consumed by
+# _resolveSidechainClashes. coor: (n_candidates, natoms, 3); mse: (n_candidates,)
+# - both indexed identically to placer_file/model_idx (lists, length
+# n_candidates). template/sidechain_mask describe the atoms (same for every
+# candidate of this residue - see _gatherResidueConformers). fixed residues
+# (no PLACER conformer found) get a single candidate: the apo coordinates.
+_ResidueCandidates = namedtuple(
+    'ResidueCandidates',
+    ['coor', 'mse', 'placer_file', 'model_idx', 'template', 'sidechain_mask', 'fixed'],
+)
+
+
+class _NodeBudgetExceeded(Exception):
+    """Raised internally by _branchAndBound to abort the search once its node
+    budget is exhausted; caught by its caller to trigger the ICM fallback."""
 
 
 class _Tee:
@@ -56,9 +90,7 @@ def build_argparser():
         'apo_structure',
         type=Path,
         help='Path to the apo (ligand-free) PANDDA structure. Used as the fallback '
-             'conformation for a residue when no PLACER conformer is '
-             'found for it, or when every PLACER conformer of it clashes with a '
-             'ligand pose in the multimodel pdb.'
+             'conformation for a residue when no PLACER conformer is found for it.'
     )
     p.add_argument(
         'output_folder',
@@ -78,15 +110,39 @@ def build_argparser():
         default=CLASH_VDW_SCALE,
         metavar="<float>",
         type=float,
-        help="Fraction of the summed VDW radii of two atoms below which they are "
-             f"considered clashing (default: {CLASH_VDW_SCALE})",
+        help="Sidechain-sidechain clash detection: fraction of the summed VDW radii "
+             "of two sidechain atoms (backbone atoms are never checked) below which "
+             f"they are considered clashing (default: {CLASH_VDW_SCALE}). Does not apply "
+             "to N/O pairs - see --hbond_clash_vdw_scale.",
+    )
+    p.add_argument(
+        "--hbond_clash_vdw_scale",
+        default=HBOND_CLASH_VDW_SCALE,
+        metavar="<float>",
+        type=float,
+        help="Sidechain-sidechain clash detection: same as --clash_vdw_scale, but used "
+             "instead of it whenever the pair is one N atom and one O atom, since a real "
+             f"hydrogen bond legitimately sits closer than a generic clash (default: "
+             f"{HBOND_CLASH_VDW_SCALE})",
+    )
+    p.add_argument(
+        "--max_clash_group_size",
+        default=MAX_CLASH_GROUP_SIZE,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: a group of mutually-reselected "
+             "clashing residues stops absorbing newly-clashing neighbors once it "
+             "would exceed this many residues - the residual clash is logged and "
+             f"left unresolved instead (default: {MAX_CLASH_GROUP_SIZE})",
     )
     return p
 
 
 class FinalModelBuilder():
     def __init__(self, dataset_dir, placer_files, multimodel_pdb, apo_structure, output_folder,
-                 resolution, clash_vdw_scale=CLASH_VDW_SCALE):
+                 resolution, clash_vdw_scale=CLASH_VDW_SCALE,
+                 hbond_clash_vdw_scale=HBOND_CLASH_VDW_SCALE,
+                 max_clash_group_size=MAX_CLASH_GROUP_SIZE):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.multimodel_pdb = multimodel_pdb
@@ -94,6 +150,8 @@ class FinalModelBuilder():
         self.output_folder = output_folder
         self.resolution = resolution
         self.clash_vdw_scale = clash_vdw_scale
+        self.hbond_clash_vdw_scale = hbond_clash_vdw_scale
+        self.max_clash_group_size = max_clash_group_size
 
         self._rmask = 0.5 + self.resolution / 3.0 #from qfit
 
@@ -126,26 +184,55 @@ class FinalModelBuilder():
         has a cluster_reps.csv with N data rows, and vice versa."""
         return Path(self.multimodel_pdb).parent / 'cluster_reps.csv'
 
-    def _countClusterReps(self):
-        """Returns the number of data rows (i.e. accepted cluster reps) in
-        cluster_reps.csv, or 0 if that csv is missing, empty, or header-only -
-        which happens when filter/filter2 rejected every candidate for this
-        dataset (e.g. every cluster failed the count/rscc/clash cutoffs)."""
+    def _acceptedPlacerFiles(self):
+        """Returns the set of placer_file values from cluster_reps.csv's
+        placer_file column - the same resolved path strings filter/filter2
+        produced from its own copy of the placer_files glob pattern - that
+        are the source of an accepted cluster rep, i.e. survived count/rscc/
+        per-placer_file-dedup/clash filtering. Empty if cluster_reps.csv is
+        missing, empty, or header-only (every candidate was rejected).
+
+        Per-placer_file dedup upstream in filter/filter2 already guarantees
+        at most one accepted cluster rep per placer_file, so this set's size
+        always equals cluster_reps.csv's row count.
+        """
         csv_path = self._cluster_reps_csv_path()
         if not csv_path.exists():
-            return 0
-        with open(csv_path) as f:
-            lines = [line for line in f if line.strip()]
-        return max(len(lines) - 1, 0)
+            return set()
+        with open(csv_path, newline='') as f:
+            return {row['placer_file'] for row in csv.DictReader(f)}
+
+    def _countClusterReps(self):
+        """Returns the number of accepted cluster reps in cluster_reps.csv
+        (see _acceptedPlacerFiles), or 0 if that csv is missing, empty, or
+        header-only - which happens when filter/filter2 rejected every
+        candidate for this dataset (e.g. every cluster failed the count/rscc/
+        clash cutoffs)."""
+        return len(self._acceptedPlacerFiles())
 
     def run(self):
         """Rescores the protein binding-site residues around the ligand(s) in a
         multimodel pdb (e.g. filter_all.py's cluster_rep_models.pdb), pooling
         every conformation of each residue across all input placer models, and
-        writes out a single merged structure - the best-scoring, non-clashing
-        conformation of each residue (falling back to the apo conformation when
-        needed), plus every ligand pose from the multimodel pdb - to
-        output_folder/final_model.pdb.
+        writes out a single merged structure - the best-scoring conformation of
+        each residue (falling back to the apo conformation when needed), plus
+        every ligand pose from the multimodel pdb - to output_folder/final_model.pdb.
+
+        No clash checking is done against the ligand poses at all - a ligand
+        pose that badly clashes with the surrounding protein gets reselected
+        downstream (DESPOT), and a genuinely correct sidechain rotamer that
+        happens to sit close to the true ligand density is expected to be far
+        more common than the reverse, so filtering candidate rotamers by
+        ligand clash would systematically reject good conformers. Independently
+        best-scoring residues can still clash with EACH OTHER though - see
+        _resolveSidechainClashes, called from _scoreAndSelectBest.
+
+        Only placer files that are the source of an accepted cluster rep in
+        cluster_reps.csv (beside multimodel_pdb - see _acceptedPlacerFiles)
+        are used; a placer file whose every candidate was filtered out
+        contributed no ligand pose to multimodel_pdb, so its residue
+        conformers are excluded rather than pooled in alongside the ones that
+        actually informed the final ligand pose(s).
 
         Writes nothing (returns early, no final_model.pdb) if cluster_reps.csv
         (beside multimodel_pdb) has no accepted cluster reps - i.e. filter/
@@ -177,12 +264,6 @@ class FinalModelBuilder():
             self.multimodel_models = Structure.fromfile(str(self.multimodel_pdb)).split_models()
             print(f'{len(self.multimodel_models)} model(s) in multimodel pdb')
 
-            #pool every ligand pose's atoms across every model of the multimodel pdb;
-            #every one of these poses ends up in the final model together, so a
-            #candidate protein residue conformation has to be clash-checked against
-            #all of them, not just the pose from its own model
-            self._gatherLigandAtoms()
-
             #find every protein residue in the apo structure. A residue only
             #actually goes through scoring/clash-checking below if PLACER
             #produced at least one conformer of it (see _gatherResidueConformers
@@ -194,11 +275,21 @@ class FinalModelBuilder():
             n_residues = sum(len(res_nums) for res_nums in self.all_residues.values())
             print(f'found {n_residues} residue(s) in the apo structure in {time.time() - time0:.2f}s')
 
-            #resolve placer files
-            placer_files = sorted(glob.glob(self.placer_files))
-            print(f'found {len(placer_files)} placer file(s)')
+            #resolve placer files, then restrict to only those that are the
+            #source of an accepted cluster rep in cluster_reps.csv - a placer
+            #file whose every candidate was filtered out (count/rscc/
+            #per-placer_file-dedup/clash cutoffs) contributed nothing to the
+            #ligand pose(s) in multimodel_pdb, so its protein-residue
+            #conformers shouldn't be considered here either
+            all_placer_files = sorted(glob.glob(self.placer_files))
+            accepted_placer_files = self._acceptedPlacerFiles()
+            placer_files = [f for f in all_placer_files if f in accepted_placer_files]
+            print(f'found {len(all_placer_files)} placer file(s) matching the glob; '
+                  f'{len(placer_files)} are the source of an accepted cluster rep '
+                  f'(skipping {len(all_placer_files) - len(placer_files)} that are not)')
             if not placer_files:
-                print('No placer files found; nothing to rescore.')
+                print('No placer files are the source of an accepted cluster rep; '
+                      'nothing to rescore.')
                 return
 
             #gather every conformation of each residue across every model of
@@ -219,10 +310,12 @@ class FinalModelBuilder():
                 print(f'FLAG: {len(missing_residues)} residue(s) had no conformers in '
                       f'any placer file (not a dealbreaker, just flagging for awareness): {missing_str}')
 
-            #score every conformer of every residue (pooled mask per residue, max
-            #across event maps), reject any that clash with a ligand pose from the
-            #multimodel pdb, and keep the single best-scoring non-clashing conformer
-            #per residue - falling back to the apo conformation if none qualify
+            #score every conformer of every residue (pooled mask per residue, MSE
+            #against the first event map only - see _scoreResidueConformers) and
+            #independently keep the single best-scoring (lowest MSE) conformer per
+            #residue - falling back to the apo conformation if none were found -
+            #then resolve any resulting sidechain-sidechain clashes jointly (see
+            #_resolveSidechainClashes)
             time0 = time.time()
             self.best_conformers = self._scoreAndSelectBest(output_folder)
             print(f'scored and selected best conformers in {time.time() - time0:.2f}s')
@@ -263,46 +356,6 @@ class FinalModelBuilder():
             residues.setdefault(chain_id, set()).add(res_num)
 
         return {chain_id: sorted(res_nums) for chain_id, res_nums in residues.items()}
-
-    def _gatherLigandAtoms(self):
-        """Pools the coordinates and VDW radii of every ligand atom, across every
-        model of the multimodel pdb, into flat arrays used for clash-checking
-        candidate protein residue conformations (see _clashesWithLigands). Every
-        one of these ligand poses is kept in the final model (see
-        _buildFinalModel), so a candidate has to be checked against all of them.
-        """
-        coords = []
-        radii = []
-        for model in self.multimodel_models:
-            ligand = model.extract('resname LIG')
-            if ligand.natoms == 0:
-                continue
-            coords.append(np.asarray(ligand.coor))
-            radii.append(np.asarray(ligand.vdw_radius))
-
-        if coords:
-            self.ligand_coords = np.concatenate(coords, axis=0)
-            self.ligand_vdw_radii = np.concatenate(radii, axis=0)
-        else:
-            self.ligand_coords = np.zeros((0, 3))
-            self.ligand_vdw_radii = np.zeros((0,))
-
-    def _clashesWithLigands(self, template, coor):
-        """Returns True if placing `template`'s atoms at coordinates `coor` would
-        put any atom within self.clash_vdw_scale * (sum of the two atoms' VDW
-        radii) of any ligand atom pooled from the multimodel pdb (see
-        _gatherLigandAtoms).
-        """
-        if self.ligand_coords.shape[0] == 0:
-            return False
-
-        residue_vdw = np.asarray(template.vdw_radius)
-        diff = coor[:, None, :] - self.ligand_coords[None, :, :]
-        dists = np.linalg.norm(diff, axis=-1)
-        radii_sum = residue_vdw[:, None] + self.ligand_vdw_radii[None, :]
-        clash_threshold = self.clash_vdw_scale * radii_sum
-
-        return bool(np.any(dists < clash_threshold))
 
     def _get_apo_residue(self, chain_id, res_num):
         """Extracts (chain_id, res_num) from the apo structure. Returns
@@ -363,57 +416,74 @@ class FinalModelBuilder():
 
     def _scoreResidueConformers(self, template, coor_list):
         """Scores every conformer coordinate set of one protein residue against
-        every event map, pooling all of that residue's conformers together into
-        a single mask per event map (rather than masking each conformer
-        separately). Returns one score per conformer: the max RSCC across all
-        event maps.
+        the FIRST event map only (self.event_maps is insertion-ordered by
+        _load_event_maps's sorted glob, so this is the lowest-numbered event
+        map), pooling all of that residue's conformers together into a single
+        mask (rather than masking each conformer separately). Returns one MSE
+        score per conformer (map density vs. model density - LOWER is better,
+        unlike RSCC).
+
+        Scores against only one map, and by MSE rather than correlation, on
+        purpose: this step dominates build_final_model's runtime (one
+        correlation per conformer per event map, for every residue), and per
+        residue the maps mostly agree on which conformer fits best - trading a
+        small amount of accuracy (occasionally picking a conformer the full
+        multi-map RSCC comparison would not have) for a large speedup was an
+        explicit, deliberate call, not an oversight.
         """
         scaled_bulk_solvent = 0 #from qfit, maybe should be different
         default_bfactor = 20 #can change
         n_conf = len(coor_list)
 
-        per_conformer_scores = [[] for _ in range(n_conf)]
+        event_map_name = next(iter(self.event_maps))
 
-        for event_map_name in list(self.event_maps.keys()):
-            #make a transformer for this residue
-            transformer = get_transformer("qfit", template, self.event_maps_models[event_map_name])
+        #make a transformer for this residue
+        transformer = get_transformer("qfit", template, self.event_maps_models[event_map_name])
 
-            #pooled mask covering every conformer of this residue together
-            mask = transformer.get_conformers_mask(coor_list, self._rmask)
-            target = self.event_maps[event_map_name].array[mask]
+        #pooled mask covering every conformer of this residue together
+        mask = transformer.get_conformers_mask(coor_list, self._rmask)
+        target = self.event_maps[event_map_name].array[mask]
 
-            for i, density in enumerate(transformer.get_conformers_densities(coor_list, [default_bfactor] * n_conf)):
-                model = density[mask]
-                np.maximum(model, scaled_bulk_solvent, out=model)
-                correlation_matrix = np.corrcoef(model, target)
-                rscc = correlation_matrix[0, 1]
-                per_conformer_scores[i].append(rscc)
+        per_conformer_scores = []
+        for density in transformer.get_conformers_densities(coor_list, [default_bfactor] * n_conf):
+            model = density[mask]
+            np.maximum(model, scaled_bulk_solvent, out=model)
+            mse = np.mean((model - target) ** 2)
+            per_conformer_scores.append(mse)
 
-        return [max(scores) for scores in per_conformer_scores]
+        return per_conformer_scores
 
     def _scoreAndSelectBest(self, output_folder):
-        """For every residue: scores every gathered conformer (see
-        _scoreResidueConformers), and - in descending score order - keeps the
-        first conformer that doesn't clash with any ligand pose from the
-        multimodel pdb (see _clashesWithLigands). If every conformer clashes,
-        or no conformer was ever found for the residue, falls back to the apo
-        structure's conformation of that residue and prints a message saying so.
+        """For every residue with at least one PLACER conformer: scores every
+        gathered conformer (see _scoreResidueConformers - MSE against the
+        first event map, lower is better) and independently picks the
+        lowest-MSE one, with NO clash checking at this stage (see run()'s
+        docstring for why ligand clashes specifically are never checked).
+        Residues with no PLACER conformer fall back to their apo conformation.
 
-        Also writes two CSVs to output_folder:
-          - residue_scores.csv: unchanged, one row per residue that had at
-            least one PLACER conformer and had a conformer selected from among
-            them (i.e. excludes apo fallbacks).
-          - residues_with_placer_conformers.csv (new, additional - does not
-            replace residue_scores.csv): a plain list of every residue
-            ("{chain}{resnum}", one per line, no header) that had at least one
-            PLACER conformer, regardless of whether that conformer ended up
-            clashing and falling back to apo.
+        Independently-best picks can still clash with EACH OTHER (sidechain
+        atoms only - backbone atoms are excluded, since two residues can
+        legitimately have been picked from different PLACER models with
+        slightly different backbones, which would otherwise look like a
+        clash at every peptide bond). _resolveSidechainClashes finds every
+        such clashing pair, groups them, and reselects each group jointly to
+        the lowest-total-MSE combination with no clash inside the group or
+        against any residue outside it.
 
-        Returns: {(chain_id, res_num): (best_coor, best_rscc, template)}
-        best_rscc is None for residues that fell back to the apo conformation.
+        Also writes three CSVs to output_folder:
+          - residue_scores.csv: one row per residue that had at least one
+            PLACER conformer (i.e. excludes apo fallbacks), reflecting the
+            FINAL choice after sidechain clash resolution.
+          - residues_with_placer_conformers.csv: a plain list of every
+            residue ("{chain}{resnum}", one per line, no header) that had at
+            least one PLACER conformer.
+          - sidechain_clash_groups.csv: one row per resolved sidechain clash
+            group (empty if none were found) - see _write_clash_groups_csv.
+
+        Returns: {(chain_id, res_num): (best_coor, best_mse, template)}
+        best_mse is None for residues that fell back to the apo conformation.
         """
-        best_conformers = {}
-        summary_rows = []
+        self._candidates = {}
         residues_with_conformers = []
 
         for (chain_id, res_num), conformers in self.residue_conformers.items():
@@ -421,16 +491,27 @@ class FinalModelBuilder():
 
             if template is None:
                 # already warned about in _gatherResidueConformers; nothing to
-                # score, clash-check, or fall back to for this residue
+                # score or fall back to for this residue
                 print(f'WARNING: {chain_id}{res_num} has no template (apo extraction '
                       f'failed); omitting it from the final model')
                 continue
 
+            sidechain_mask = ~np.isin(np.asarray(template.name), list(BACKBONE_ATOM_NAMES))
+
             if not conformers:
                 # already flagged in run(); fall back to the apo conformation.
-                # template is itself the apo structure's residue, so its own
-                # (unmodified) coordinates ARE the apo conformation.
-                best_conformers[(chain_id, res_num)] = (template.coor, None, template)
+                # A single, immovable candidate (its own apo coordinates) -
+                # this residue can still be absorbed into a clash group as a
+                # fixed constraint on its neighbors, it just never changes.
+                self._candidates[(chain_id, res_num)] = _ResidueCandidates(
+                    coor=np.asarray(template.coor)[None, :, :],
+                    mse=np.zeros(1),
+                    placer_file=[None],
+                    model_idx=[None],
+                    template=template,
+                    sidechain_mask=sidechain_mask,
+                    fixed=True,
+                )
                 continue
 
             residues_with_conformers.append((chain_id, res_num))
@@ -438,44 +519,567 @@ class FinalModelBuilder():
             coor_list = [c[0] for c in conformers]
             scores = self._scoreResidueConformers(template, coor_list)
 
-            # try conformers best-scoring first, skipping any that clash with a
-            # ligand pose from the multimodel pdb
-            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-            chosen_idx = None
-            for idx in order:
-                if not self._clashesWithLigands(template, coor_list[idx]):
-                    chosen_idx = idx
-                    break
+            self._candidates[(chain_id, res_num)] = _ResidueCandidates(
+                coor=np.stack(coor_list, axis=0),
+                mse=np.asarray(scores),
+                placer_file=[c[1] for c in conformers],
+                model_idx=[c[2] for c in conformers],
+                template=template,
+                sidechain_mask=sidechain_mask,
+                fixed=False,
+            )
 
-            if chosen_idx is not None:
-                best_coor, best_placer_file, best_model_idx = conformers[chosen_idx]
-                best_rscc = scores[chosen_idx]
+        # independently best (lowest-MSE) pick per residue, ignoring clashes
+        chosen_idx = {key: int(np.argmin(cand.mse)) for key, cand in self._candidates.items()}
+        initial_idx = dict(chosen_idx)
 
-                best_conformers[(chain_id, res_num)] = (best_coor, best_rscc, template)
-                summary_rows.append((chain_id, res_num, len(conformers), best_rscc,
-                                      best_placer_file, best_model_idx))
+        group_rows = self._resolveSidechainClashes(chosen_idx)
 
-                print(f'{chain_id}{res_num}: best rscc {best_rscc:.4f} from {best_placer_file} '
-                      f'model {best_model_idx} (of {len(conformers)} conformer(s))')
-            else:
-                print(f'{chain_id}{res_num}: all {len(conformers)} conformer(s) clashed with a '
-                      f'ligand pose in the multimodel pdb; a non-clashing conformer could not be '
-                      f'found, falling back to apo conformation')
-                best_conformers[(chain_id, res_num)] = (template.coor, None, template)
+        best_conformers = {}
+        summary_rows = []
+        for key, cand in self._candidates.items():
+            idx = chosen_idx[key]
+            coor = cand.coor[idx]
+
+            if cand.fixed:
+                best_conformers[key] = (coor, None, cand.template)
+                continue
+
+            mse = float(cand.mse[idx])
+            best_conformers[key] = (coor, mse, cand.template)
+            summary_rows.append((key[0], key[1], len(cand.mse), mse,
+                                  cand.placer_file[idx], cand.model_idx[idx]))
+
+            reassigned = ' (reassigned by sidechain clash resolution)' if idx != initial_idx[key] else ''
+            print(f'{key[0]}{key[1]}: best mse {mse:.4f} from {cand.placer_file[idx]} '
+                  f'model {cand.model_idx[idx]} (of {len(cand.mse)} conformer(s)){reassigned}')
 
         self._write_residue_scores_csv(summary_rows, output_folder + '/residue_scores.csv')
         self._write_residue_conformer_list_csv(
             residues_with_conformers, output_folder + '/residues_with_placer_conformers.csv'
         )
+        self._write_clash_groups_csv(group_rows, output_folder + '/sidechain_clash_groups.csv')
 
         return best_conformers
 
+    # ---- sidechain-sidechain clash resolution -----------------------------
+    #
+    # _scoreAndSelectBest picks every residue's lowest-MSE conformer
+    # independently, which can leave pairs of residues whose sidechains
+    # clash with each other. The methods below find those pairs, group them
+    # by connectivity, and jointly reselect each group to the
+    # lowest-total-MSE combination that clashes with nothing - inside the
+    # group or out. See _resolveSidechainClashes for the full algorithm and
+    # _resolveGroup/_solveGroupAssignment for how one group is actually
+    # solved efficiently.
+
+    def _residueReachSpheres(self):
+        """Per residue, returns (centroids, reach): reach[key] is the
+        distance from centroids[key] to the farthest sidechain atom across
+        EVERY gathered candidate conformer of that residue (not just the
+        chosen one) - a conservative bounding sphere. Two residues can only
+        possibly sidechain-clash if their reach-spheres overlap (plus a
+        margin covering the VDW clash threshold), which lets every clash
+        search below skip an exact atom-pairwise check for residue pairs
+        that are obviously too far apart. Residues with no sidechain atoms
+        (e.g. glycine) get reach 0 - they can never clash.
+        """
+        centroids = {}
+        reach = {}
+        for key, cand in self._candidates.items():
+            if not cand.sidechain_mask.any():
+                centroids[key] = cand.coor[0].mean(axis=0)
+                reach[key] = 0.0
+                continue
+            pts = cand.coor[:, cand.sidechain_mask, :].reshape(-1, 3)
+            centroid = pts.mean(axis=0)
+            centroids[key] = centroid
+            reach[key] = float(np.max(np.linalg.norm(pts - centroid, axis=1)))
+        return centroids, reach
+
+    def _candidatePairsWithinReach(self, keys_a, centroids, reach, keys_b=None, margin=3.0):
+        """Yields (key1, key2) pairs - key1 from keys_a, key2 from keys_b
+        (defaults to keys_a itself, in which case each unordered pair is
+        yielded once) - whose reach-spheres (see _residueReachSpheres) come
+        within `margin` of overlapping. `margin` just needs to conservatively
+        cover the largest plausible VDW clash threshold (~2-3 Angstrom for
+        two heavy atoms) - it does not need to be exact, since this is only a
+        cheap prefilter and every pair it yields still gets an exact
+        atom-pairwise check.
+        """
+        self_pairs = keys_b is None
+        keys_b = keys_a if self_pairs else keys_b
+        for i, k1 in enumerate(keys_a):
+            others = keys_b[i + 1:] if self_pairs else keys_b
+            for k2 in others:
+                if k1 == k2:
+                    continue
+                d = np.linalg.norm(centroids[k1] - centroids[k2])
+                if d <= reach[k1] + reach[k2] + margin:
+                    yield k1, k2
+
+    def _domainCompatibilityMatrix(self, key1, idx1, key2, idx2):
+        """Returns an (len(idx1), len(idx2)) boolean matrix: True where
+        candidate idx1[i] of residue key1 does NOT sidechain-clash with
+        candidate idx2[j] of residue key2 (sidechain atoms only). The
+        per-atom-pair threshold is self.clash_vdw_scale * summed VDW radii,
+        EXCEPT for an (N, O) atom pair (either order) - a real N-H...O or
+        O-H...N hydrogen bond legitimately sits closer than a generic clash
+        would tolerate, so those pairs use self.hbond_clash_vdw_scale
+        instead. idx1/idx2 are arrays of candidate indices (e.g. a truncated
+        top-K domain, or a single index to check one specific pair of
+        candidates).
+        """
+        cand1, cand2 = self._candidates[key1], self._candidates[key2]
+        mask1, mask2 = cand1.sidechain_mask, cand2.sidechain_mask
+        if not mask1.any() or not mask2.any():
+            return np.ones((len(idx1), len(idx2)), dtype=bool)
+
+        coor1 = cand1.coor[idx1][:, mask1, :]  # (n1, a1, 3)
+        coor2 = cand2.coor[idx2][:, mask2, :]  # (n2, a2, 3)
+        vdw1 = np.asarray(cand1.template.vdw_radius)[mask1]  # (a1,)
+        vdw2 = np.asarray(cand2.template.vdw_radius)[mask2]  # (a2,)
+        e1 = np.asarray(cand1.template.e)[mask1]  # (a1,) element symbols
+        e2 = np.asarray(cand2.template.e)[mask2]  # (a2,)
+
+        vdw_sum = vdw1[:, None] + vdw2[None, :]  # (a1, a2)
+        is_n_o_pair = (
+            ((e1 == 'N')[:, None] & (e2 == 'O')[None, :])
+            | ((e1 == 'O')[:, None] & (e2 == 'N')[None, :])
+        )  # (a1, a2)
+        scale = np.where(is_n_o_pair, self.hbond_clash_vdw_scale, self.clash_vdw_scale)
+        thresh = scale * vdw_sum  # (a1, a2)
+
+        diff = coor1[:, None, :, None, :] - coor2[None, :, None, :, :]  # (n1,n2,a1,a2,3)
+        dists = np.linalg.norm(diff, axis=-1)  # (n1,n2,a1,a2)
+        clashing = np.any(dists < thresh[None, None, :, :], axis=(2, 3))  # (n1,n2)
+        return ~clashing
+
+    def _pairClashes(self, key1, idx1, key2, idx2):
+        """Whether residue key1's candidate idx1 sidechain-clashes with
+        residue key2's candidate idx2 (both single indices, not arrays)."""
+        compat = self._domainCompatibilityMatrix(key1, np.array([idx1]), key2, np.array([idx2]))
+        return not compat[0, 0]
+
+    def _findClashingPairs(self, keys, chosen_idx, centroids, reach):
+        """Among `keys`' CURRENT choices in chosen_idx, returns every pair
+        that sidechain-clashes (after the reach-sphere prefilter)."""
+        return [
+            (k1, k2) for k1, k2 in self._candidatePairsWithinReach(keys, centroids, reach)
+            if self._pairClashes(k1, chosen_idx[k1], k2, chosen_idx[k2])
+        ]
+
+    def _externalClashes(self, group, chosen_idx, centroids, reach):
+        """Among `group`'s CURRENT choices in chosen_idx, returns every pair
+        that sidechain-clashes with a residue outside the group."""
+        others = [k for k in self._candidates if k not in group]
+        return [
+            (k1, k2) for k1, k2 in self._candidatePairsWithinReach(group, centroids, reach, keys_b=others)
+            if self._pairClashes(k1, chosen_idx[k1], k2, chosen_idx[k2])
+        ]
+
+    def _connectedComponents(self, keys, pairs):
+        """Groups `keys` into connected components of the graph formed by
+        `pairs` (undirected edges). Keys with no edge at all are omitted -
+        only residues that are actually part of some clash end up in a
+        returned component."""
+        adjacency = {k: set() for k in keys}
+        for k1, k2 in pairs:
+            adjacency[k1].add(k2)
+            adjacency[k2].add(k1)
+
+        seen = set()
+        components = []
+        for k in keys:
+            if k in seen or not adjacency[k]:
+                continue
+            stack = [k]
+            seen.add(k)
+            comp = []
+            while stack:
+                cur = stack.pop()
+                comp.append(cur)
+                for nb in adjacency[cur]:
+                    if nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+            components.append(sorted(comp))
+        return components
+
+    def _format_group(self, keys):
+        return ', '.join(f'{c}{r}' for c, r in keys)
+
+    def _groupMSE(self, group, chosen_idx):
+        return sum(
+            float(self._candidates[key].mse[chosen_idx[key]])
+            for key in group if not self._candidates[key].fixed
+        )
+
+    def _resolveSidechainClashes(self, chosen_idx):
+        """Finds every sidechain-sidechain clash among the independently
+        chosen (lowest-MSE) conformers in `chosen_idx`, groups clashing
+        residues by connectivity, and resolves each group via _resolveGroup -
+        mutating chosen_idx in place. Returns a list of per-group summary
+        rows for sidechain_clash_groups.csv (see _write_clash_groups_csv).
+
+        `groups` (connected components) are computed once, up front, from
+        the INITIAL (pre-resolution) clash graph. But _resolveGroup's own
+        expansion can grow one group to fully absorb the residues of a
+        different, separately-identified initial component - if that
+        happens, that other component is skipped rather than redundantly
+        (and wastefully) resolved again from scratch.
+        """
+        centroids, reach = self._residueReachSpheres()
+        keys = list(self._candidates.keys())
+
+        initial_pairs = self._findClashingPairs(keys, chosen_idx, centroids, reach)
+        groups = self._connectedComponents(keys, initial_pairs)
+
+        if groups:
+            print(f'{len(groups)} sidechain-sidechain clash group(s) found among '
+                  f'independently chosen (lowest-MSE) conformers; resolving each jointly.')
+
+        group_rows = []
+        settled = set()
+        for group in groups:
+            if settled.issuperset(group):
+                continue
+            row = self._resolveGroup(group, chosen_idx, centroids, reach)
+            settled.update(row['residues'])
+            group_rows.append(row)
+        return group_rows
+
+    def _resolveGroup(self, group, chosen_idx, centroids, reach):
+        """Jointly reselects one clash group to the lowest-total-MSE
+        combination of candidates with no sidechain clash inside the group
+        (see _solveGroupAssignment) - mutating chosen_idx in place for every
+        member. If the new picks clash with a residue outside the group,
+        that residue is absorbed into the group and the whole group is
+        resolved again, repeating until stable.
+
+        Two independent ways this can end up NOT fully clash-free, both
+        honestly reported in the returned row rather than silently reported
+        as success:
+          - unresolved: _solveGroupAssignment itself could not find any
+            candidate combination (even outside the top-K, see its
+            docstring) that eliminates every clash WITHIN the current group -
+            e.g. a residue with no PLACER conformer at all blocking every
+            candidate of its one real neighbor. Expansion stops immediately;
+            there is no neighbor left to absorb that would help.
+          - hit_cap: the group WAS fully resolved internally, but doing so
+            introduced (or left) a clash against a residue outside the
+            group, and absorbing it would exceed MAX_CLASH_GROUP_EXPANSIONS
+            (rounds) or self.max_clash_group_size (residues) - so expansion
+            stops there instead of growing further or forcing convergence.
+        """
+        group = list(group)
+        original_group = list(group)
+        original_mse = self._groupMSE(group, chosen_idx)
+        hit_cap = False
+        unresolved = False
+
+        for _round in range(MAX_CLASH_GROUP_EXPANSIONS):
+            assignment, resolved = self._solveGroupAssignment(group)
+            for key, idx in assignment.items():
+                chosen_idx[key] = idx
+
+            if not resolved:
+                unresolved = True
+                still_clashing = [
+                    f'{self._format_group([k1])}-{self._format_group([k2])}'
+                    for i, k1 in enumerate(group) for k2 in group[i + 1:]
+                    if self._pairClashes(k1, chosen_idx[k1], k2, chosen_idx[k2])
+                ]
+                print(f'WARNING: sidechain clash group [{self._format_group(group)}] could NOT be '
+                      f'fully resolved - no combination of candidates (checked up to the full '
+                      f'candidate pool of every member) eliminates every clash within the group. '
+                      f'Still clashing: {"; ".join(still_clashing)}. Keeping the lowest-total-mse '
+                      f'combination found (still clashing) - flagged in '
+                      f'sidechain_clash_groups.csv for manual review.')
+                break
+
+            external = self._externalClashes(group, chosen_idx, centroids, reach)
+            new_members = sorted({k2 for (_, k2) in external if k2 not in group})
+            if not new_members:
+                break
+
+            if len(group) + len(new_members) > self.max_clash_group_size:
+                hit_cap = True
+                print(f'WARNING: sidechain clash group [{self._format_group(group)}] would grow '
+                      f'past max_clash_group_size={self.max_clash_group_size} residues after '
+                      f'absorbing [{self._format_group(new_members)}]; stopping expansion here. '
+                      f'Residual clash(es) against [{self._format_group(new_members)}] are left '
+                      f'unresolved - see sidechain_clash_groups.csv.')
+                break
+
+            group.extend(new_members)
+        else:
+            hit_cap = True
+            print(f'WARNING: sidechain clash group [{self._format_group(group)}] kept absorbing '
+                  f'new neighbors past {MAX_CLASH_GROUP_EXPANSIONS} round(s); stopping here. '
+                  f'Residual clashes may remain - see sidechain_clash_groups.csv.')
+
+        final_mse = self._groupMSE(group, chosen_idx)
+        flagged = hit_cap or unresolved
+        verb = 'left with a residual clash' if flagged else 'resolved'
+        print(f'sidechain clash group [{self._format_group(group)}] ({len(group)} residue(s), '
+              f'{len(original_group)} originally clashing) {verb}: total mse '
+              f'{original_mse:.4f} -> {final_mse:.4f}'
+              + (' (see warning above)' if flagged else '') + '.')
+
+        return {
+            'residues': group,
+            'original_residues': original_group,
+            'size': len(group),
+            'original_size': len(original_group),
+            'original_mse': original_mse,
+            'final_mse': final_mse,
+            'hit_cap': hit_cap,
+            'unresolved': unresolved,
+        }
+
+    def _assignmentClashFree(self, group, assignment):
+        """Whether `assignment` ({key: global_candidate_index}, one per
+        member of `group`) has zero pairwise sidechain clash among every
+        pair in `group`. `group` is always small (capped by
+        max_clash_group_size), so this is a plain O(n^2) check - no
+        reach-sphere prefilter needed."""
+        return all(
+            not self._pairClashes(k1, assignment[k1], k2, assignment[k2])
+            for i, k1 in enumerate(group) for k2 in group[i + 1:]
+        )
+
+    def _domainsFor(self, group, top_k):
+        """{key: candidate indices to consider}, cheapest-first. top_k=None
+        means every candidate (no truncation); fixed residues always get
+        their single apo candidate regardless of top_k."""
+        domains = {}
+        for key in group:
+            cand = self._candidates[key]
+            if cand.fixed:
+                domains[key] = np.array([0])
+            else:
+                order = np.argsort(cand.mse)
+                domains[key] = order if top_k is None else order[:top_k]
+        return domains
+
+    def _solveGroupAssignmentOverDomains(self, group, domains, domain_label):
+        """Solves the joint MSE-minimization problem (see
+        _solveGroupAssignment) over exactly the given `domains` - no
+        truncation or widening here. Returns ({key: global_candidate_index},
+        resolved) where resolved is False if no combination within these
+        domains eliminates every pairwise clash (branch-and-bound found
+        nothing AND the ICM fallback also didn't land on a compatible
+        combination) - the returned assignment is still the best/cheapest
+        one found, just not clash-free.
+        """
+        compat = {}
+        for i, key1 in enumerate(group):
+            for key2 in group[i + 1:]:
+                compat[(key1, key2)] = self._domainCompatibilityMatrix(
+                    key1, domains[key1], key2, domains[key2]
+                )
+
+        result = self._branchAndBound(group, domains, compat)
+        if result is None:
+            print(f'  sidechain clash group [{self._format_group(group)}]: exact search over the '
+                  f'{domain_label} domain found no fully compatible combination (or exhausted its '
+                  f'node budget); falling back to a heuristic (ICM) reassignment.')
+            result = self._icmAssignment(group, domains, compat)
+
+        assignment = {key: int(domains[key][local_i]) for key, local_i in result.items()}
+        return assignment, self._assignmentClashFree(group, assignment)
+
+    def _solveGroupAssignment(self, group):
+        """Returns ({key: chosen_candidate_index}, resolved) for one clash
+        group: the combination of candidates (one per residue) that
+        minimizes total MSE subject to no pairwise sidechain clash within
+        the group - and whether that goal was actually achieved.
+
+        Efficiency: each residue's domain is first truncated to its
+        CLASH_DOMAIN_TOP_K cheapest (lowest-MSE) candidates - a conformer far
+        down the MSE ranking essentially never wins even when it's
+        compatible, so this turns what can be a ~100-300-way domain into a
+        ~25-way one with negligible risk of losing the true optimum. Given
+        the truncated domains, _branchAndBound does an exact search (DFS,
+        most-constrained-residue-first, pruned by an admissible cost bound);
+        if that exceeds its node budget, or finds no fully-compatible
+        combination at all within the truncated domains, _icmAssignment (a
+        fast, always-terminating local-search heuristic) is used instead.
+
+        If even that fails to find a fully compatible combination - which
+        does happen: e.g. a residue with no PLACER conformer at all (a fixed,
+        single-candidate "domain") can clash with EVERY one of a real
+        neighbor's top-K conformers, or two movable residues' only mutually
+        compatible pair can simply rank outside the top-K on both sides -
+        this retries ONCE with each residue's FULL (untruncated) candidate
+        domain before conceding, since that's cheap (see _branchAndBound/
+        _icmAssignment's own performance) and can genuinely find a real,
+        compatible - if costlier - combination the truncated search missed.
+        `resolved` is only False if even the full-domain retry couldn't
+        eliminate every internal clash; the caller (_resolveGroup) is
+        responsible for surfacing that honestly rather than reporting success.
+
+        Fixed (apo-fallback) residues have a domain of exactly one candidate
+        and are handled by the same code with no special-casing.
+        """
+        top_k_domains = self._domainsFor(group, CLASH_DOMAIN_TOP_K)
+        assignment, resolved = self._solveGroupAssignmentOverDomains(
+            group, top_k_domains, f'top-{CLASH_DOMAIN_TOP_K}'
+        )
+
+        if not resolved:
+            full_domains = self._domainsFor(group, top_k=None)
+            assignment, resolved = self._solveGroupAssignmentOverDomains(group, full_domains, 'full')
+
+        return assignment, resolved
+
+    def _branchAndBound(self, group, domains, compat, node_budget=CLASH_SOLVE_NODE_BUDGET):
+        """Exact DFS branch-and-bound over `domains` (local candidate
+        indices per residue), minimizing total MSE subject to `compat`
+        (pairwise domain-compatibility matrices - see
+        _domainCompatibilityMatrix - keyed by (key1, key2) in `group` order).
+        Residues are visited most-constrained-first (smallest domain first);
+        within a residue, candidates are tried cheapest-first, and a branch
+        is pruned once its partial cost plus the cheapest possible
+        completion (each remaining residue's own minimum candidate cost - an
+        admissible lower bound, since it ignores compatibility) can no
+        longer beat the best solution found so far.
+
+        Returns {key: local_domain_index} for the optimal assignment, or
+        None if the node budget was exhausted before one fully-compatible
+        assignment was found (including the case where none exists at all
+        within these domains).
+        """
+        order = sorted(group, key=lambda k: len(domains[k]))
+        costs = [self._candidates[key].mse[domains[key]] for key in order]
+        cheapest_first = [np.argsort(c) for c in costs]
+
+        n = len(order)
+        suffix_min = [0.0] * (n + 1)
+        for k in range(n - 1, -1, -1):
+            suffix_min[k] = suffix_min[k + 1] + float(costs[k].min())
+
+        def get_matrix(k1, k2):
+            key1, key2 = order[k1], order[k2]
+            if (key1, key2) in compat:
+                return compat[(key1, key2)], False
+            return compat[(key2, key1)], True
+
+        current = [None] * n
+        best = {'assignment': None, 'cost': float('inf')}
+        nodes = {'count': 0}
+
+        def compat_ok(k, local_i):
+            for prev in range(k):
+                m, swapped = get_matrix(prev, k)
+                i, j = (current[prev], local_i) if not swapped else (local_i, current[prev])
+                if not m[i, j]:
+                    return False
+            return True
+
+        def dfs(k, cost_so_far):
+            if cost_so_far + suffix_min[k] >= best['cost']:
+                return
+            nodes['count'] += 1
+            if nodes['count'] > node_budget:
+                raise _NodeBudgetExceeded()
+            if k == n:
+                best['assignment'] = list(current)
+                best['cost'] = cost_so_far
+                return
+            for local_i in cheapest_first[k]:
+                if not compat_ok(k, local_i):
+                    continue
+                current[k] = local_i
+                dfs(k + 1, cost_so_far + float(costs[k][local_i]))
+            current[k] = None
+
+        try:
+            dfs(0, 0.0)
+        except _NodeBudgetExceeded:
+            return None
+
+        if best['assignment'] is None:
+            return None
+        return {key: idx for key, idx in zip(order, best['assignment'])}
+
+    def _icmAssignment(self, group, domains, compat, max_iters=25):
+        """Iterated Conditional Modes: a fast, always-terminating heuristic
+        for the same joint MSE-minimization problem _branchAndBound solves
+        exactly. Starting every residue at its own cheapest candidate,
+        repeatedly revisits each residue in `group` in turn and reassigns it
+        to its cheapest candidate that's compatible with every OTHER
+        residue's CURRENT pick, until a full pass changes nothing (or
+        max_iters is hit). May still leave residual clashes if even the
+        (already top-K-truncated) domains contain no fully mutually
+        compatible combination at all - callers check for that afterward via
+        _externalClashes / a subsequent _findClashingPairs pass on the next
+        expansion round.
+
+        Returns {key: local_domain_index}.
+        """
+        def get_matrix(key_a, key_b):
+            if (key_a, key_b) in compat:
+                return compat[(key_a, key_b)], False
+            return compat[(key_b, key_a)], True
+
+        current = {key: 0 for key in group}
+
+        for _ in range(max_iters):
+            changed = False
+            for key in group:
+                costs = self._candidates[key].mse[domains[key]]
+                for local_i in np.argsort(costs):
+                    ok = True
+                    for other in group:
+                        if other == key:
+                            continue
+                        m, swapped = get_matrix(key, other)
+                        i, j = (local_i, current[other]) if not swapped else (current[other], local_i)
+                        if not m[i, j]:
+                            ok = False
+                            break
+                    if ok:
+                        if local_i != current[key]:
+                            current[key] = int(local_i)
+                            changed = True
+                        break
+            if not changed:
+                break
+
+        return current
+
+    def _write_clash_groups_csv(self, group_rows, path):
+        """Writes one row per sidechain-sidechain clash group resolved by
+        _resolveSidechainClashes (empty - header only - if none were found):
+        which residues ended up jointly reselected (residues) vs. which ones
+        were originally found clashing before any group expansion
+        (original_residues), and the group's total MSE before/after
+        reselection. Two independent residual-clash flags (see
+        _resolveGroup's docstring for exactly what each means) -
+        unresolved=True or hit_cap=True either one means a clash was left in
+        place; check log.txt for the specific residue pair(s) still
+        clashing.
+        """
+        with open(path, 'w+') as f:
+            f.write('residues,original_residues,size,original_size,original_mse,final_mse,'
+                    'hit_cap,unresolved')
+            f.write('\n')
+            for row in group_rows:
+                residues = ';'.join(f'{c}{r}' for c, r in row['residues'])
+                original_residues = ';'.join(f'{c}{r}' for c, r in row['original_residues'])
+                f.write(f"{residues},{original_residues},{row['size']},{row['original_size']},"
+                        f"{row['original_mse']},{row['final_mse']},{row['hit_cap']},"
+                        f"{row['unresolved']}")
+                f.write('\n')
+
     def _write_residue_scores_csv(self, rows, path):
         with open(path, 'w+') as f:
-            f.write('chain,resid,num_conformers,best_rscc,best_placer_file,best_model_idx')
+            f.write('chain,resid,num_conformers,best_mse,best_placer_file,best_model_idx')
             f.write('\n')
-            for chain_id, res_num, num_conformers, best_rscc, best_placer_file, best_model_idx in rows:
-                f.write(f'{chain_id},{res_num},{num_conformers},{best_rscc},'
+            for chain_id, res_num, num_conformers, best_mse, best_placer_file, best_model_idx in rows:
+                f.write(f'{chain_id},{res_num},{num_conformers},{best_mse},'
                         f'{best_placer_file},{best_model_idx}')
                 f.write('\n')
 
@@ -518,7 +1122,7 @@ class FinalModelBuilder():
         pieces = []
 
         #best-scoring (or apo-fallback) protein residue conformations
-        for (chain_id, res_num), (best_coor, best_rscc, template) in self.best_conformers.items():
+        for (chain_id, res_num), (best_coor, best_mse, template) in self.best_conformers.items():
             residue_model = template.copy()
             residue_model.coor = best_coor
             residue_model.b = 20
@@ -563,7 +1167,8 @@ def main():
     args = p.parse_args()
     builder = FinalModelBuilder(args.dataset, args.placer_files, args.multimodel_pdb,
                                  args.apo_structure, args.output_folder, args.resolution,
-                                 args.clash_vdw_scale)
+                                 args.clash_vdw_scale, args.hbond_clash_vdw_scale,
+                                 args.max_clash_group_size)
     builder.run()
 
 

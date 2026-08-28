@@ -25,7 +25,11 @@ def build_argparser():
                     "id/residue number), rather than into the symmetry-expanded protein "
                     "output. The unit cell and space group are always taken from the command "
                     "line, never from the input pdb's own CRYST1 record (which, for this "
-                    "pipeline's structures, is never correct)."
+                    "pipeline's structures, is never correct). By default the mate-proximity "
+                    "target is input_pdb's own ligand atoms - pass --ligand-conformers-pdb to "
+                    "target an externally-supplied set of ligand conformers instead (e.g. "
+                    "every placer2 conformer, not just one final pose), so the expanded "
+                    "protein covers a crystal environment realistic for all of them."
     )
     p.add_argument(
         'input_pdb',
@@ -77,6 +81,21 @@ def build_argparser():
              'scoring is not set up to handle. A final_model_refined.pdb already has none '
              'of these, so this is a no-op on one; kept as an explicit, toggleable flag '
              'rather than always-on for control.'
+    )
+    p.add_argument(
+        '--ligand-conformers-pdb',
+        type=Path,
+        nargs='+',
+        default=None,
+        metavar='PDB',
+        help='One or more pdb file(s) of ligand (resname LIG) conformer instances to use as '
+             'the mate-proximity target INSTEAD of input_pdb\'s own ligand atoms (e.g. every '
+             'placer2 conformer, not just whichever pose ended up in final_model_refined.pdb) '
+             '- for scoring many candidate poses against a crystal environment that covers '
+             'all of them. input_pdb\'s own ligand atoms are still excluded from the protein '
+             'output and still written to ligand_output_pdb regardless of this flag; only the '
+             'symmetry-mate search target changes. Omit for the default behavior (target is '
+             'input_pdb\'s own ligand atoms).'
     )
     return p
 
@@ -130,12 +149,17 @@ def _full_atom_mask(struct, subset_mask):
     return full_mask
 
 
-def find_protein_symmetry_mates(structure, distance_cutoff):
+def find_protein_symmetry_mates(structure, distance_cutoff, ligand_conformers=None):
     """
     Finds every crystallographic symmetry mate of structure's protein atoms
-    (resname != LIG) that comes within distance_cutoff of the input structure's
-    own ligand (resname LIG) atoms, and returns them as a list of new
-    Structure objects (deep copies, safe to modify/combine further).
+    (resname != LIG) that comes within distance_cutoff of a ligand (resname LIG) atom, and
+    returns them as a list of new Structure objects (deep copies, safe to modify/combine
+    further).
+
+    ligand_conformers: optional Structure to use as the mate-proximity target INSTEAD of
+    structure's own ligand atoms - e.g. every placer2 conformer pooled into one pdb, not just
+    whichever single pose ended up in structure itself (see --ligand-conformers-pdb). None
+    (default) preserves the original behavior: target is structure.extract('resname LIG').
 
     Each returned mate is trimmed down to just the residues that have at
     least one atom within distance_cutoff of a ligand atom - not the whole
@@ -165,10 +189,12 @@ def find_protein_symmetry_mates(structure, distance_cutoff):
     protein = structure.extract('not resname LIG')
     if protein.natoms == 0:
         raise ValueError('No protein (non-LIG) atoms found in structure.')
-    ligand = structure.extract('resname LIG')
+    ligand = (ligand_conformers if ligand_conformers is not None else structure).extract(
+        'resname LIG')
     if ligand.natoms == 0:
-        raise ValueError('No ligand (resname LIG) atoms found in structure - nothing to '
-                          'measure distance_cutoff against.')
+        source = 'ligand_conformers' if ligand_conformers is not None else 'structure'
+        raise ValueError(f'No ligand (resname LIG) atoms found in {source} - nothing to '
+                          f'measure distance_cutoff against.')
     protein_baseline_coor = protein.coor.copy()
     tree = cKDTree(ligand.coor)
 
@@ -232,9 +258,17 @@ def main():
     # CRYST1 record parsed to.
     structure._kwargs['crystal_symmetry'] = crystal_symmetry  # pylint: disable=protected-access
 
-    mates = find_protein_symmetry_mates(structure, args.distance_cutoff)
+    ligand_conformers = None
+    ligand_source = args.input_pdb
+    if args.ligand_conformers_pdb:
+        ligand_conformers = Structure.fromfile(str(args.ligand_conformers_pdb[0]))
+        for extra_pdb in args.ligand_conformers_pdb[1:]:
+            ligand_conformers = ligand_conformers.combine(Structure.fromfile(str(extra_pdb)))
+        ligand_source = ', '.join(str(p) for p in args.ligand_conformers_pdb)
+
+    mates = find_protein_symmetry_mates(structure, args.distance_cutoff, ligand_conformers)
     print(f'Found {len(mates)} protein symmetry mate(s) within {args.distance_cutoff} '
-          f'Å of the ligand(s) in {args.input_pdb}.')
+          f'Å of the ligand(s) in {ligand_source}.')
 
     used_chain_ids = set(structure.chain)
     protein_output = structure.extract('not resname LIG')
