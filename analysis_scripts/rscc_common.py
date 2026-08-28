@@ -1942,6 +1942,50 @@ def run_rscc_aggregator_pooled(args):
         )
 
 
+CLASH_GROUPS_CSV_COLUMNS = ['dataset', 'residues', 'original_residues', 'size', 'original_size',
+                            'original_mse', 'final_mse', 'hit_cap', 'unresolved']
+
+
+def run_clash_groups_aggregator(args):
+    """Pooled (cross-dataset) aggregation of the sidechain_clash_groups.csv
+    files build_final_model already writes into every dataset's own
+    .../<final_run_name>/ directory (one row per resolved sidechain-sidechain
+    clash group - see build_final_model.py's _write_clash_groups_csv). No new
+    clash detection or resolution happens here - this just concatenates what
+    build_final already wrote, with a 'dataset' column prepended so a
+    run-wide row still identifies which dataset it came from. A dataset with
+    no sidechain_clash_groups.csv (build_final_model never ran for it, e.g.
+    filter2 rejected every candidate) or an empty one (no clash groups found)
+    contributes no rows. Written to
+    args.graphs_dir/sidechain_clash_groups_combined.csv.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    pooled_rows = []
+    for dataset in datasets:
+        csv_path = dataset_final_dir(args.datasets_dir, dataset, args) / 'sidechain_clash_groups.csv'
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            continue
+        df.insert(0, 'dataset', dataset)
+        pooled_rows.append(df)
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    out_path = graphs_dir / 'sidechain_clash_groups_combined.csv'
+
+    if not pooled_rows:
+        print('  No sidechain_clash_groups.csv data found for any dataset; writing empty combined csv.')
+        pd.DataFrame(columns=CLASH_GROUPS_CSV_COLUMNS).to_csv(out_path, index=False)
+        return
+
+    pooled_df = pd.concat(pooled_rows, ignore_index=True)
+    pooled_df.to_csv(out_path, index=False)
+    print(f'  {len(pooled_df)} clash-group row(s) from {len(pooled_rows)} dataset(s) written to: {out_path}')
+
+
 def _dataset_z_values(z_csv):
     """Reads a calc_z csv and collapses altloc variants of the same residue
     down to a single {residue_base: {'max_z', 'min_z', 'average_z'}} dict,

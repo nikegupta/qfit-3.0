@@ -42,6 +42,11 @@
 #         (restricted to residues_with_placer_conformers.csv)
 #   6d. plot_residues_vs_ref_final (only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
+#   6e. aggregate_clash_groups (always - no reference set needed): concatenates every
+#       dataset's own sidechain_clash_groups.csv (written by build_final in Stage 6a) into
+#       one run-wide csv
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
+#                                           sidechain_clash_groups_combined.csv
 #   7a. despot (only runs when <despot_run_name> is given)
 #       extract_ligand_conformers pools every placer2 round-2 conformer (not just filter2's
 #       selected representative) into one ligs.pdb; symmetry_expand --ligand-conformers-pdb
@@ -287,6 +292,7 @@ PLOT_LIG_VS_REF_FILTER1_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_filter1.py"
 PLOT_LIG_VS_REF_FILTER2_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_filter2.py"
 PLOT_RESIDUES_VS_REF_BACKBONE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_backbone.py"
 PLOT_RESIDUES_VS_REF_FINAL_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_final.py"
+AGGREGATE_CLASH_GROUPS_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_clash_groups.py"
 CENTROID_RMSD_ALL_PY="${ANALYSIS_SCRIPTS_DIR}/centroid_rmsd_all.py"
 CALC_PLACER_SAMPLING_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling.py"
 CALC_PLACER_SAMPLING_UNREFINED_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling_unrefined.py"
@@ -626,6 +632,7 @@ export RSR_SCRIPT_LIGAND RSR_SCRIPT_PROTEIN RSR_SCRIPT_FINAL
 export ANALYSIS_SCRIPTS_DIR PLOT_CLUSTER_REPS_PY AGGREGATE_PROTEIN_RSCC_PY AGGREGATE_LIG_RSCC_PY
 export PLOT_LIG_VS_REF_FILTER1_PY PLOT_LIG_VS_REF_FILTER2_PY
 export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY GRAPHS_DIR
+export AGGREGATE_CLASH_GROUPS_PY
 export CENTROID_RMSD_ALL_PY CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
 export PLOT_FIT_LIGAND_COUNTS_PY
 export PLOT_FINAL_VS_APO_Z_PY
@@ -2986,6 +2993,32 @@ final_ref_comparison_outputs_exist() {
 }
 
 ######################################################################
+# Stage 6e: aggregate_clash_groups (no -c needed - just concatenates each
+# dataset's own sidechain_clash_groups.csv, already written by build_final in
+# Stage 6a; no reference set involved)
+######################################################################
+# Run-wide concatenation of every dataset's sidechain_clash_groups.csv into
+# GRAPHS_DIR/<run>/.../<final_run_name>/sidechain_clash_groups_combined.csv.
+
+do_aggregate_clash_groups() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$AGGREGATE_CLASH_GROUPS_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" "$final_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+clash_groups_aggregate_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    files_exist "${out_dir}/sidechain_clash_groups_combined.csv"
+}
+
+######################################################################
 # Stage 7a: despot
 ######################################################################
 # For each dataset (only runs when despot_run_name is given), scores every placer2 round-2
@@ -3638,7 +3671,7 @@ stage8_outputs_exist() {
 stage0_apo_rscc() {
     run_step "Stage 0a: convert_ligs" do_convert_ligs
     run_step "Stage 0b: calc_apo_rscc" do_calc_apo_rscc
-    run_step "Stage 0b: calc_apo_z" do_calc_apo_z
+    # run_step "Stage 0b: calc_apo_z" do_calc_apo_z
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step "Stage 0c: calc_ref_set_rscc" do_calc_ref_set_rscc
         if [ -n "$despot_run_name" ]; then
@@ -3697,12 +3730,15 @@ stage6_final() {
     run_step "Stage 6a: build_final (${final_run_name})" do_build_final
     run_step "Stage 6b: rsr_final (${final_run_name})" do_rsr_final
     run_step "Stage 6c: calc_final_refined_rscc (${final_run_name})" do_calc_final_rscc
-    run_step "Stage 6c: calc_final_refined_z (${final_run_name})" do_calc_final_z
-    run_step "Stage 6c: calc_final_refined_rscc_b (${final_run_name})" do_calc_final_rscc_b
+    # temporarily disabled - not deleted, just not run right now
+    # run_step "Stage 6c: calc_final_refined_z (${final_run_name})" do_calc_final_z
+    # run_step "Stage 6c: calc_final_refined_rscc_b (${final_run_name})" do_calc_final_rscc_b
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 6d: plot_residues_vs_ref_final (${final_run_name})" \
             final_ref_comparison_outputs_exist do_plot_residues_vs_ref_final
     fi
+    run_step_pooled_replot "Stage 6e: aggregate_clash_groups (${final_run_name})" \
+        clash_groups_aggregate_outputs_exist do_aggregate_clash_groups
 }
 
 stage7_despot() {
