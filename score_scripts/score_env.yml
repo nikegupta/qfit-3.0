@@ -1,0 +1,27 @@
+# score_env.yml - conda env for the pdbqt-prep + docking-score half of score.sh
+# (split_complex_pdbqt.py, detect_untemplated_hetero_residues.py, complex_to_pdbqt.sh,
+# run_gnina_score.sh). Recreates/updates the "openbabel" env score.sh's CONDA_ENV_OBABEL var
+# activates - this is ../lig_scripts/openbabel.yml (openbabel + pdb2pqr) plus meeko and its
+# runtime deps (rdkit, scipy, gemmi), which that file doesn't include.
+#
+#   conda env create -f score_env.yml       # first time
+#   conda env update -f score_env.yml       # add these to an existing "openbabel" env
+#
+# score.sh ALSO needs a second, separate conda env for the RSCC half (calc_rscc.py) - the
+# "nikhils_program_exp" env score.sh's CONDA_ENV_QFIT var activates, already defined by
+# ../environment.yml (qfit itself, cctbx-base, etc.) - not duplicated here.
+#
+# Outside conda entirely: docker/podman, and the gnina/gnina container image
+# (`docker pull gnina/gnina:latest`) that run_gnina_score.sh runs gnina from - score.sh doesn't
+# invoke gnina from any conda env at all, just the container.
+name: openbabel
+channels:
+  - conda-forge
+dependencies:
+  - python
+  - openbabel
+  - pdb2pqr
+  - meeko>=0.8
+  - rdkit
+  - scipy
+  - gemmi
