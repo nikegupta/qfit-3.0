@@ -129,11 +129,11 @@ class LigRSCC_Comparator():
         Returns [(chain_id, resi, altloc), ...] for every residue named 'LIG' in a single-model
         structure.
 
-        A LIG residue group that contains two or more distinct non-blank altlocs (e.g. 'A' and
-        'B') is split into one key per altloc, since each altloc represents a physically distinct
-        ligand conformer that should be matched, scored, and counted independently rather than
-        collapsed into a single ligand. altloc is '' for residues with no altloc disorder (a
-        single conformer, whether its atoms carry a blank altloc code or no altloc at all).
+        A LIG residue group with any non-blank altloc (e.g. 'A', whether or not a second altloc
+        competes at that same residue) is split into one key per altloc, since each altloc
+        represents a physically distinct ligand conformer that should be matched, scored, and
+        counted independently rather than collapsed into a single ligand. altloc is '' only for
+        residues with no altloc at all.
         """
         keys = []
         for chain in structure._pdb_hierarchy.only_model().chains():
@@ -145,7 +145,7 @@ class LigRSCC_Comparator():
                 resi = int(residue_group.resseq)
                 altlocs = sorted({ag.altloc.strip() for ag in residue_group.atom_groups()})
                 non_blank_altlocs = [a for a in altlocs if a != '']
-                if len(non_blank_altlocs) >= 2:
+                if non_blank_altlocs:
                     for altloc in non_blank_altlocs:
                         keys.append((chain_id, resi, altloc))
                 else:

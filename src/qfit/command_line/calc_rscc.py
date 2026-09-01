@@ -60,17 +60,54 @@ def build_argparser():
         default=DEFAULT_BFACTOR,
         help=f'B-factor used when generating each residue\'s model density (default: {DEFAULT_BFACTOR})',
     )
+    p.add_argument(
+        '--residues-csv',
+        type=Path,
+        default=None,
+        help='Path to a headerless CSV with one residue per line, formatted as '
+             '"<chain><resnum>" (e.g. "A101") - the format written by '
+             'build_final_model.py\'s residues_with_placer_conformers.csv. When given, '
+             'restricts scoring to just these residues instead of every residue in the '
+             'structure (altloc conformers of a listed residue are still all scored).',
+    )
     return p
 
 
+def parse_residues_csv(path):
+    """Parses a headerless CSV with one residue per line, formatted as
+    '<chain><resnum>' (e.g. 'A101') - the format written by
+    build_final_model.py's residues_with_placer_conformers.csv. Returns a
+    list of (chain_id, res_id) tuples in file order (blank lines skipped).
+    """
+    pattern = re.compile(r'^([A-Za-z]+)(\d+)$')
+    residues = []
+    with open(path, newline='') as f:
+        for line_num, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = pattern.match(line)
+            if not match:
+                raise ValueError(
+                    f"{path}:{line_num}: could not parse residue from '{line}' "
+                    f"(expected '<chain><resnum>', e.g. 'A101')"
+                )
+            chain_id, res_id = match.group(1), int(match.group(2))
+            residues.append((chain_id, res_id))
+    return residues
+
+
 class ResidueRSCCCalculator:
-    def __init__(self, structure_pdb, map_files, resolution, output_csv, bfactor=DEFAULT_BFACTOR):
+    def __init__(self, structure_pdb, map_files, resolution, output_csv, bfactor=DEFAULT_BFACTOR,
+                 residues=None):
         self.structure_pdb = Path(structure_pdb)
         self.map_files = [Path(m) for m in map_files]
         self.resolution = resolution
         self.output_csv = Path(output_csv)
         self.bfactor = bfactor
         self.rmask = 0.5 + resolution / 3.0  # from qfit
+        # (chain_id, resi) pairs to restrict scoring to, or None to score every residue.
+        self.residue_filter = set(residues) if residues is not None else None
 
     def _clean_structure(self, structure):
         """Remove hydrogens and rename OXT->O, matching what qfit's transformer expects."""
@@ -103,19 +140,21 @@ class ResidueRSCCCalculator:
         """
         Returns [(chain_id, resi, altloc), ...] for every residue in a single-model structure.
 
-        A residue group that contains two or more distinct non-blank altlocs (e.g. 'A' and 'B')
-        is split into one key per altloc, since each altloc represents a physically distinct
-        conformer that should be scored independently rather than collapsed into one residue.
-        altloc is '' for residues with no altloc disorder.
+        A residue group with any non-blank altloc (e.g. 'A', whether or not a second altloc
+        competes at that same residue) is split into one key per altloc, since each altloc
+        represents a physically distinct conformer that should be scored independently rather
+        than collapsed into one residue. altloc is '' only for residues with no altloc at all.
         """
         keys = []
         for chain in structure._pdb_hierarchy.only_model().chains():
             chain_id = chain.id.strip()
             for residue_group in chain.residue_groups():
                 resi = int(residue_group.resseq)
+                if self.residue_filter is not None and (chain_id, resi) not in self.residue_filter:
+                    continue
                 altlocs = sorted({ag.altloc.strip() for ag in residue_group.atom_groups()})
                 non_blank_altlocs = [a for a in altlocs if a != '']
-                if len(non_blank_altlocs) >= 2:
+                if non_blank_altlocs:
                     for altloc in non_blank_altlocs:
                         keys.append((chain_id, resi, altloc))
                 else:
@@ -248,8 +287,13 @@ class ResidueRSCCCalculator:
 
 def main():
     args = build_argparser().parse_args()
+    residues = None
+    if args.residues_csv is not None:
+        residues = parse_residues_csv(args.residues_csv)
+        print(f'Restricting scoring to {len(residues)} residue(s) from {args.residues_csv}')
     calculator = ResidueRSCCCalculator(
-        args.structure_pdb, args.map_files, args.resolution, args.output_csv, args.bfactor
+        args.structure_pdb, args.map_files, args.resolution, args.output_csv, args.bfactor,
+        residues=residues,
     )
     calculator.run()
 
