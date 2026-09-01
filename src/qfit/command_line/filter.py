@@ -240,10 +240,16 @@ class Filter():
                 #remove hydrogens from base structure
                 self.base_structure = self.base_structure.extract("e", "H", "!=")
 
-                # fixing issues with terminal oxygens
-                rename = self.base_structure.extract("name", "OXT", "==")
-                rename.name = "O"
-                self.base_structure = self.base_structure.extract("name", "OXT", "!=").combine(rename)
+                # extract() only masks atoms - it doesn't touch _pdb_hierarchy, which
+                # code elsewhere in this class (only_atom_group(), the ref_lig_atom_names
+                # scan in _getBindingSiteConformers) walks directly, bypassing the mask.
+                # Rebuild the hierarchy now so it actually reflects the H-stripped atom
+                # set, keeping every downstream direct-hierarchy read in sync with it.
+                self.base_structure = self.base_structure.get_selected_structure(None)
+
+                # collapse real alternate conformations (non-blank altlocs) down
+                # to a single conformer per residue - see _collapse_altlocs
+                self.base_structure = self._collapse_altlocs(self.base_structure)
 
                 #get set of binding site coors
                 self.binding_site_residues.update({placer_file: self._determineBindingSite(models)})
@@ -754,6 +760,53 @@ class Filter():
             rep = self._selectClusterRepresentative(clusters[cluster_id])
             self.cluster_reps[cluster_id] = rep + (cluster_size,)
 
+
+    def _collapse_altlocs(self, structure):
+        """Keep at most one non-blank-altloc conformer per residue (chain, resi,
+        icode), picking the alphabetically-first altloc code; atoms with a blank
+        altloc (shared across conformers, or simply unsplit residues) are always
+        kept.
+
+        A residue modeled with genuine alternate conformations (e.g. altloc
+        'A'/'B', as real crystal structures in this binding site sometimes have)
+        otherwise ends up with two atom_groups in the same residue_group, which
+        breaks any code assuming a residue has exactly one atom_group
+        (only_atom_group(), used in _getBaseBindingSite and
+        _getBindingSiteConformers) - and doubles that residue's atom count
+        relative to a PLACER model, which never has altlocs, so downstream
+        coor_set indexing (_getBindingSiteConformers, and the
+        self.base_binding_sites[placer_file]/self.coor_sets[placer_file][index]
+        pairing used to build cluster_model.coor) would otherwise silently go out
+        of sync.
+
+        Uses get_selected_structure (not extract) so the dropped atoms are
+        actually removed from the rebuilt _pdb_hierarchy, not just filtered out
+        of the flat atom view - only_atom_group() and other hierarchy-walking
+        code in this file read self.base_structure._pdb_hierarchy directly, which
+        extract()'s selection mask does not affect.
+        """
+        altloc = structure.altloc
+        non_blank = altloc != ""
+        if not non_blank.any():
+            return structure
+
+        chain = structure.chain
+        resi = structure.resi
+        icode = structure.icode
+
+        chosen_altloc = {}
+        for c, r, ic, al in zip(chain[non_blank], resi[non_blank], icode[non_blank], altloc[non_blank]):
+            key = (c, r, ic)
+            if key not in chosen_altloc or al < chosen_altloc[key]:
+                chosen_altloc[key] = al
+
+        keep = ~non_blank
+        for i in np.where(non_blank)[0]:
+            key = (chain[i], resi[i], icode[i])
+            if altloc[i] == chosen_altloc[key]:
+                keep[i] = True
+
+        return structure.get_selected_structure(keep)
 
     def _determineBindingSite(self, models):
         """Determines where binding site is.
