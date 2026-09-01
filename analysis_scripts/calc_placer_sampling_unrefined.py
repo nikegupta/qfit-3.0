@@ -75,7 +75,8 @@ def main():
     )
     if all_rows:
         write_plot_csv(out_dir, out_name,
-                        pd.DataFrame(all_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'rmsd']])
+                        pd.DataFrame(all_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'rmsd',
+                                                 'placer_file', 'model_idx']])
 
 
 if __name__ == '__main__':
