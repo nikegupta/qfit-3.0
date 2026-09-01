@@ -19,7 +19,7 @@ usage() {
     cat <<EOF
 Usage: $0 <map_file> <structure_file> <output_dir> <ligand_resname>
            [-em] [--resolution <float>] [--bfactor <float>] [--label <F,PHI>]
-           [--cnn <model>] [--gnina-image <image>]
+           [--cnn <model>] [--gnina-image <image>] [--smi <SMILES>]
 
   <map_file>        Density map: .ccp4/.mrc/.map (real-space) or .mtz (structure factors).
   <structure_file>  Protein-ligand complex structure: .pdb.
@@ -49,6 +49,13 @@ Usage: $0 <map_file> <structure_file> <output_dir> <ligand_resname>
   --cnn <model>          gnina --cnn model name for docking-pose scoring. Default:
                           crossdock_default2018
   --gnina-image <image>  Docker image to run gnina from. Default: gnina/gnina:latest
+  --smi <SMILES>         SMILES for <ligand_resname>, used as an RDKit template to assign each
+                          ligand instance's bond orders/aromaticity (AllChem.
+                          AssignBondOrdersFromTemplate) when converting it for gnina docking-pose
+                          scoring - see score_scripts/apply_smiles_template.py. Optional - if
+                          omitted, obabel's own geometry-based bond/aromaticity perception is used
+                          instead, which can fail to produce a structure meeko/RDKit can kekulize
+                          for some heteroaromatic ligands.
 EOF
     exit 1
 }
@@ -70,6 +77,7 @@ bfactor=""
 label="FWT,PHWT"
 cnn_model="crossdock_default2018"
 gnina_image="gnina/gnina:latest"
+ligand_smiles=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -95,6 +103,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gnina-image)
             gnina_image="$2"
+            shift 2
+            ;;
+        --smi)
+            ligand_smiles="$2"
             shift 2
             ;;
         -h|--help)
@@ -145,12 +157,13 @@ SCORE_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/score_scripts"
 CALC_RSCC_PY="${SCORE_SCRIPTS_DIR}/calc_rscc.py"
 SPLIT_COMPLEX_PDBQT_PY="${SCORE_SCRIPTS_DIR}/split_complex_pdbqt.py"
 DETECT_UNTEMPLATED_PY="${SCORE_SCRIPTS_DIR}/detect_untemplated_hetero_residues.py"
+APPLY_SMILES_TEMPLATE_PY="${SCORE_SCRIPTS_DIR}/apply_smiles_template.py"
 COMPLEX_TO_PDBQT_SH="${SCORE_SCRIPTS_DIR}/complex_to_pdbqt.sh"
 RUN_GNINA_SH="${SCORE_SCRIPTS_DIR}/run_gnina_score.sh"
 MERGE_SCORES_PY="${SCORE_SCRIPTS_DIR}/merge_scores.py"
 
 for f in "$CALC_RSCC_PY" "$SPLIT_COMPLEX_PDBQT_PY" "$DETECT_UNTEMPLATED_PY" \
-         "$COMPLEX_TO_PDBQT_SH" "$RUN_GNINA_SH" "$MERGE_SCORES_PY"; do
+         "$APPLY_SMILES_TEMPLATE_PY" "$COMPLEX_TO_PDBQT_SH" "$RUN_GNINA_SH" "$MERGE_SCORES_PY"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
         exit 1
@@ -205,7 +218,7 @@ calc_rscc_step() {
 run_step "Calculate ligand RSCC" calc_rscc_step
 
 run_step "Prepare receptor/ligand pdbqt files (meeko + obabel)" \
-    bash "$COMPLEX_TO_PDBQT_SH" "$structure_file" "$ligand_resname" "$output_dir" "$CONDA_SH" "$CONDA_ENV_OBABEL"
+    bash "$COMPLEX_TO_PDBQT_SH" "$structure_file" "$ligand_resname" "$output_dir" "$CONDA_SH" "$CONDA_ENV_OBABEL" "$ligand_smiles"
 
 run_step "Score docking pose(s) with gnina" \
     bash "$RUN_GNINA_SH" "$output_dir" "$cnn_model" "$gnina_image"
