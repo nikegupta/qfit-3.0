@@ -69,21 +69,36 @@ def align_to_reference(mobile_struct, target_struct):
 
 
 def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
-    """Returns a list of {ref_chain, ref_resi, ref_altloc, dist} dicts, one
-    per reference LIG conformation matched against the closest ligand pose
-    (after CA superposition) across every *.pdb file directly in run_dir."""
+    """Returns (matched_rows, not_found_rows):
+      matched_rows - list of {ref_chain, ref_resi, ref_altloc, dist} dicts,
+        one per reference LIG conformation matched against the closest
+        ligand pose (after CA superposition) across every *.pdb file
+        directly in run_dir.
+      not_found_rows - list of {ref_chain, ref_resi, ref_altloc} dicts (no
+        dist - there's nothing to measure a distance to) for every
+        reference LIG conformation in a dataset whose fit_ligand run
+        produced zero output pdbs (run_dir exists and has a reference
+        structure, but its *.pdb glob is empty). Distinct from run_dir not
+        existing at all, which means fit_ligand simply hasn't been run for
+        this dataset yet - not a placement failure - and contributes
+        nothing to either list.
+    """
     if not run_dir.exists() or not ref_path.exists():
-        return []
-
-    pdb_files = sorted(run_dir.glob('*.pdb'))
-    if not pdb_files:
-        return []
+        return [], []
 
     ref_atoms = read_pdb_raw_atoms(ref_path)
     ref_struct = read_pdb_biotite(ref_path)
     ref_confs = lig_conformations_filtered(ref_atoms)
     if not ref_confs:
-        return []
+        return [], []
+
+    pdb_files = sorted(run_dir.glob('*.pdb'))
+    if not pdb_files:
+        not_found_rows = [
+            {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2]}
+            for key in ref_confs
+        ]
+        return [], not_found_rows
 
     min_dists = {key: np.inf for key in ref_confs}
 
@@ -109,10 +124,11 @@ def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
                 if dist < min_dists[ref_key]:
                     min_dists[ref_key] = dist
 
-    return [
+    matched_rows = [
         {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'dist': dist}
         for key, dist in min_dists.items() if np.isfinite(dist)
     ]
+    return matched_rows, []
 
 
 def main():
@@ -120,14 +136,20 @@ def main():
 
     datasets = read_datasets(args.datasets_file)
     all_rows = []
+    all_not_found_rows = []
     for dataset in datasets:
         run_dir = Path(args.datasets_dir) / dataset / args.run_name
         ref_path = ref_pdb_path(args, dataset)
-        rows = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1)
-        print(f'  {dataset}: {len(rows)} ref LIG conformation(s) matched')
+        rows, not_found_rows = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1)
+        print(f'  {dataset}: {len(rows)} ref LIG conformation(s) matched'
+              + (f', {len(not_found_rows)} not found (fit_ligand placed 0 ligands)'
+                 if not_found_rows else ''))
         for row in rows:
             row['dataset'] = dataset
+        for row in not_found_rows:
+            row['dataset'] = dataset
         all_rows.extend(rows)
+        all_not_found_rows.extend(not_found_rows)
 
     out_dir = Path(args.graphs_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -138,10 +160,12 @@ def main():
         xlabel='Minimum Centroid Distance to Closest fit_ligand Pose (Å)',
         out_path=out_dir / out_name,
         bin_width=1.0,
+        not_found_count=len(all_not_found_rows),
     )
-    if all_rows:
+    if all_rows or all_not_found_rows:
+        combined_rows = all_rows + [{**row, 'dist': None} for row in all_not_found_rows]
         write_plot_csv(out_dir, out_name,
-                        pd.DataFrame(all_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'dist']])
+                        pd.DataFrame(combined_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'dist']])
 
 
 if __name__ == '__main__':
