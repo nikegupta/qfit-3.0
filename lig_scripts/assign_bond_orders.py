@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-Loads one or more single-instance ligand pdbs (e.g. symmetry_expand.py's ligand_output_dir -
-one pdb per (chain, resi[, altloc]) ligand instance, already split apart there so a genuinely
-disordered instance never shares a file with its other altloc conformer) and the ligand's
-correct connectivity/bond orders from a SMILES string, matches the SMILES template onto each
-instance's structure (by heavy-atom topology, via rdkit's AssignBondOrdersFromTemplate), and
-writes out an sdf - one entry per instance, named after its input file's own basename (e.g. a
-file named 'ligC1.pdb' becomes an sdf entry named 'ligC1') - with each instance's original 3D
-coordinates but the SMILES's bond orders. Hydrogens are ignored throughout: the pdb is read
-with its hydrogens stripped, so both the template (from SMILES) and each structure (from pdb)
-are heavy-atom-only, and the output sdf has no hydrogens either.
+Loads one or more ligand pdbs and the ligand's correct connectivity/bond orders from a SMILES
+string, matches the SMILES template onto each instance's structure (by heavy-atom topology, via
+rdkit's AssignBondOrdersFromTemplate), and writes out an sdf - one entry per instance - with
+each instance's original 3D coordinates but the SMILES's bond orders. Hydrogens are ignored
+throughout: the pdb is read with its hydrogens stripped, so both the template (from SMILES) and
+each structure (from pdb) are heavy-atom-only, and the output sdf has no hydrogens either.
+
+Each input file may hold either a single already-split ligand instance (e.g.
+symmetry_expand.py's ligand_output_dir - one pdb per (chain, resi[, altloc]) instance, already
+split apart there so a genuinely disordered instance never shares a file with its other altloc
+conformer) or several combined together in one flat file, split apart here by (chain id,
+residue number, insertion code) instead (e.g. extract_ligand_conformers.py's pooled ligs.pdb -
+one instance per (chain, resnum), no MODEL records; restores a splitting step this script used
+to do unconditionally on a single combined file, before every caller was expected to pre-split -
+see git history). A file containing exactly one instance names it after the file's own basename
+(e.g. 'ligC1.pdb' -> 'ligC1'); a file containing more than one names each
+'lig<chain><resnum><icode>' (e.g. 'ligL1', 'ligL2', ... - matching extract_ligand_conformers.py's
+documented naming).
 
 AssignBondOrdersFromTemplate only relabels the *order* of bonds that rdkit's own
 MolFromPDBBlock already decided exist - it never adds or removes a bond. MolFromPDBBlock's own
@@ -41,19 +49,40 @@ Usage:
 """
 import argparse
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
 
-def read_ligand_pdb(pdb_path):
-    """Returns every ATOM/HETATM line in pdb_path, in file order. Each file is already a
-    single ligand instance (see symmetry_expand.py's ligand_output_dir), so - unlike this
-    script's previous single-combined-pdb design - no further splitting by residue/altloc is
-    needed here."""
+def read_ligand_instances(pdb_path):
+    """Splits pdb_path's ATOM/HETATM records by their (chain id, residue number, insertion
+    code), since one input file may hold either a single already-split ligand instance or
+    several combined together in one flat file - see this module's docstring.
+
+    Returns [(name, lines), ...] in first-appearance order. A file containing exactly one
+    instance is named after the file's own basename (matching every existing single-instance
+    caller's naming, e.g. symmetry_expand's 'ligA103.pdb' -> 'ligA103'); a file containing more
+    than one names each 'lig<chain><resnum><icode>' (matching extract_ligand_conformers.py's
+    documented naming for its pooled ligs.pdb)."""
+    residues = OrderedDict()
     with open(pdb_path) as f:
-        return [line for line in f if line.startswith(('ATOM', 'HETATM'))]
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                chain_id = line[21].strip()
+                resnum = line[22:26].strip()
+                icode = line[26].strip()
+                residues.setdefault((chain_id, resnum, icode), []).append(line)
+
+    if not residues:
+        return []
+    if len(residues) == 1:
+        return [(pdb_path.stem, next(iter(residues.values())))]
+    return [
+        (f'lig{chain_id}{resnum}{icode}', lines)
+        for (chain_id, resnum, icode), lines in residues.items()
+    ]
 
 
 def assign_from_geometry(lines, name, template):
@@ -134,11 +163,11 @@ def main():
 
     instances = []
     for ligand_pdb in args.ligand_pdb:
-        lines = read_ligand_pdb(ligand_pdb)
-        if not lines:
+        file_instances = read_ligand_instances(ligand_pdb)
+        if not file_instances:
             print(f'Warning: no ATOM/HETATM records found in {ligand_pdb}; skipping.')
             continue
-        instances.append((ligand_pdb.stem, lines))
+        instances.extend(file_instances)
     if not instances:
         sys.exit(f'No ATOM/HETATM records found in any of {[str(p) for p in args.ligand_pdb]}')
 

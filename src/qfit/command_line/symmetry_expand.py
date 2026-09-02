@@ -21,8 +21,9 @@ def build_argparser():
                     "fall near its ligand(s), so that energy calculations on the model see a "
                     "more realistic crystal environment around the ligand. Ligand atoms "
                     "(resname LIG) are never symmetry-expanded, and are written out "
-                    "separately, all together in a single pdb (with their original chain "
-                    "id/residue number), rather than into the symmetry-expanded protein "
+                    "separately, one pdb per ligand instance (with their original chain "
+                    "id/residue number, split further by altloc when a residue has any - see "
+                    "ligand_output_dir), rather than into the symmetry-expanded protein "
                     "output. The unit cell and space group are always taken from the command "
                     "line, never from the input pdb's own CRYST1 record (which, for this "
                     "pipeline's structures, is never correct). By default the mate-proximity "
@@ -40,7 +41,7 @@ def build_argparser():
         'output_pdb',
         type=Path,
         help='Path to write the input structure\'s protein atoms plus any added symmetry '
-             'mates. Ligand atoms are not included here - see ligand_output_pdb.'
+             'mates. Ligand atoms are not included here - see ligand_output_dir.'
     )
     p.add_argument(
         'space_group',
@@ -64,11 +65,16 @@ def build_argparser():
              'which keeps the expanded structure small.'
     )
     p.add_argument(
-        'ligand_output_pdb',
+        'ligand_output_dir',
         type=Path,
-        help='Path to write every ligand (resname LIG) atom found in the input structure, '
-             'all in a single pdb, keeping each ligand\'s original chain id and residue '
-             'number. Not written at all if the input structure has no LIG atoms.'
+        help='Directory to write one pdb per ligand (resname LIG) instance found in the '
+             'input structure, named lig<chain><resi>.pdb, or lig<chain><resi>-<altloc>.pdb '
+             'for each altloc of a residue that has any non-blank altloc (matched with that '
+             'residue\'s own blank-altloc atoms, if any) - same altloc-splitting convention '
+             'as calc_rscc.py/split_complex_pdbqt.py, so a genuinely disordered ligand '
+             'instance gets its own file (and, downstream, its own DESPOT score) instead of '
+             'being merged with its other conformer(s). Created if missing. Nothing is '
+             'written if the input structure has no LIG atoms.'
     )
     p.add_argument(
         '--strip',
@@ -93,7 +99,7 @@ def build_argparser():
              'placer2 conformer, not just whichever pose ended up in final_model_refined.pdb) '
              '- for scoring many candidate poses against a crystal environment that covers '
              'all of them. input_pdb\'s own ligand atoms are still excluded from the protein '
-             'output and still written to ligand_output_pdb regardless of this flag; only the '
+             'output and still written to ligand_output_dir regardless of this flag; only the '
              'symmetry-mate search target changes. Omit for the default behavior (target is '
              'input_pdb\'s own ligand atoms).'
     )
@@ -227,6 +233,80 @@ def find_protein_symmetry_mates(structure, distance_cutoff, ligand_conformers=No
     return mates
 
 
+def split_ligand_instances(structure):
+    """Splits structure's LIG atoms into one sub-structure per (chain, resi) instance, further
+    split by altloc for any residue that has one - same "any non-blank altloc gets its own
+    instance" convention as calc_rscc.py/split_complex_pdbqt.py, so a genuinely disordered
+    ligand instance (2+ altlocs at the same chain+resi) is never merged with its other
+    conformer(s). Each altloc instance is combined with that residue's own blank-altloc atoms
+    (shared across all of its conformers), matching split_complex_pdbqt.py's atom selection.
+
+    Returns [(label, sub_structure), ...] sorted by (chain, resi, altloc), label formatted
+    '<chain><resi>' or '<chain><resi>-<altloc>' - the same convention
+    residue_label_from_key/calc_rscc.py's _residue_label use (see rscc_common.py).
+
+    Every mask below is computed against, and applied to, structure directly (never through an
+    intermediate extract() result) - extract() only sets a selection over the ORIGINAL,
+    unfiltered atom array, so a mask sized to an already-extracted subset (e.g. one built from
+    that subset's own .chain/.resi/.altloc) would be silently misapplied against the wrong
+    (much larger) array if handed to a second, chained extract() call."""
+    is_lig = structure.resn == 'LIG'
+    if not is_lig.any():
+        return []
+
+    chain, resi, altloc = structure.chain, structure.resi, structure.altloc
+    keys = sorted(set(zip(chain[is_lig], resi[is_lig])))
+
+    instances = []
+    for c, r in keys:
+        base_mask = is_lig & (chain == c) & (resi == r)
+        non_blank_altlocs = sorted(set(altloc[base_mask]) - {''})
+        if non_blank_altlocs:
+            for al in non_blank_altlocs:
+                mask = base_mask & ((altloc == al) | (altloc == ''))
+                instances.append((f'{c}{r}-{al}', structure.extract(mask)))
+        else:
+            instances.append((f'{c}{r}', structure.extract(base_mask)))
+    return instances
+
+
+def collapse_protein_altlocs_to_highest_occupancy(structure):
+    """Collapses every non-ligand (resname != LIG) residue's alternate conformations down to a
+    single, highest-occupancy conformer. pdb2pqr30 (which protein_to_mol2.sh shells out to for
+    DESPOT scoring) has no altloc support and no CLI flag for one - left alone, it silently
+    keeps whichever altloc it happens to parse first, regardless of occupancy (confirmed
+    empirically: on a real disordered residue it kept the lower-occupancy 'A' conformer over
+    the higher-occupancy 'B'). Doing this explicitly and occupancy-aware, before pdb2pqr30 ever
+    runs, replaces that silent, occupancy-blind default with a deliberate, logged choice.
+    Ligand (resname LIG) atoms are left untouched - see split_ligand_instances for how their
+    altlocs are handled instead. A no-op if there's no non-ligand altloc disorder at all."""
+    resn = structure.resn
+    altloc = structure.altloc
+    non_blank = (altloc != '') & (resn != 'LIG')
+    if not non_blank.any():
+        return structure
+
+    chain, resi, icode, q = structure.chain, structure.resi, structure.icode, structure.q
+    chosen = {}
+    for c, r, ic, al, occ in zip(chain[non_blank], resi[non_blank], icode[non_blank],
+                                  altloc[non_blank], q[non_blank]):
+        key = (c, r, ic)
+        if key not in chosen or occ > chosen[key][1]:
+            chosen[key] = (al, occ)
+
+    keep = ~non_blank
+    for i in np.where(non_blank)[0]:
+        key = (chain[i], resi[i], icode[i])
+        if altloc[i] == chosen[key][0]:
+            keep[i] = True
+
+    n_residues = len(chosen)
+    print(f'Collapsed {n_residues} disordered non-ligand residue(s) to their highest-occupancy '
+          f'altloc before protein_to_mol2.sh/pdb2pqr30 (which cannot represent alternate '
+          f'conformations at all).')
+    return structure.get_selected_structure(keep)
+
+
 def main():
     args = build_argparser().parse_args()
 
@@ -242,6 +322,14 @@ def main():
         structure = structure.extract(keep_mask)
         print(f'--strip: removed {n_before - structure.natoms} atom(s) (ligand hydrogens + '
               f'HOH waters + DMS residues); {structure.natoms} atom(s) remain.')
+        # extract() only masks atoms - it doesn't rebuild the underlying atom array, so any
+        # later selection computed against this (now-smaller) structure's own natoms/properties
+        # would be the wrong size to apply against the still-full-sized array beneath it.
+        # Rebuild now so every later step (collapse_protein_altlocs_to_highest_occupancy,
+        # split_ligand_instances) has a real 1:1 view to select against.
+        structure = structure.get_selected_structure(None)
+
+    structure = collapse_protein_altlocs_to_highest_occupancy(structure)
 
     # Always taken from the command line, never from the input pdb's own CRYST1 record (which,
     # for this pipeline's structures, is never correct/meaningful).
@@ -282,12 +370,16 @@ def main():
           f'+ {protein_output.natoms - n_original_protein_atoms} from symmetry mates) to '
           f'{args.output_pdb}.')
 
-    ligand_output = structure.extract('resname LIG')
-    if ligand_output.natoms > 0:
-        ligand_output.tofile(str(args.ligand_output_pdb))
-        print(f'Wrote {ligand_output.natoms} ligand atom(s) to {args.ligand_output_pdb}.')
+    ligand_instances = split_ligand_instances(structure)
+    if ligand_instances:
+        args.ligand_output_dir.mkdir(parents=True, exist_ok=True)
+        for label, instance in ligand_instances:
+            instance_path = args.ligand_output_dir / f'lig{label}.pdb'
+            instance.tofile(str(instance_path))
+            print(f'Wrote {instance.natoms} ligand atom(s) to {instance_path}.')
+        print(f'{len(ligand_instances)} ligand instance(s) written to {args.ligand_output_dir}.')
     else:
-        print(f'No ligand (resname LIG) atoms found; {args.ligand_output_pdb} not written.')
+        print(f'No ligand (resname LIG) atoms found; nothing written to {args.ligand_output_dir}.')
 
 
 if __name__ == '__main__':
