@@ -354,7 +354,7 @@ despot_run_name=""
 
 num_placer_confs=100
 num_placer2_confs=100
-gpu_ids=""
+gpu_ids="0"
 num_parallel=""
 compare_ref_set=0
 overwrite=0
