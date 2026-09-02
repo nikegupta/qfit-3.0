@@ -1217,14 +1217,14 @@ ref_set_despot_process_dataset() {
     local dataset_start_time=$(date +%s)
 
     local expanded_pdb="${reference_dataset_dir}/expanded.pdb"
-    local ligs_pdb="${reference_dataset_dir}/ligs.pdb"
+    local ligs_dir="${reference_dataset_dir}/ligs"
     local ligs_mol2="${reference_dataset_dir}/ligs.mol2"
     local expanded_mol2="${reference_dataset_dir}/expanded.mol2"
 
     local step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"
     symmetry_expand --strip "$structure" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
-        "$EXPAND_DISTANCE_CUTOFF" "$ligs_pdb"
+        "$EXPAND_DISTANCE_CUTOFF" "$ligs_dir"
     local status=$?
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
@@ -1234,10 +1234,25 @@ ref_set_despot_process_dataset() {
         return 1
     fi
 
-    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL" "$ASSIGN_BOND_ORDERS_PY"
+    # symmetry_expand writes one lig<chain><resi>[-<altloc>].pdb per ligand instance into
+    # ligs_dir (split by altloc so a genuinely disordered instance gets its own DESPOT score -
+    # see symmetry_expand.py's ligand_output_dir) - pdb_to_mol2.sh/assign_bond_orders.py
+    # combine every instance found here into one ligs.sdf/ligs.mol2, one molecule per instance,
+    # named after its own lig<label>.pdb basename.
+    shopt -s nullglob
+    local ligand_pdbs=("${ligs_dir}"/lig*.pdb)
+    shopt -u nullglob
+    if [ ${#ligand_pdbs[@]} -eq 0 ]; then
+        echo "Warning [${dataset}]: no ligand (resname LIG) instance found in ${structure}; skipping."
+        print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
+        return 1
+    fi
+
+    "$PDB_TO_MOL2_SH" "${reference_dataset_dir}/ligs" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" \
+        "$CONDA_ENV_OBABEL" "$ASSIGN_BOND_ORDERS_PY" "${ligand_pdbs[@]}"
     status=$?
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
+        echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligand_pdbs[*]} with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
         return 1
     fi
@@ -3095,7 +3110,7 @@ despot_process_dataset() {
     local ligs_pdb="${despot_dir}/ligs.pdb"
     local conformer_map_csv="${despot_dir}/conformer_map.csv"
     local expanded_pdb="${despot_dir}/expanded.pdb"
-    local original_ligand_pdb="${despot_dir}/original_ligand.pdb"
+    local original_ligand_dir="${despot_dir}/original_ligand"
     local ligs_mol2="${despot_dir}/ligs.mol2"
     local expanded_mol2="${despot_dir}/expanded.mol2"
     local despot_csv="${despot_dir}/${dataset}_DESPOT.csv"
@@ -3114,8 +3129,12 @@ despot_process_dataset() {
 
     step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"
+    # original_ligand_dir just captures final_model's own single ligand instance for the
+    # record (never read downstream) - the actual scored ligand(s) are $ligs_pdb, from
+    # extract_ligand_conformers above (every placer2 conformer, chain L - never carries
+    # altloc), targeted via --ligand-conformers-pdb below.
     symmetry_expand "$final_model" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
-        "$EXPAND_DISTANCE_CUTOFF" "$original_ligand_pdb" --ligand-conformers-pdb "$ligs_pdb"
+        "$EXPAND_DISTANCE_CUTOFF" "$original_ligand_dir" --ligand-conformers-pdb "$ligs_pdb"
     status=$?
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
@@ -3125,7 +3144,8 @@ despot_process_dataset() {
         return 1
     fi
 
-    "$PDB_TO_MOL2_SH" "$ligs_pdb" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL" "$ASSIGN_BOND_ORDERS_PY"
+    "$PDB_TO_MOL2_SH" "${despot_dir}/ligs" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL" \
+        "$ASSIGN_BOND_ORDERS_PY" "$ligs_pdb"
     status=$?
     if [ $status -ne 0 ]; then
         echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
