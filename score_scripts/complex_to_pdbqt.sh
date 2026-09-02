@@ -6,8 +6,14 @@
 # openbabel.
 #
 # Each ligand instance (every atom whose resname matches <ligand_resname>, split per-altloc where
-# applicable - see split_complex_pdbqt.py): obabel adds hydrogens and converts to mol2, then
-# mk_prepare_ligand.py builds a proper AutoDock torsion-tree pdbqt with gasteiger charges.
+# applicable - see split_complex_pdbqt.py) is converted to SDF - either from a SMILES template, if
+# one was given, via RDKit's AssignBondOrdersFromTemplate (apply_smiles_template.py), or otherwise
+# via obabel's own geometry-based bond/aromaticity perception, which adds hydrogens in the
+# process. Either way, mk_prepare_ligand.py then builds a proper AutoDock torsion-tree pdbqt with
+# gasteiger charges. SDF (explicit bond orders), not MOL2 (generic aromatic flags), is used for
+# this handoff: mk_prepare_ligand.py uses RDKit internally, and obabel's MOL2 'ar' bond flags for
+# some heteroaromatic rings have no Kekule structure RDKit will accept, aborting the conversion
+# with "Can't kekulize mol" even though the same ring converts fine via SDF or a SMILES template.
 #
 # Receptor (everything else, e.g. the rest of the protein plus cofactors like HEM): prepped via
 # mk_prepare_receptor.py, EXCEPT for any HETATM cofactor resname meeko has no built-in residue
@@ -24,6 +30,13 @@
 #
 # Usage:
 #   complex_to_pdbqt.sh <complex_pdb> <ligand_resname> <output_dir> <conda_sh> <obabel_env>
+#                        [ligand_smiles]
+#
+#   [ligand_smiles]  Optional. A SMILES for <ligand_resname>, used as an RDKit template
+#                     (AllChem.AssignBondOrdersFromTemplate) to assign each ligand instance's
+#                     bond orders/aromaticity directly from known-correct chemistry instead of
+#                     obabel's geometry-based perception (see apply_smiles_template.py). Falls
+#                     back to obabel (`obabel ... -O ligand.sdf -h`) when omitted.
 #
 # Writes into <output_dir>:
 #   receptor.pdb, ligand_<label>.pdb (from split_complex_pdbqt.py)
@@ -32,8 +45,8 @@
 
 set -uo pipefail
 
-if [ $# -ne 5 ]; then
-    echo "Usage: $0 <complex_pdb> <ligand_resname> <output_dir> <conda_sh> <obabel_env>" >&2
+if [ $# -lt 5 ] || [ $# -gt 6 ]; then
+    echo "Usage: $0 <complex_pdb> <ligand_resname> <output_dir> <conda_sh> <obabel_env> [ligand_smiles]" >&2
     exit 1
 fi
 complex_pdb="$1"
@@ -41,6 +54,7 @@ ligand_resname="$2"
 output_dir="$3"
 conda_sh="$4"
 obabel_env="$5"
+ligand_smiles="${6:-}"
 
 if [ ! -f "$complex_pdb" ]; then
     echo "Error: complex pdb not found: ${complex_pdb}" >&2
@@ -50,6 +64,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPLIT_PY="${SCRIPT_DIR}/split_complex_pdbqt.py"
 DETECT_PY="${SCRIPT_DIR}/detect_untemplated_hetero_residues.py"
+SMILES_TEMPLATE_PY="${SCRIPT_DIR}/apply_smiles_template.py"
 
 mkdir -p "$output_dir"
 
@@ -87,12 +102,17 @@ if [ ${#ligand_pdbs[@]} -eq 0 ]; then
 fi
 for lig_pdb in "${ligand_pdbs[@]}"; do
     label="$(basename "$lig_pdb" .pdb | sed 's/^ligand_//')"
-    lig_mol2="${output_dir}/ligand_${label}.mol2"
+    lig_sdf="${output_dir}/ligand_${label}.sdf"
     lig_pdbqt="${output_dir}/ligand_${label}.pdbqt"
-    run_step "Convert ligand ${label} to mol2 (obabel, add H)" \
-        obabel "$lig_pdb" -O "$lig_mol2" -h
+    if [ -n "$ligand_smiles" ]; then
+        run_step "Assign bond orders for ligand ${label} from SMILES template (RDKit)" \
+            python "$SMILES_TEMPLATE_PY" "$lig_pdb" "$ligand_smiles" "$lig_sdf"
+    else
+        run_step "Convert ligand ${label} to sdf (obabel, add H)" \
+            obabel "$lig_pdb" -O "$lig_sdf" -h
+    fi
     run_step "Prepare ligand_${label}.pdbqt (meeko)" \
-        mk_prepare_ligand.py -i "$lig_mol2" -o "$lig_pdbqt"
+        mk_prepare_ligand.py -i "$lig_sdf" -o "$lig_pdbqt"
 done
 
 # --- Receptor branch ---

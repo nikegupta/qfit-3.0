@@ -199,10 +199,10 @@ class ResidueRSCCCalculator:
         reflects every residue actually in the file, so no separate pre-filtering/splitting
         step is needed first (see this module's docstring).
 
-        A residue group that contains two or more distinct non-blank altlocs (e.g. 'A' and 'B')
-        is split into one key per altloc, since each altloc represents a physically distinct
-        conformer that should be scored independently rather than collapsed into one residue.
-        altloc is '' for residues with no altloc disorder.
+        A residue group with any non-blank altloc (e.g. 'A', whether or not a second altloc
+        competes at that same residue) is split into one key per altloc, since each altloc
+        represents a physically distinct conformer that should be scored independently rather
+        than collapsed into one residue. altloc is '' only for residues with no altloc at all.
         """
         keys = []
         for chain in structure._pdb_hierarchy.only_model().chains():
@@ -216,7 +216,7 @@ class ResidueRSCCCalculator:
                 resi = int(residue_group.resseq)
                 altlocs = sorted({ag.altloc.strip() for ag in atom_groups})
                 non_blank_altlocs = [a for a in altlocs if a != '']
-                if len(non_blank_altlocs) >= 2:
+                if non_blank_altlocs:
                     for altloc in non_blank_altlocs:
                         keys.append((chain_id, resi, altloc))
                 else:

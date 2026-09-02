@@ -409,8 +409,12 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
     under model_chain/model_resi, falls back to any LIG in that block.
     Empty list if model_dir/ref_path don't exist or nothing matches.
 
-    Returns a list of {ref_chain, ref_resi, ref_altloc, rmsd} dicts, one per
-    matched reference LIG conformation."""
+    Returns a list of {ref_chain, ref_resi, ref_altloc, rmsd, placer_file,
+    model_idx} dicts, one per matched reference LIG conformation.
+    placer_file/model_idx identify the source file and, 0-based, the
+    MODEL/ENDMDL block within it (file order) that produced the minimum-RMSD
+    conformer - the same placer_file/index convention filter.py's
+    cluster_reps.csv uses."""
     if not model_dir.exists() or not ref_path.exists():
         return []
 
@@ -423,6 +427,7 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
         return []
 
     min_rmsds = {key: np.inf for key in ref_groups}
+    best_source = {key: (None, None) for key in ref_groups}
 
     for model_file in model_files:
         try:
@@ -431,7 +436,7 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
             print(f'    Warning: could not read {model_file}: {e}')
             continue
 
-        for atoms in blocks:
+        for model_idx, atoms in enumerate(blocks):
             model_groups = lig_atom_groups(atoms, chain_id=model_chain, res_id=model_resi)
             if not model_groups:
                 model_groups = lig_atom_groups(atoms)
@@ -443,37 +448,65 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
                     rmsd = compute_rmsd_symmetric(model_atom_list, ref_atom_list)
                     if rmsd is not None and rmsd < min_rmsds[ref_key]:
                         min_rmsds[ref_key] = rmsd
+                        best_source[ref_key] = (str(model_file), model_idx)
 
     return [
-        {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'rmsd': v}
+        {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'rmsd': v,
+         'placer_file': best_source[key][0], 'model_idx': best_source[key][1]}
         for key, v in min_rmsds.items() if np.isfinite(v)
     ]
 
 
-def plot_distance_histogram(values, title, xlabel, out_path, bin_width=1.0, color='steelblue'):
+def plot_distance_histogram(values, title, xlabel, out_path, bin_width=1.0, color='steelblue',
+                             not_found_count=0):
     """Histogram for distance/RMSD-style measurements with an unbounded
     (non-[0,1]) x-range, in the style of calc_filter_rmsd.py's
     save_histogram. Unlike plot_rscc_histogram, bins span [0, max(values)]
-    at bin_width increments rather than the fixed RSCC [0, 1] range."""
+    at bin_width increments rather than the fixed RSCC [0, 1] range.
+
+    not_found_count: optional - number of reference items that had no
+    candidate to measure a distance to at all (e.g. a dataset whose upstream
+    step placed zero poses), so they can never appear in `values` no matter
+    how large a distance would be. When > 0, an extra categorical bar is
+    added one bin past the real distance bins, colored red and labeled 'not
+    found', distinct from a large-but-finite distance. Default 0 preserves
+    the previous behavior exactly for callers that don't have this concept
+    (calc_placer_sampling.py/calc_placer_sampling_unrefined.py)."""
     values = np.asarray(values, dtype=float)
     values = values[~np.isnan(values)]
-    if len(values) == 0:
+    if len(values) == 0 and not_found_count == 0:
         print(f'  Skipping {out_path.name}: no data points.')
         return
 
-    bins = np.arange(0, np.ceil(values.max() / bin_width) * bin_width + bin_width, bin_width)
+    has_values = len(values) > 0
+    bins = (np.arange(0, np.ceil(values.max() / bin_width) * bin_width + bin_width, bin_width)
+            if has_values else np.array([0.0, bin_width]))
     plt.figure(figsize=(10, 6))
-    plt.hist(values, bins=bins, edgecolor='black', alpha=0.7, color=color)
+    if has_values:
+        plt.hist(values, bins=bins, edgecolor='black', alpha=0.7, color=color)
     plt.xlabel(xlabel, fontsize=12)
     plt.ylabel('Count', fontsize=12)
-    plt.title(f'{title} (n={len(values)})', fontsize=13)
-    plt.xticks(bins, fontsize=8, rotation=90)
+    plt.title(f'{title} (n={len(values) + not_found_count})', fontsize=13)
     plt.grid(True, alpha=0.3)
 
-    stats_text = (f'Mean:   {values.mean():.2f} Å\n'
-                  f'Median: {np.median(values):.2f} Å\n'
-                  f'≤ 2 Å:  {(values <= 2).sum()}/{len(values)}')
-    plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes,
+    if not_found_count > 0:
+        not_found_x = bins[-1] + bin_width / 2
+        plt.bar(not_found_x, not_found_count, width=bin_width, edgecolor='black',
+                alpha=0.7, color='red')
+        xticks = list(bins) + [bins[-1] + bin_width]
+        xtick_labels = [f'{b:g}' for b in bins] + ['not found']
+        plt.xticks(xticks, xtick_labels, fontsize=8, rotation=90)
+    else:
+        plt.xticks(bins, fontsize=8, rotation=90)
+
+    stats_lines = []
+    if has_values:
+        stats_lines.append(f'Mean:   {values.mean():.2f} Å')
+        stats_lines.append(f'Median: {np.median(values):.2f} Å')
+        stats_lines.append(f'≤ 2 Å:  {(values <= 2).sum()}/{len(values)}')
+    if not_found_count > 0:
+        stats_lines.append(f'Not found: {not_found_count}')
+    plt.text(0.98, 0.98, '\n'.join(stats_lines), transform=plt.gca().transAxes,
               va='top', ha='right', fontsize=10,
               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
@@ -556,69 +589,104 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
     out). None (default) means every row is eligible, the original behavior.
 
     Returns (matched_ref_rscc, matched_pipeline_rscc, n_unmatched_ref,
-    n_excess_pipeline, matched_rows). matched_rows has one dict per matched
-    pair - {ref_chain, ref_resi, ref_altloc, ref_rscc, cluster_rep_index,
-    pipeline_chain, pipeline_rscc} - for callers that want to write out the
-    full match, not just the pooled RSCC values. cluster_rep_index/
-    pipeline_chain identify the matched cluster_reps.csv row (1-indexed) and
-    that row's ligand's chain id in cluster_rep_models.pdb - the same
-    (chain, resi=cluster_rep_index) pair that row's ligand keeps all the way
-    through final_model(_refined).pdb and, if it survives, despot_filtered.pdb
-    (build_final_model.py/despot_filter.py never renumber it).
+    n_excess_pipeline, matched_rows, unmatched_ref_rows, excess_pipeline_rows).
+
+    matched_rows has one dict per matched pair - {ref_chain, ref_resi,
+    ref_altloc, ref_rscc, cluster_rep_index, pipeline_chain, pipeline_rscc} -
+    for callers that want to write out the full match, not just the pooled
+    RSCC values. cluster_rep_index/pipeline_chain identify the matched
+    cluster_reps.csv row (1-indexed) and that row's ligand's chain id in
+    cluster_rep_models.pdb - the same (chain, resi=cluster_rep_index) pair
+    that row's ligand keeps all the way through final_model(_refined).pdb
+    and, if it survives, despot_filtered.pdb (build_final_model.py/
+    despot_filter.py never renumber it).
+
+    unmatched_ref_rows has one dict per reference LIG conformation that
+    never became part of a matched pair - {ref_chain, ref_resi, ref_altloc,
+    ref_rscc, reason} - reason is 'no_reference_rscc' (ref_rscc_csv_path had
+    no value for this label - see residue_label_from_key), 'no_pipeline_output'
+    (this dataset's run_dir/cluster_reps.csv or cluster_rep_models.pdb - or
+    cluster_csv_override, if given - doesn't exist, e.g. a failed/incomplete
+    pipeline run for this dataset; every reference ligand with a known
+    ref_rscc is counted unmatched this way rather than the whole dataset
+    being silently skipped), or 'no_pipeline_match_within_cutoff' (every
+    eligible cluster-rep ligand was farther than args.centroid_cutoff, or
+    none were eligible at all); ref_rscc is the reference RSCC when known,
+    else None.
+
+    excess_pipeline_rows has one dict per eligible cluster-rep ligand that
+    never became any reference ligand's nearest match - {cluster_rep_index,
+    pipeline_chain, pipeline_rscc, placer_file, index} - placer_file/index
+    are that row's own cluster_reps.csv columns (the filter.py placer_file/
+    index convention - the same placer_file/model-index pair the row's pose
+    came from), so an excess pipeline ligand can be traced back to its
+    source PLACER model.
     """
     ref_pdb = ref_pdb_path(args, dataset)
     ref_csv = ref_rscc_csv_path(args, dataset)
     cluster_csv = run_dir / 'cluster_reps.csv'
     cluster_pdb = run_dir / 'cluster_rep_models.pdb'
 
-    if not (ref_pdb.exists() and ref_csv.exists() and cluster_csv.exists() and cluster_pdb.exists()):
-        print(f'  {dataset}: missing required file(s) for lig-vs-reference comparison '
-              f'(ref_pdb={ref_pdb.exists()}, ref_rscc={ref_csv.exists()}, '
-              f'cluster_reps={cluster_csv.exists()}, cluster_rep_models={cluster_pdb.exists()}); skipping.')
-        return [], [], 0, 0, []
+    if not (ref_pdb.exists() and ref_csv.exists()):
+        print(f'  {dataset}: missing reference file(s) for lig-vs-reference comparison '
+              f'(ref_pdb={ref_pdb.exists()}, ref_rscc={ref_csv.exists()}); skipping.')
+        return [], [], 0, 0, [], [], []
 
     ref_ligs = lig_conformations(read_pdb_raw_atoms(ref_pdb))
     if not ref_ligs:
         print(f'  {dataset}: no LIG residue found in reference {ref_pdb}; skipping.')
-        return [], [], 0, 0, []
+        return [], [], 0, 0, [], [], []
     ref_rscc_df = read_calc_rscc_csv(ref_csv)
     ref_rscc = dict(zip(ref_rscc_df['residue'], ref_rscc_df['rscc']))
 
     rscc_csv_path = cluster_csv_override if cluster_csv_override is not None else cluster_csv
-    if cluster_csv_override is not None and not cluster_csv_override.exists():
-        print(f'  {dataset}: missing {cluster_csv_override} for lig-vs-reference comparison; '
-              f'skipping.')
-        return [], [], 0, 0, []
-    cluster_df = pd.read_csv(rscc_csv_path)
-    pipeline_rscc_by_row = list(cluster_df[rscc_column])
+    # A missing pipeline-side file (e.g. a failed/incomplete run for this dataset) must still
+    # surface every one of this dataset's reference ligands as unmatched - NOT silently drop the
+    # whole dataset, which would make pipeline failures invisible in the unmatched count/plot.
+    pipeline_output_missing = not (rscc_csv_path.exists() and cluster_pdb.exists())
+    if pipeline_output_missing:
+        print(f'  {dataset}: missing pipeline output for lig-vs-reference comparison '
+              f'(cluster_reps={rscc_csv_path.exists()}, cluster_rep_models={cluster_pdb.exists()}); '
+              f'counting every reference ligand as unmatched.')
+        n_models = 0
+        pipeline_rscc_by_row, placer_file_by_row, index_by_row = [], [], []
+        pipeline_centroids, pipeline_chains = [], []
+    else:
+        cluster_df = pd.read_csv(rscc_csv_path)
+        pipeline_rscc_by_row = list(cluster_df[rscc_column])
+        placer_file_by_row = list(cluster_df['placer_file'])
+        index_by_row = list(cluster_df['index'])
 
-    model_blocks = split_pdb_models(cluster_pdb)
-    n_models = min(len(model_blocks), len(pipeline_rscc_by_row))
-    if len(model_blocks) != len(pipeline_rscc_by_row):
-        print(f'  {dataset}: cluster_rep_models.pdb has {len(model_blocks)} model(s) but '
-              f'cluster_reps.csv has {len(pipeline_rscc_by_row)} row(s); using first {n_models}.')
+        model_blocks = split_pdb_models(cluster_pdb)
+        n_models = min(len(model_blocks), len(pipeline_rscc_by_row))
+        if len(model_blocks) != len(pipeline_rscc_by_row):
+            print(f'  {dataset}: cluster_rep_models.pdb has {len(model_blocks)} model(s) but '
+                  f'cluster_reps.csv has {len(pipeline_rscc_by_row)} row(s); using first {n_models}.')
 
-    pipeline_centroids = []
-    pipeline_chains = []
-    for i in range(n_models):
-        if alive_rows is not None and (i + 1) not in alive_rows:
-            pipeline_centroids.append(None)
-            pipeline_chains.append(None)
-            continue
-        lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
-        pipeline_centroids.append(
-            np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
-        )
-        pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
+        pipeline_centroids = []
+        pipeline_chains = []
+        for i in range(n_models):
+            if alive_rows is not None and (i + 1) not in alive_rows:
+                pipeline_centroids.append(None)
+                pipeline_chains.append(None)
+                continue
+            lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
+            pipeline_centroids.append(
+                np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
+            )
+            pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
 
     used_rows = set()
     matched_ref, matched_pipeline, matched_rows = [], [], []
-    n_unmatched_ref = 0
+    unmatched_ref_rows = []
     for (chain_id, res_id, altloc), ref_centroid in ref_ligs.items():
         ref_label = residue_label_from_key(chain_id, res_id, altloc)
         ref_val = ref_rscc.get(ref_label)
         if ref_val is None or pd.isna(ref_val):
-            n_unmatched_ref += 1
+            unmatched_ref_rows.append({
+                'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+                'ref_rscc': None, 'reason': 'no_reference_rscc',
+            })
             continue
 
         best_row, best_dist = None, float('inf')
@@ -632,7 +700,11 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
                 best_row = i
 
         if best_row is None or best_dist > args.centroid_cutoff:
-            n_unmatched_ref += 1
+            reason = 'no_pipeline_output' if pipeline_output_missing else 'no_pipeline_match_within_cutoff'
+            unmatched_ref_rows.append({
+                'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+                'ref_rscc': ref_val, 'reason': reason,
+            })
             continue
 
         pipeline_val = pipeline_rscc_by_row[best_row]
@@ -645,10 +717,18 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
         })
         used_rows.add(best_row)
 
-    n_excess_pipeline = sum(
-        1 for i in range(n_models) if pipeline_centroids[i] is not None and i not in used_rows
-    )
-    return matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline, matched_rows
+    excess_pipeline_rows = [
+        {
+            'cluster_rep_index': i + 1, 'pipeline_chain': pipeline_chains[i],
+            'pipeline_rscc': pipeline_rscc_by_row[i],
+            'placer_file': placer_file_by_row[i], 'index': index_by_row[i],
+        }
+        for i in range(n_models) if pipeline_centroids[i] is not None and i not in used_rows
+    ]
+    n_excess_pipeline = len(excess_pipeline_rows)
+    n_unmatched_ref = len(unmatched_ref_rows)
+    return (matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline, matched_rows,
+            unmatched_ref_rows, excess_pipeline_rows)
 
 
 def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None,
@@ -658,9 +738,17 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
     reference ligand RSCC across every dataset in datasets.txt into a single
     scatter plot (Reference on x, Pipeline on y - qfit compare_lig_rscc's
     convention), with unmatched-reference/excess-pipeline counts labeled -
-    plus the exact matched pairs (dataset, reference ligand chain/resi/altloc/
-    rscc, matched cluster_reps.csv row/chain, pipeline rscc) written to
-    <graphs_dir>/<out_name stem>.csv, alongside the plot itself.
+    plus three csvs written alongside the plot in <graphs_dir>:
+      <out_name stem>.csv - the exact matched pairs (dataset, reference
+        ligand chain/resi/altloc/rscc, matched cluster_reps.csv row/chain,
+        pipeline rscc).
+      <out_name stem>_unmatched_ref.csv - every reference LIG conformation
+        that didn't become part of a matched pair (dataset, chain/resi/
+        altloc, ref_rscc, reason - see _dataset_lig_vs_ref).
+      <out_name stem>_excess_pipeline.csv - every eligible cluster-rep
+        ligand that was never any reference ligand's nearest match (dataset,
+        cluster_rep_index/chain/rscc, and the placer_file/index it came
+        from - see _dataset_lig_vs_ref).
 
     run_dir_for_dataset(dataset) -> Path to the directory holding that
     dataset's cluster_reps.csv + cluster_rep_models.pdb for this stage.
@@ -681,6 +769,7 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
     """
     datasets = read_datasets(args.datasets_file)
     all_ref, all_pipeline, all_rows = [], [], []
+    all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
     total_unmatched, total_excess = 0, 0
 
     for dataset in datasets:
@@ -690,7 +779,8 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
             cluster_csv_override_for_dataset(dataset) if cluster_csv_override_for_dataset
             else None
         )
-        ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows = _dataset_lig_vs_ref(
+        (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
+         unmatched_ref_rows, excess_pipeline_rows) = _dataset_lig_vs_ref(
             dataset, args, run_dir, alive_rows=alive_rows,
             cluster_csv_override=cluster_csv_override, rscc_column=rscc_column,
         )
@@ -702,6 +792,14 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
             row_out = dict(row)
             row_out['dataset'] = dataset
             all_rows.append(row_out)
+        for row in unmatched_ref_rows:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_unmatched_ref_rows.append(row_out)
+        for row in excess_pipeline_rows:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_excess_pipeline_rows.append(row_out)
         print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
               f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
 
@@ -722,6 +820,19 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
         )[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc',
            chain_col_name, resi_col_name, 'pipeline_rscc']]
         write_plot_csv(graphs_dir, out_name, rows_df)
+
+    out_stem = Path(out_name).stem
+    if all_unmatched_ref_rows:
+        unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
+            ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc', 'reason']
+        ]
+        write_plot_csv(graphs_dir, f'{out_stem}_unmatched_ref.png', unmatched_df)
+
+    if all_excess_pipeline_rows:
+        excess_df = pd.DataFrame(all_excess_pipeline_rows).rename(
+            columns={'cluster_rep_index': resi_col_name, 'pipeline_chain': chain_col_name}
+        )[['dataset', chain_col_name, resi_col_name, 'pipeline_rscc', 'placer_file', 'index']]
+        write_plot_csv(graphs_dir, f'{out_stem}_excess_pipeline.png', excess_df)
 
 
 def _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels):
@@ -1166,11 +1277,13 @@ def _ref_despot_conformations(dataset, args):
     count, element inferred from atom name via _element_of) - the same
     normalization despot_filter.py applies on the pipeline side (see
     despot_filter.py's _heavy_atom_count). Instance labels are built the same
-    way assign_bond_orders.py named them (f'lig{chain}{resi}'; icode is
-    assumed blank - reference structures carry no insertion codes in this
-    pipeline). A conformation with zero heavy atoms, or no matching score in
-    ref_despot_csv_path, is left out. Empty dict if the reference structure
-    or its DESPOT csv is missing, or has no LIG atoms."""
+    way symmetry_expand.py's split_ligand_instances/assign_bond_orders.py
+    named them: f'lig{chain}{resi}', or f'lig{chain}{resi}-{altloc}' for a
+    residue with any non-blank altloc (icode is assumed blank - reference
+    structures carry no insertion codes in this pipeline). A conformation
+    with zero heavy atoms, or no matching score in ref_despot_csv_path, is
+    left out. Empty dict if the reference structure or its DESPOT csv is
+    missing, or has no LIG atoms."""
     ref_pdb = ref_pdb_path(args, dataset)
     despot_csv = ref_despot_csv_path(args, dataset)
     if not (ref_pdb.exists() and despot_csv.exists()):
@@ -1188,7 +1301,7 @@ def _ref_despot_conformations(dataset, args):
         n_heavy = sum(1 for a in atom_list if _element_of(a['name']) != 'H')
         if n_heavy == 0:
             continue
-        label = f'lig{chain_id}{resi}'
+        label = f'lig{chain_id}{resi}' + (f'-{altloc}' if altloc else '')
         raw_score = scores_by_label.get(label)
         if raw_score is None:
             continue
@@ -1220,48 +1333,76 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
     eligible.
 
     Returns (matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline,
-    matched_rows), matching _dataset_lig_vs_ref's return shape - matched_rows
-    has one dict per matched pair: {ref_chain, ref_resi, ref_altloc,
-    ref_despot_normalized, cluster_rep_index, pipeline_chain,
-    pipeline_despot_normalized}.
+    matched_rows, unmatched_ref_rows, excess_pipeline_rows) - same shape and
+    same field conventions as _dataset_lig_vs_ref. matched_rows has one dict
+    per matched pair: {ref_chain, ref_resi, ref_altloc, ref_despot_normalized,
+    cluster_rep_index, pipeline_chain, pipeline_despot_normalized}.
+    unmatched_ref_rows has one dict per reference LIG conformation that never
+    matched - {ref_chain, ref_resi, ref_altloc, ref_despot_normalized,
+    reason} - reason is 'no_pipeline_output' (this dataset's cluster_reps.csv,
+    cluster_rep_models.pdb, or despot_filtered_scores.csv doesn't exist, e.g.
+    a failed/incomplete despot run for this dataset; every reference ligand
+    is counted unmatched this way rather than the whole dataset being
+    silently skipped), 'no_pipeline_match_within_cutoff', or
+    'no_pipeline_despot_score' (matched a cluster-rep pose, but that row has
+    no despot_filtered_scores.csv entry). excess_pipeline_rows has one dict
+    per eligible cluster-rep ligand that was never any reference ligand's
+    nearest match - {cluster_rep_index, pipeline_chain, placer_file, index} -
+    placer_file/index are that row's own cluster_reps.csv columns.
     """
     ref_conformations = _ref_despot_conformations(dataset, args)
     if not ref_conformations:
         print(f'  {dataset}: no reference DESPOT score(s) found; skipping.')
-        return [], [], 0, 0, []
+        return [], [], 0, 0, [], [], []
 
     cluster_csv = run_dir / 'cluster_reps.csv'
     cluster_pdb = run_dir / 'cluster_rep_models.pdb'
     scores_csv = despot_filtered_scores_csv_path(args.datasets_dir, dataset, args)
 
-    if not (cluster_csv.exists() and cluster_pdb.exists() and scores_csv.exists()):
-        print(f'  {dataset}: missing required file(s) for despot-vs-reference comparison '
+    # A missing pipeline-side file (e.g. a failed/incomplete despot run for this dataset) must
+    # still surface every one of this dataset's reference ligands as unmatched - NOT silently
+    # drop the whole dataset, which would make pipeline failures invisible in the unmatched
+    # count/plot (same fix as _dataset_lig_vs_ref).
+    pipeline_output_missing = not (cluster_csv.exists() and cluster_pdb.exists() and scores_csv.exists())
+    if pipeline_output_missing:
+        print(f'  {dataset}: missing pipeline output for despot-vs-reference comparison '
               f'(cluster_reps={cluster_csv.exists()}, cluster_rep_models={cluster_pdb.exists()}, '
-              f'despot_filtered_scores={scores_csv.exists()}); skipping.')
-        return [], [], 0, 0, []
+              f'despot_filtered_scores={scores_csv.exists()}); counting every reference ligand '
+              f'as unmatched.')
+        n_models = 0
+        placer_file_by_row, index_by_row = [], []
+        pipeline_centroids, pipeline_chains = [], []
+        pipeline_normalized_by_resi = {}
+    else:
+        pipeline_scores_df = read_despot_filtered_scores_csv(scores_csv)
+        pipeline_normalized_by_resi = dict(zip(pipeline_scores_df['resi'], pipeline_scores_df['normalized_score']))
 
-    pipeline_scores_df = read_despot_filtered_scores_csv(scores_csv)
-    pipeline_normalized_by_resi = dict(zip(pipeline_scores_df['resi'], pipeline_scores_df['normalized_score']))
+        cluster_df = pd.read_csv(cluster_csv)
+        placer_file_by_row = list(cluster_df['placer_file'])
+        index_by_row = list(cluster_df['index'])
 
-    model_blocks = split_pdb_models(cluster_pdb)
-    n_models = len(model_blocks)
+        model_blocks = split_pdb_models(cluster_pdb)
+        n_models = min(len(model_blocks), len(placer_file_by_row))
+        if len(model_blocks) != len(placer_file_by_row):
+            print(f'  {dataset}: cluster_rep_models.pdb has {len(model_blocks)} model(s) but '
+                  f'cluster_reps.csv has {len(placer_file_by_row)} row(s); using first {n_models}.')
 
-    pipeline_centroids = []
-    pipeline_chains = []
-    for i in range(n_models):
-        if alive_rows is not None and (i + 1) not in alive_rows:
-            pipeline_centroids.append(None)
-            pipeline_chains.append(None)
-            continue
-        lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
-        pipeline_centroids.append(
-            np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
-        )
-        pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
+        pipeline_centroids = []
+        pipeline_chains = []
+        for i in range(n_models):
+            if alive_rows is not None and (i + 1) not in alive_rows:
+                pipeline_centroids.append(None)
+                pipeline_chains.append(None)
+                continue
+            lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
+            pipeline_centroids.append(
+                np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
+            )
+            pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
 
     used_rows = set()
     matched_ref, matched_pipeline, matched_rows = [], [], []
-    n_unmatched_ref = 0
+    unmatched_ref_rows = []
     for (chain_id, res_id, altloc), (ref_centroid, ref_val) in ref_conformations.items():
         best_row, best_dist = None, float('inf')
         for i in range(n_models):
@@ -1274,12 +1415,19 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
                 best_row = i
 
         if best_row is None or best_dist > args.centroid_cutoff:
-            n_unmatched_ref += 1
+            reason = 'no_pipeline_output' if pipeline_output_missing else 'no_pipeline_match_within_cutoff'
+            unmatched_ref_rows.append({
+                'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+                'ref_despot_normalized': ref_val, 'reason': reason,
+            })
             continue
 
         pipeline_val = pipeline_normalized_by_resi.get(best_row + 1)
         if pipeline_val is None or pd.isna(pipeline_val):
-            n_unmatched_ref += 1
+            unmatched_ref_rows.append({
+                'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+                'ref_despot_normalized': ref_val, 'reason': 'no_pipeline_despot_score',
+            })
             continue
 
         matched_ref.append(ref_val)
@@ -1292,10 +1440,17 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
         })
         used_rows.add(best_row)
 
-    n_excess_pipeline = sum(
-        1 for i in range(n_models) if pipeline_centroids[i] is not None and i not in used_rows
-    )
-    return matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline, matched_rows
+    excess_pipeline_rows = [
+        {
+            'cluster_rep_index': i + 1, 'pipeline_chain': pipeline_chains[i],
+            'placer_file': placer_file_by_row[i], 'index': index_by_row[i],
+        }
+        for i in range(n_models) if pipeline_centroids[i] is not None and i not in used_rows
+    ]
+    n_excess_pipeline = len(excess_pipeline_rows)
+    n_unmatched_ref = len(unmatched_ref_rows)
+    return (matched_ref, matched_pipeline, n_unmatched_ref, n_excess_pipeline, matched_rows,
+            unmatched_ref_rows, excess_pipeline_rows)
 
 
 def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None):
@@ -1304,10 +1459,15 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
     centroid-distance matching plot_lig_vs_ref uses for RSCC, see
     _dataset_despot_vs_ref) across every dataset in datasets.txt into a
     single scatter plot (Reference on x, Pipeline on y), with unmatched-
-    reference/excess-pipeline counts labeled - plus the exact matched pairs
-    (dataset, reference ligand chain/resi/altloc/normalized score, matched
-    cluster_reps.csv row/chain, pipeline normalized score) written to
-    <graphs_dir>/<out_name stem>.csv, alongside the plot itself.
+    reference/excess-pipeline counts labeled - plus three csvs written
+    alongside the plot in <graphs_dir> (same convention as plot_lig_vs_ref):
+      <out_name stem>.csv - the exact matched pairs (dataset, reference
+        ligand chain/resi/altloc/normalized score, matched cluster_reps.csv
+        row/chain, pipeline normalized score). Only written if at least one
+        dataset had a matched pair.
+      <out_name stem>_unmatched_ref.csv / _excess_pipeline.csv - written
+        whenever there's at least one such row, even if no dataset had any
+        matched pair at all (see _dataset_despot_vs_ref).
 
     Unlike plot_lig_vs_ref, the axis range is computed from the data
     (_auto_axis_range) rather than plot_rscc_scatter's [x, 1]-ish RSCC
@@ -1326,12 +1486,14 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
     """
     datasets = read_datasets(args.datasets_file)
     all_ref, all_pipeline, all_rows = [], [], []
+    all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
     total_unmatched, total_excess = 0, 0
 
     for dataset in datasets:
         run_dir = run_dir_for_dataset(dataset)
         alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
-        ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows = _dataset_despot_vs_ref(
+        (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
+         unmatched_ref_rows, excess_pipeline_rows) = _dataset_despot_vs_ref(
             dataset, args, run_dir, alive_rows=alive_rows
         )
         all_ref.extend(ref_vals)
@@ -1342,11 +1504,31 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
             row_out = dict(row)
             row_out['dataset'] = dataset
             all_rows.append(row_out)
+        for row in unmatched_ref_rows:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_unmatched_ref_rows.append(row_out)
+        for row in excess_pipeline_rows:
+            row_out = dict(row)
+            row_out['dataset'] = dataset
+            all_excess_pipeline_rows.append(row_out)
         print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
               f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
 
     graphs_dir = Path(args.graphs_dir)
     graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    out_stem = Path(out_name).stem
+    if all_unmatched_ref_rows:
+        unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
+            ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized', 'reason']
+        ]
+        write_plot_csv(graphs_dir, f'{out_stem}_unmatched_ref.png', unmatched_df)
+    if all_excess_pipeline_rows:
+        excess_df = pd.DataFrame(all_excess_pipeline_rows)[
+            ['dataset', 'pipeline_chain', 'cluster_rep_index', 'placer_file', 'index']
+        ]
+        write_plot_csv(graphs_dir, f'{out_stem}_excess_pipeline.png', excess_df)
 
     if not all_ref:
         print(f'  No matched ligand(s) found for any dataset; skipping {out_name}.')
@@ -1383,11 +1565,11 @@ def _dataset_rscc_despot_tradeoff(dataset, args, run_dir, alive_rows, cluster_cs
     pipeline_chain, ref_rscc, pipeline_rscc, ref_despot_normalized, pipeline_despot_normalized,
     rscc_delta (= pipeline_rscc - ref_rscc), despot_delta (= ref_despot_normalized -
     pipeline_despot_normalized)."""
-    _, _, _, _, rscc_rows = _dataset_lig_vs_ref(
+    _, _, _, _, rscc_rows, _, _ = _dataset_lig_vs_ref(
         dataset, args, run_dir, alive_rows=alive_rows,
         cluster_csv_override=cluster_csv_override, rscc_column='despot_rscc',
     )
-    _, _, _, _, despot_rows = _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=alive_rows)
+    _, _, _, _, despot_rows, _, _ = _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=alive_rows)
 
     rscc_by_key = {(r['ref_chain'], r['ref_resi'], r['ref_altloc']): r for r in rscc_rows}
     joined = []

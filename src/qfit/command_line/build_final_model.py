@@ -332,13 +332,19 @@ class FinalModelBuilder():
 
     def _get_atom_records(self, model):
         """Returns a list of (chain_id, res_num, resname, xyz) for every atom in
-        a Structure model, read directly from its iotbx hierarchy."""
+        a Structure model, read directly from its iotbx hierarchy.
+
+        resname is read from the residue_group's first atom_group rather than
+        via only_atom_group() (which asserts there is exactly one) - a
+        residue with 2+ altlocs (e.g. a crystallographically ambiguous ASN/
+        GLN/HIS flip) has one atom_group per altloc, all with the same
+        resname, so any of them gives the same answer."""
         records = []
         for chain in model._pdb_hierarchy.only_model().chains():
             chain_id = chain.id.strip()
             for residue in chain.residue_groups():
                 res_num = int(residue.resseq)
-                resname = residue.only_atom_group().resname.strip()
+                resname = residue.atom_groups()[0].resname.strip()
                 for atom_group in residue.atom_groups():
                     for atom in atom_group.atoms():
                         records.append((chain_id, res_num, resname, np.array(atom.xyz)))
@@ -366,6 +372,43 @@ class FinalModelBuilder():
             return None, None
         return residue.coor, residue
 
+    def _collapse_apo_template_altloc(self, residue):
+        """If `residue` (an apo-extracted template) has 2+ distinct non-blank
+        altlocs, returns a copy keeping only the highest-occupancy one (plus
+        any blank-altloc atoms, which are shared across altlocs - e.g. a
+        residue whose backbone is unsplit but whose sidechain is modeled as
+        altloc A/B). No-op (returns `residue` unchanged) if it has at most
+        one altloc.
+
+        Why this exists: PLACER always generates a single conformation per
+        residue (confirmed empirically - never altloc-split, even when its
+        own input template residue is), so a multi-altloc apo template has
+        more atoms than every PLACER conformer of that residue ever will.
+        Only called on residues that actually have a PLACER conformer to be
+        scored against (see _gatherResidueConformers) - a residue with no
+        PLACER conformer never reaches the atom-count-sensitive scoring code
+        (_scoreResidueConformers), so its apo template is left exactly as-is
+        there, altlocs included.
+        """
+        altlocs = residue.altloc
+        non_blank = sorted(set(a for a in altlocs if a))
+        if len(non_blank) <= 1:
+            return residue
+
+        occupancies = residue.q
+        best_altloc = max(non_blank, key=lambda a: np.mean(occupancies[altlocs == a]))
+        # A boolean-array extract() on an already-extracted Structure (residue is itself
+        # apo_model.extract(...)'s result) corrupts residue-group identity - e.g. .resi
+        # silently becomes a bogus small integer instead of the real residue number,
+        # which then drops the residue entirely once _buildFinalModel tries to place it
+        # by (chain_id, res_num) (confirmed empirically). Two string-based selections
+        # (each its own top-level select()) plus combine() - the same pattern
+        # calc_rscc.py's _extract_residue already uses for altloc extraction - preserves
+        # it correctly.
+        alt_structure = residue.extract("altloc", best_altloc, "==")
+        blank_structure = residue.extract("altloc", "", "==")
+        return alt_structure.combine(blank_structure)
+
     def _gatherResidueConformers(self, placer_files):
         """For every residue in self.all_residues, gathers every
         conformation of that residue found across every model of every input
@@ -374,14 +417,18 @@ class FinalModelBuilder():
 
         Returns:
           residue_templates  : {(chain_id, res_num): Structure} - the apo
-                                structure's own copy of that residue. The apo
-                                structure is guaranteed to have every residue
-                                in self.all_residues (that's where it was
-                                enumerated from), and its atom identity/count
-                                will always match every PLACER conformer, so
-                                it's used as the single canonical template for
-                                scoring, clash-checking, and building the
-                                final model.
+                                structure's own copy of that residue, with
+                                its altlocs collapsed to a single one (see
+                                _collapse_apo_template_altloc) for any
+                                residue that has at least one gathered PLACER
+                                conformer - guaranteeing the template's atom
+                                count matches every one of that residue's
+                                PLACER conformers, since PLACER never
+                                generates a multi-altloc residue itself. A
+                                residue with zero PLACER conformers keeps its
+                                apo template untouched (altlocs included) -
+                                it's never atom-count-compared against
+                                anything (see _scoreAndSelectBest).
           residue_conformers : {(chain_id, res_num): [(coor, placer_file, model_idx), ...]}
         """
         residue_conformers = {}
@@ -411,6 +458,18 @@ class FinalModelBuilder():
                     residue_conformers[(chain_id, res_num)].append(
                         (residue.coor, placer_file, model_idx)
                     )
+
+        collapsed = []
+        for key, conformers in residue_conformers.items():
+            template = residue_templates[key]
+            if conformers and template is not None and len(set(a for a in template.altloc if a)) > 1:
+                residue_templates[key] = self._collapse_apo_template_altloc(template)
+                collapsed.append(f'{key[0]}{key[1]}')
+        if collapsed:
+            print(f'FLAG: {len(collapsed)} scored residue(s) had a multi-altloc apo template '
+                  f'collapsed to their higher-occupancy conformer before scoring (PLACER never '
+                  f'generates a multi-altloc residue, so the template must match): '
+                  f'{", ".join(collapsed)}')
 
         return residue_templates, residue_conformers
 

@@ -31,7 +31,7 @@ def main():
 
     plot_lig_vs_ref(
         args, run_dir_for_dataset,
-        title=f'Ligand RSCC vs Reference ({args.run_name}/{args.placer_run_name}/{args.filter_run_name})',
+        title='Ligand RSCC vs Reference, Filter 1',
         out_name='lig_vs_reference_rscc.png',
     )
 

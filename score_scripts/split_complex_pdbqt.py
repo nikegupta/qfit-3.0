@@ -65,7 +65,7 @@ def main():
     n_instances = 0
     for (chain, resi), lines_altlocs in sorted(ligand_lines_by_key.items()):
         non_blank_altlocs = sorted({a for _, a in lines_altlocs if a != ''})
-        instance_altlocs = non_blank_altlocs if len(non_blank_altlocs) >= 2 else ['']
+        instance_altlocs = non_blank_altlocs if non_blank_altlocs else ['']
 
         for altloc in instance_altlocs:
             if altloc:

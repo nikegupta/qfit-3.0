@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
-Loads a ligand pdb (which may contain more than one copy/instance of the same ligand, e.g.
-multiple binding sites - each is matched against the SMILES independently, split by its
-original chain id + residue number, not by proximity/connectivity) and its correct
-connectivity/bond orders from a SMILES string, matches the SMILES template onto each
-instance's structure (by heavy-atom topology, via rdkit's AssignBondOrdersFromTemplate), and
-writes out an sdf - one entry per instance, named 'lig<chain><resnum>' (e.g. 'ligC1') - with
+Loads one or more ligand pdbs and the ligand's correct connectivity/bond orders from a SMILES
+string, matches the SMILES template onto each instance's structure (by heavy-atom topology, via
+rdkit's AssignBondOrdersFromTemplate), and writes out an sdf - one entry per instance - with
 each instance's original 3D coordinates but the SMILES's bond orders. Hydrogens are ignored
-throughout: the pdb is read with its hydrogens stripped, so both the template (from SMILES)
-and each structure (from pdb) are heavy-atom-only, and the output sdf has no hydrogens either.
+throughout: the pdb is read with its hydrogens stripped, so both the template (from SMILES) and
+each structure (from pdb) are heavy-atom-only, and the output sdf has no hydrogens either.
+
+Each input file may hold either a single already-split ligand instance (e.g.
+symmetry_expand.py's ligand_output_dir - one pdb per (chain, resi[, altloc]) instance, already
+split apart there so a genuinely disordered instance never shares a file with its other altloc
+conformer) or several combined together in one flat file, split apart here by (chain id,
+residue number, insertion code) instead (e.g. extract_ligand_conformers.py's pooled ligs.pdb -
+one instance per (chain, resnum), no MODEL records; restores a splitting step this script used
+to do unconditionally on a single combined file, before every caller was expected to pre-split -
+see git history). A file containing exactly one instance names it after the file's own basename
+(e.g. 'ligC1.pdb' -> 'ligC1'); a file containing more than one names each
+'lig<chain><resnum><icode>' (e.g. 'ligL1', 'ligL2', ... - matching extract_ligand_conformers.py's
+documented naming).
 
 AssignBondOrdersFromTemplate only relabels the *order* of bonds that rdkit's own
 MolFromPDBBlock already decided exist - it never adds or removes a bond. MolFromPDBBlock's own
@@ -36,25 +45,27 @@ _chem_comp_bond table (stereospecific, no template-matching needed at all), rath
 template.
 
 Usage:
-  assign_bond_orders.py <ligand_pdb> <smiles> <output_sdf>
+  assign_bond_orders.py <ligand_pdb>... <smiles> <output_sdf>
 """
+import argparse
 import sys
 from collections import OrderedDict
+from pathlib import Path
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
 
-def read_residue_blocks(pdb_path):
-    """
-    Splits a pdb's ATOM/HETATM records by their original (chain id, residue number, icode),
-    so that separate ligand instances are always kept apart regardless of how close together
-    they are in space (unlike relying on rdkit's post-parse connectivity/fragment splitting,
-    which is proximity-based and could bridge two nearby instances into one fragment).
+def read_ligand_instances(pdb_path):
+    """Splits pdb_path's ATOM/HETATM records by their (chain id, residue number, insertion
+    code), since one input file may hold either a single already-split ligand instance or
+    several combined together in one flat file - see this module's docstring.
 
-    Returns an OrderedDict of {(chain_id, resnum, icode): [pdb lines...]}, in first-appearance
-    order.
-    """
+    Returns [(name, lines), ...] in first-appearance order. A file containing exactly one
+    instance is named after the file's own basename (matching every existing single-instance
+    caller's naming, e.g. symmetry_expand's 'ligA103.pdb' -> 'ligA103'); a file containing more
+    than one names each 'lig<chain><resnum><icode>' (matching extract_ligand_conformers.py's
+    documented naming for its pooled ligs.pdb)."""
     residues = OrderedDict()
     with open(pdb_path) as f:
         for line in f:
@@ -62,9 +73,16 @@ def read_residue_blocks(pdb_path):
                 chain_id = line[21].strip()
                 resnum = line[22:26].strip()
                 icode = line[26].strip()
-                key = (chain_id, resnum, icode)
-                residues.setdefault(key, []).append(line)
-    return residues
+                residues.setdefault((chain_id, resnum, icode), []).append(line)
+
+    if not residues:
+        return []
+    if len(residues) == 1:
+        return [(pdb_path.stem, next(iter(residues.values())))]
+    return [
+        (f'lig{chain_id}{resnum}{icode}', lines)
+        for (chain_id, resnum, icode), lines in residues.items()
+    ]
 
 
 def assign_from_geometry(lines, name, template):
@@ -126,27 +144,40 @@ def assign_from_sibling(donor_mol, donor_name, lines, name):
     return new_mol
 
 
+def build_argparser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('ligand_pdb', nargs='+', type=Path,
+                    help='One or more single-instance ligand pdb files (e.g. '
+                         'symmetry_expand.py\'s ligand_output_dir/lig*.pdb).')
+    p.add_argument('smiles', help='SMILES for the ligand, used as the bond-order template.')
+    p.add_argument('output_sdf', help='Path to write the combined multi-instance sdf to.')
+    return p
+
+
 def main():
-    if len(sys.argv) != 4:
-        sys.exit(f'Usage: {sys.argv[0]} <ligand_pdb> <smiles> <output_sdf>')
-    ligand_pdb, smiles, output_sdf = sys.argv[1:4]
+    args = build_argparser().parse_args()
 
-    template = Chem.MolFromSmiles(smiles)
+    template = Chem.MolFromSmiles(args.smiles)
     if template is None:
-        sys.exit(f'Could not parse SMILES: {smiles!r}')
+        sys.exit(f'Could not parse SMILES: {args.smiles!r}')
 
-    residue_blocks = read_residue_blocks(ligand_pdb)
-    if not residue_blocks:
-        sys.exit(f'No ATOM/HETATM records found in {ligand_pdb}')
+    instances = []
+    for ligand_pdb in args.ligand_pdb:
+        file_instances = read_ligand_instances(ligand_pdb)
+        if not file_instances:
+            print(f'Warning: no ATOM/HETATM records found in {ligand_pdb}; skipping.')
+            continue
+        instances.extend(file_instances)
+    if not instances:
+        sys.exit(f'No ATOM/HETATM records found in any of {[str(p) for p in args.ligand_pdb]}')
 
-    writer = Chem.SDWriter(output_sdf)
+    writer = Chem.SDWriter(args.output_sdf)
     n_written = 0
     n_recovered = 0
     donor_mol, donor_name = None, None
     failed = []
 
-    for (chain_id, resnum, icode), lines in residue_blocks.items():
-        name = f'lig{chain_id}{resnum}{icode}'
+    for name, lines in instances:
         mol = assign_from_geometry(lines, name, template)
         if mol is None:
             failed.append((name, lines))
@@ -170,8 +201,8 @@ def main():
     writer.close()
 
     if n_written == 0:
-        sys.exit(f'No ligand instance in {ligand_pdb} could be matched against the SMILES.')
-    msg = f'Wrote {n_written} ligand instance(s) to {output_sdf}'
+        sys.exit(f'No ligand instance could be matched against the SMILES.')
+    msg = f'Wrote {n_written} ligand instance(s) to {args.output_sdf}'
     if n_recovered:
         msg += f' ({n_recovered} via sibling-topology fallback)'
     print(msg)

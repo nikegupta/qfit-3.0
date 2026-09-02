@@ -1,5 +1,5 @@
 import argparse
-import glob
+import re
 from pathlib import Path
 import time
 import numpy as np
@@ -14,20 +14,20 @@ from qfit.samplers import ChiRotator, CBAngleRotator, BisectingAngleRotator
 def _get_coordinate_rmsd(reference_coordinates, new_coordinate_set, atom_names=None):
     reference_coordinates = np.array(reference_coordinates)
     new_coordinate_set = np.array(new_coordinate_set)
-    
+
     # Build mask to exclude backbone atoms
     backbone_atoms = {"N", "CA", "C", "O"}
     if atom_names is not None:
         sidechain_mask = np.array([name not in backbone_atoms for name in atom_names])
     else:
         sidechain_mask = np.ones(reference_coordinates.shape[0], dtype=bool)
-    
+
     ref_sc = reference_coordinates[sidechain_mask]
     new_sc = new_coordinate_set[:, sidechain_mask, :]
-    
+
     delta = new_sc - ref_sc
     rmsds = np.sqrt(np.square(delta).sum(axis=2).sum(axis=1))
-    
+
     if atom_names is not None:
         atom_names = list(atom_names)
         sc_names = [name for name in atom_names if name not in backbone_atoms]
@@ -44,10 +44,23 @@ def _get_coordinate_rmsd(reference_coordinates, new_coordinate_set, atom_names=N
             delta_flipped = flipped - ref_sc
             rmsds_flipped = np.sqrt(np.square(delta_flipped).sum(axis=2).sum(axis=1))
             rmsds = np.minimum(rmsds, rmsds_flipped)
-    
+
     return min(rmsds)
 
 DEFAULT_RMSD_CUTOFF = 0.2
+
+# Matches the BDC value embedded in an event map filename, e.g.
+# 'x00407-1-event_1_1-BDC_0.08_map.native.ccp4' -> '0.08'. Same convention as calc_rscc.py.
+BDC_PATTERN = re.compile(r'1-BDC_([\d.]+)_')
+
+
+def parse_bdc(map_filename):
+    """Extracts the BDC value (as a string, so '0.080' and '0.08' aren't silently treated as
+    equal) from an event map filename. Returns None if the filename doesn't match the expected
+    '1-BDC_<value>_' pattern."""
+    m = BDC_PATTERN.search(str(map_filename))
+    return m.group(1) if m else None
+
 
 def build_argparser():
     p = argparse.ArgumentParser()
@@ -58,12 +71,8 @@ def build_argparser():
     p.add_argument(
         'model_file',
         type=str,
-        help='Path to the model file'
-    )
-    p.add_argument(
-        'ligandfit_file',
-        type=str,
-        help='Path to a ligandift file, doesnt matter which one',
+        help='Path to the single-model structure to optimize (e.g. final_model.pdb). '
+             'residues_with_placer_conformers.csv is expected alongside it in the same folder.'
     )
     p.add_argument(
         'output_folder',
@@ -79,12 +88,6 @@ def build_argparser():
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
     return p
-
-class Uninitialized:
-    def __str__(self):
-        raise RuntimeError("Variable has not been initialized!")
-    def __repr__(self):
-        raise RuntimeError("Variable has not been initialized!")
 
 class QFitOptions: #copypasted from qfit.py
     def __init__(self):
@@ -118,10 +121,9 @@ class QFitOptions: #copypasted from qfit.py
         self.remove_conformers_below_cutoff = False
 
 class Rotamer_Optimizer():
-    def __init__(self, dataset_dir, model_file, ligandfit_file, output_folder, resolution):
+    def __init__(self, dataset_dir, model_file, output_folder, resolution):
         self.dir = dataset_dir
         self.model_file = model_file
-        self.ligandfit_file = ligandfit_file
         self.output_path = f"{dataset_dir}/{output_folder}"
         os.makedirs(self.output_path,exist_ok=True)
         self.resolution = resolution
@@ -129,24 +131,37 @@ class Rotamer_Optimizer():
         self._load_event_maps()
         self._rmask = 0.5 + self.resolution / 3.0 #from qfit
 
-        self.base_structure = Structure.fromfile(self.ligandfit_file)
+        self.base_structure = Structure.fromfile(self.model_file)
         self.base_structure = self.base_structure.extract("e", "H", "!=")
-        rename = self.base_structure.extract("name", "OXT", "==")
-        rename.name = "O"
-        self.base_structure = self.base_structure.extract("name", "OXT", "!=").combine(rename)
 
-        self.trim = 100
-        self.accept = 1
+        self.trim = 10
 
-        self.rscc_cutoff = 0.4
+        # Residues scoring below this against the event maps are candidates for optimization;
+        # residues already at/above it are left untouched.
+        self.rscc_threshold = 0.5
+        # An optimized conformer is only accepted if it improves RSCC over the starting
+        # conformer by at least this much.
+        self.rscc_improvement_threshold = 0.1
 
     def _load_event_maps(self):
+        """Loads every event map for this dataset. Maps sharing the same 1-BDC value are
+        identical (same partial-occupancy background subtraction), so only the first one seen
+        for a given BDC is loaded; later ones with the same BDC are skipped (see calc_rscc.py,
+        same convention)."""
         self.event_maps = {}
         self.event_maps_models = {}
         event_map_files = sorted(self.dir.glob('*-event_*_*-BDC_*_map.native.ccp4'))
+        seen_bdcs = set()
         for event_file in event_map_files:
-            # Use full filename as key
-            event_name = str(event_file).split('/')[-1]  # e.g., "x01325-1-event_1_1-BDC_0.3_map.native.ccp4"
+            event_name = event_file.name
+            bdc = parse_bdc(event_name)
+            if bdc is not None:
+                if bdc in seen_bdcs:
+                    print(f'Skipping map {event_file}: duplicate BDC={bdc} '
+                          f'(another event map with this BDC was already loaded).')
+                    continue
+                seen_bdcs.add(bdc)
+
             self.event_maps[event_name] = XMap.fromfile(str(event_file), resolution=self.resolution)
 
             # make copies for density steps
@@ -154,108 +169,105 @@ class Rotamer_Optimizer():
             event_map_model.set_space_group("P1")
             self.event_maps_models[event_name] = event_map_model
 
+    def _load_binding_site_residues(self):
+        """Reads the pipeline-computed list of binding-site residues (those with Placer
+        conformers) from residues_with_placer_conformers.csv, expected alongside model_file.
+        Each line is a residue label like 'A143' (chain id + residue number)."""
+        residues_csv = Path(self.model_file).parent / "residues_with_placer_conformers.csv"
+        residues = []
+        with open(residues_csv) as f:
+            for line in f:
+                label = line.strip()
+                if not label:
+                    continue
+                m = re.match(r'^([A-Za-z]+)(\d+)$', label)
+                if not m:
+                    print(f"Warning: could not parse residue label {label!r} in {residues_csv}; skipping.")
+                    continue
+                residues.append((m.group(1), int(m.group(2))))
+        return residues
+
     def run(self):
-        models = Structure.fromfile(self.model_file).split_models()
-        self.bs_residues = self._determineBindingSite(models)
-        print(self.__dict__)
-        # rsccs_all_events = {}
-        rsccs = {}
-        base_rsccs = {}
+        residues = self._load_binding_site_residues()
+        print(f'{len(residues)} binding-site residue(s) to check')
 
-        residue_coor_sets = {}
-        base_coor_sets = {}
-        for chain_id in self.bs_residues:
-            for resnum in self.bs_residues[chain_id]:
-                current_residue = Uninitialized()
-                from_model = np.nan
-                retrieved_flag = False
+        accepted_coords = {}
+        improved_coords = {}
+        all_rows = []
+        num_improved = 0
 
-                for i,model in enumerate(models):
-                    if not retrieved_flag:
-                        try:
-                            chain = model[chain_id]
-                            current_residue = chain.conformers[0][resnum]
-                            # print(f'retrieved residue {chain_id},{resnum} from model {i}: {current_residue}')
-                            retrieved_flag = True
-                            from_model = i
-                        except:
-                            pass
-                            # print(f'couldnt get residue {chain_id},{resnum} from model {i}, trying model {i+1}')
+        for chain_id, resi in residues:
+            resi_selstr = f"chain {chain_id} and resi {resi}"
+            structure_new = self.base_structure.copy()
+            structure_resi = structure_new.extract(resi_selstr)
+            try:
+                chain = structure_resi[chain_id]
+                current_residue = chain.conformers[0][resi]
+            except Exception:
+                print(f'Warning: could not retrieve residue {chain_id}{resi} from {self.model_file}; skipping.')
+                continue
 
-                time0 = time.time()
+            if current_residue.type != 'rotamer-residue':
+                continue
 
-                #make copy of residue
-                if current_residue.type == 'rotamer-residue':
-                    (chainid, resi, icode) = current_residue.identifier_tuple
-                    resi_selstr = f"chain {chainid} and resi {resi}"
-                    if icode:
-                        resi_selstr += f" and icode {icode}"
-                    structure_new = models[from_model].copy()
-                    structure_resi = structure_new.extract(resi_selstr)
-                    chain = structure_resi[chainid]
-                    conformer = chain.conformers[0]
-                    self.current_residue = conformer[current_residue.id]
+            time0 = time.time()
+            self.current_residue = current_residue
 
-                    #get rscc/coors for base residue
-                    self._coor_set = [self.current_residue.coor]
-                    base_rsccs.update({(chainid,resi): self._calc_rscc_all_events()})
-                    base_coor_sets.update({(chain_id,resi): self._coor_set})
+            #get rscc/coors for starting conformer
+            self._coor_set = [self.current_residue.coor]
+            base_rscc = self._calc_rscc_all_events()
+            print(f'{chain_id}{resi}: base_rscc={base_rscc:.3f}')
 
-                    #sample ca-b-y for aromatics
-                    self._sample_angle()
+            if base_rscc >= self.rscc_threshold:
+                all_rows.append((chain_id, resi, base_rscc, None, False))
+                continue
 
-                    #sample sidechains chi
-                    self._sample_sidechains()
-                    
-                    #score sidecains to top 1
-                    self._convert_and_score_rotamer(self.accept)
-                    residue_coor_sets.update({(chain_id,resi): self._coor_set})
-                    print(f'residue scored in {time.time() - time0}')
+            #sample ca-b-y for aromatics
+            self._sample_angle()
 
-                    #get rscc for top residue
-                    rsccs.update({(chainid,resi): self._calc_rscc_all_events()})
+            #sample sidechains chi
+            self._sample_sidechains()
 
-                    #legacy code for different evaluations
-                    # rsccs = self._calc_rscc_all_events()
-                    # rsccs_all_events.update({(chainid, resi): rsccs})
-                    # self._write_multimodel_pdb_residue(self.current_residue, self._coor_set, self.output_path + '/test.pdb')
+            #score sidechains to top 1
+            self._convert_and_score_rotamer(1)
+            optimized_rscc = self._calc_rscc_all_events()
 
-        for model in models:
-            self._update_coords(model, residue_coor_sets, base_coor_sets, rsccs)
+            print(f'{chain_id}{resi}: base_rscc={base_rscc:.3f} optimized_rscc={optimized_rscc:.3f} '
+                  f'({time.time() - time0:.1f}s)')
 
+            accepted = optimized_rscc - base_rscc >= self.rscc_improvement_threshold
+            if accepted:
+                accepted_coords[(chain_id, resi)] = self._coor_set[0]
+                num_improved += 1
+            if optimized_rscc > base_rscc:
+                improved_coords[(chain_id, resi)] = self._coor_set[0]
+            all_rows.append((chain_id, resi, base_rscc, optimized_rscc, accepted))
+
+        # fitted.pdb carries every residue whose resampled conformer improved RSCC at all, even
+        # if it didn't clear the acceptance threshold - copy the untouched structure before
+        # applying accepted_coords below (accepted_coords is a subset of improved_coords).
+        fitted_structure = self.base_structure.copy()
+        self._update_coords(fitted_structure, improved_coords)
+        fitted_output = self.output_path + '/fitted.pdb'
+        self._write_pdb(fitted_structure, fitted_output)
+
+        # rotamer_optimized.pdb only carries residues that cleared the acceptance threshold
+        self._update_coords(self.base_structure, accepted_coords)
         output = self.output_path + '/rotamer_optimized.pdb'
-        self._write_multimodel_pdb(models, output)
+        self._write_pdb(self.base_structure, output)
 
-        rscc_output = self.output_path + '/rscc.csv'
-        with open(rscc_output,'w+') as f:
-            f.write('residue,optimized_rscc,base_rscc,optmized?')
-            f.write('\n')
-            for residue_tuple in list(rsccs.keys()):
-                f.write(f'{residue_tuple[0]}{residue_tuple[1]},')
-                f.write(f'{rsccs[residue_tuple]},')
-                f.write(f'{base_rsccs[residue_tuple]},')
-                if rsccs[residue_tuple] >= self.rscc_cutoff:
-                    f.write('yes')
-                else:
-                    f.write('no')
-                f.write('\n')
+        residue_rscc_output = self.output_path + '/residue_rscc.csv'
+        with open(residue_rscc_output, 'w+') as f:
+            f.write('residue,initial_rscc,improved_rscc,accepted\n')
+            for chain_id, resi, base_rscc, optimized_rscc, accepted in all_rows:
+                improved_rscc_str = f'{optimized_rscc}' if optimized_rscc is not None else 'NA'
+                f.write(f'{chain_id}{resi},{base_rscc},{improved_rscc_str},{"yes" if accepted else "no"}\n')
+        print(f'{num_improved}/{len(all_rows)} residue(s) improved; written to {residue_rscc_output}')
 
-        # rscc_output = self.output_path + '/rscc.csv'
-        # with open(rscc_output,'w+') as f:
-        #     f.write('residue,rsccs')
-        #     f.write('\n')
-        #     for residue_tuple in list(rsccs_all_events.keys()):
-        #         f.write(f'{residue_tuple[0]}{residue_tuple[1]},')
-        #         for rscc in rsccs_all_events[residue_tuple]:
-        #             f.write(f'{rscc}_')
-        #         f.write('\n')
-
-
-    
-    def _update_coords(self, model, residue_coor_sets, base_coor_sets, rsccs):
-        new_coor = model.coor.copy()
+    def _update_coords(self, structure, coords_by_residue):
+        new_coor = structure.coor.copy()
         atom_index = 0
-        for chain in model._pdb_hierarchy.only_model().chains():
+        for chain in structure._pdb_hierarchy.only_model().chains():
             chain_id = chain.id.strip()
             for residue_group in chain.residue_groups():
                 resi = int(residue_group.resseq)
@@ -263,34 +275,16 @@ class Rotamer_Optimizer():
                     len(atom_group.atoms()) for atom_group in residue_group.atom_groups()
                 )
                 key = (chain_id, resi)
-                if key in residue_coor_sets:
-                    rscc = rsccs.get(key, 0)
-                    if rscc >= self.rscc_cutoff:
-                        new_coor[atom_index: atom_index + n_atoms] = residue_coor_sets[key][0]
-                    elif key in base_coor_sets:
-                        new_coor[atom_index: atom_index + n_atoms] = base_coor_sets[key][0]
+                if key in coords_by_residue:
+                    new_coor[atom_index: atom_index + n_atoms] = coords_by_residue[key]
                 atom_index += n_atoms
-        model.coor = new_coor
+        structure.coor = new_coor
 
-    def _write_multimodel_pdb(self, models, output_path):
+    def _write_pdb(self, structure, output_path):
         with open(output_path, 'w') as out:
-            for i, model in enumerate(models, start=1):
-                out.write(f"MODEL     {i:4d}\n")
-                for atom in model.get_selected_atoms():
-                    atom_labels = atom.fetch_labels()
-                    out.write("{}\n".format(atom_labels.format_atom_record_group()))
-                out.write("ENDMDL\n")
-            out.write("END\n")  
-
-    def _write_multimodel_pdb_residue(self, residue, coor_set, output_path):
-        with open(output_path, 'w') as out:
-            for i, coor in enumerate(coor_set, start=1):
-                residue.coor = coor
-                out.write(f"MODEL     {i:4d}\n")
-                for atom in residue.get_selected_atoms():
-                    atom_labels = atom.fetch_labels()
-                    out.write("{}\n".format(atom_labels.format_atom_record_group()))
-                out.write("ENDMDL\n")
+            for atom in structure.get_selected_atoms():
+                atom_labels = atom.fetch_labels()
+                out.write("{}\n".format(atom_labels.format_atom_record_group()))
             out.write("END\n")
 
     #this function is an editted version of the code from QfitRotamer
@@ -382,16 +376,16 @@ class Rotamer_Optimizer():
             if dchi_max > delta_chi > self.options.rotamer_neighborhood + 1e-6:
                 return False
         return True
-    
+
     def _convert_and_score_rotamer(self, n):
         first_event_map_name = list(self.event_maps.keys())[0] #only use the 1st event map right now, could change
         scaled_bulk_solvent = 0 #from qfit, maybe should be different
 
         (chainid, resi, icode) = self.current_residue.identifier_tuple
-        
+
         #get residue from base structure
         residue = self.base_structure.extract(f"chain {chainid} and resi {resi}")
-        
+
         #make bfactor array
         default_bfactor = 20
         bfactor_array = []
@@ -400,7 +394,7 @@ class Rotamer_Optimizer():
 
         #initialize transformer
         transformer = get_transformer("qfit", residue, self.event_maps_models[first_event_map_name])
-        
+
         #convert and score this set of rotamers
         scores = []
         rsccs = []
@@ -411,7 +405,7 @@ class Rotamer_Optimizer():
             np.maximum(model, scaled_bulk_solvent, out=model)
             mse = np.mean((model - target) ** 2)
             scores.append(mse)
-            
+
             correlation_matrix = np.corrcoef(model, target)
             rscc = correlation_matrix[0, 1]
             rsccs.append(rscc)
@@ -425,13 +419,13 @@ class Rotamer_Optimizer():
     def _calc_rscc_all_events(self):
         scaled_bulk_solvent = 0 #from qfit, maybe should be different
         rsccs = []
-        for event_map_name in list(self.event_maps.keys()): 
+        for event_map_name in list(self.event_maps.keys()):
 
             (chainid, resi, icode) = self.current_residue.identifier_tuple
-            
+
             #get residue from base structure
             residue = self.base_structure.extract(f"chain {chainid} and resi {resi}")
-            
+
             #make bfactor array
             default_bfactor = 20
             bfactor_array = []
@@ -440,13 +434,13 @@ class Rotamer_Optimizer():
 
             #initialize transformer
             transformer = get_transformer("qfit", residue, self.event_maps_models[event_map_name])
-            
+
             #convert and score this set of rotamers
             mask = transformer.get_conformers_mask(self._coor_set, self._rmask)
             target = self.event_maps[event_map_name].array[mask]
             for density in transformer.get_conformers_densities(self._coor_set, bfactor_array):
-                model = density[mask]         
-                np.maximum(model, scaled_bulk_solvent, out=model)  
+                model = density[mask]
+                np.maximum(model, scaled_bulk_solvent, out=model)
                 correlation_matrix = np.corrcoef(model, target)
                 rscc = correlation_matrix[0, 1]
                 rsccs.append(rscc)
@@ -454,34 +448,10 @@ class Rotamer_Optimizer():
         top_rscc = max(rsccs)
 
         return top_rscc
-        # return rsccs
 
-    def _determineBindingSite(self, models):
-        """Determines where binding site is.
-        Binding Site includes all residues in any of the Placer models
-        and the ligand.
-        """
-
-        residues_in_binding_site = {}
-
-        for model in models:
-            for chain in model._pdb_hierarchy.only_model().chains():
-                chain_id = chain.id.strip()
-
-                if chain_id not in residues_in_binding_site:
-                    residues_in_binding_site.update({chain_id: []})
-
-                for residue in chain.residue_groups():
-                    res_num = int(residue.resseq)
-                    if res_num not in residues_in_binding_site[chain_id]:
-                        residues_in_binding_site[chain_id].append(res_num)
-
-
-        return residues_in_binding_site
-    
 def main():
     args = build_argparser().parse_args()
-    ro = Rotamer_Optimizer(args.dataset, args.model_file, args.ligandfit_file, args.output_folder, args.resolution)
+    ro = Rotamer_Optimizer(args.dataset, args.model_file, args.output_folder, args.resolution)
     ro.run()
 
 if __name__ == '__main__':
