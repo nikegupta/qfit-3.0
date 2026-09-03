@@ -1,0 +1,87 @@
+--strip: removed 274 atom(s) (ligand hydrogens + HOH waters + DMS residues); 4779 atom(s) remain.
+Found 0 protein symmetry mate(s) within 10.0 Å of the ligand(s) in /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/x00407-1-pandda-model.pdb.
+Wrote 4764 protein atom(s) (4764 original + 0 from symmetry mates) to /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.pdb.
+Wrote 15 ligand atom(s) to /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs/ligA701.pdb.
+1 ligand instance(s) written to /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs.
+[x00407-1] symmetry_expand took 00:00:05 (HH:MM:SS)
+Assigning bond orders from SMILES: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs/ligA701.pdb -> /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs.sdf
+Wrote 1 ligand instance(s) to /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs.sdf
+Converting to mol2: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs.sdf -> /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs.mol2
+1 molecule converted
+Done: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/ligs.mol2
+Protonating/assigning charges: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.pdb -> /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.pqr
+ERROR:Error parsing line: invalid literal for int() with base 10: ''
+ERROR:<CRYST1   84.839   88.862  105.343  90.00  90.00  90.00 P 21 21 21>
+ERROR:Truncating remaining errors for record type:CRYST1
+WARNING:Warning: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.pdb is a non-standard PDB file.
+
+ERROR:['CRYST1']
+WARNING:Gap in backbone detected between GLY A 176 and SER A 192!
+WARNING:Gap in backbone detected between THR A 432 and SER A 682!
+WARNING:Gap in backbone detected between VAL B 177 and SER B 192!
+WARNING:Gap in backbone detected between ILE B 431 and SER B 682!
+WARNING:Missing atom OXT in residue GLU A 696
+WARNING:Missing atom OXT in residue SER B 698
+WARNING:Missing atom OXT in residue GLU A 696
+WARNING:Missing atom OXT in residue SER B 698
+WARNING:Missing atom OXT in residue GLU A 696
+WARNING:Missing atom OXT in residue SER B 698
+WARNING:Missing atoms or failed protonation for SER 192 A (BBN) -- please check the structure
+WARNING:Group (BBN) for   293-   N   192-SER (A) [ -38.641    0.590    1.286] N
+WARNING:Expected 2 interaction atoms for acids, found:
+WARNING:                 0-  H1   192-SER (A) [ -38.582    0.551    2.294] H
+WARNING:                 0-  H2   192-SER (A) [ -39.509    0.172    0.983] H
+WARNING:               293-   N   192-SER (A) [ -38.641    0.590    1.286] N
+WARNING:Expected 2 interaction atoms for bases, found:
+WARNING:                 0-  H1   192-SER (A) [ -38.582    0.551    2.294] H
+WARNING:                 0-  H2   192-SER (A) [ -39.509    0.172    0.983] H
+WARNING:               293-   N   192-SER (A) [ -38.641    0.590    1.286] N
+WARNING:Missing atoms or failed protonation for SER 682 A (BBN) -- please check the structure
+WARNING:Group (BBN) for  2247-   N   682-SER (A) [ -50.142   31.700  -14.307] N
+WARNING:Expected 2 interaction atoms for acids, found:
+WARNING:                 0-  H1   682-SER (A) [ -50.451   32.398  -13.645] H
+WARNING:                 0-  H2   682-SER (A) [ -50.920   31.419  -14.887] H
+WARNING:              2247-   N   682-SER (A) [ -50.142   31.700  -14.307] N
+WARNING:Expected 2 interaction atoms for bases, found:
+WARNING:                 0-  H1   682-SER (A) [ -50.451   32.398  -13.645] H
+WARNING:                 0-  H2   682-SER (A) [ -50.920   31.419  -14.887] H
+WARNING:              2247-   N   682-SER (A) [ -50.142   31.700  -14.307] N
+WARNING:Missing atoms or failed protonation for SER 192 B (BBN) -- please check the structure
+WARNING:Group (BBN) for  2678-   N   192-SER (B) [  17.184   31.590  -29.080] N
+WARNING:Expected 2 interaction atoms for acids, found:
+WARNING:                 0-  H1   192-SER (B) [  17.154   31.514  -28.073] H
+WARNING:                 0-  H2   192-SER (B) [  16.602   32.360  -29.377] H
+WARNING:              2678-   N   192-SER (B) [  17.184   31.590  -29.080] N
+WARNING:Expected 2 interaction atoms for bases, found:
+WARNING:                 0-  H1   192-SER (B) [  17.154   31.514  -28.073] H
+WARNING:                 0-  H2   192-SER (B) [  16.602   32.360  -29.377] H
+WARNING:              2678-   N   192-SER (B) [  17.184   31.590  -29.080] N
+WARNING:Missing atoms or failed protonation for SER 682 B (BBN) -- please check the structure
+WARNING:Group (BBN) for  4625-   N   682-SER (B) [  23.751   20.929    8.907] N
+WARNING:Expected 2 interaction atoms for acids, found:
+WARNING:                 0-  H1   682-SER (B) [  23.572   21.129    9.881] H
+WARNING:                 0-  H2   682-SER (B) [  24.731   21.071    8.709] H
+WARNING:              4625-   N   682-SER (B) [  23.751   20.929    8.907] N
+WARNING:Expected 2 interaction atoms for bases, found:
+WARNING:                 0-  H1   682-SER (B) [  23.572   21.129    9.881] H
+WARNING:                 0-  H2   682-SER (B) [  24.731   21.071    8.709] H
+WARNING:              4625-   N   682-SER (B) [  23.751   20.929    8.907] N
+WARNING:Side chain interaction failed for C-  696 A and LYS 259 A
+WARNING:Side chain interaction failed for C-  696 A and GLN 695 A
+WARNING:Side chain interaction failed for C-  696 A and GLU 696 A
+WARNING:Ignoring 465 header lines in output.
+Converting to mol2: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.pqr -> /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.mol2
+1 molecule converted
+Done: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/expanded.mol2
+[x00407-1] pdb2pqr took 00:00:04 (HH:MM:SS)
+despot_scores_crown.npz
+Scoring complexes:   0%|          | 0/1 [00:00<?, ?it/s]Scoring complexes: 100%|██████████| 1/1 [00:00<00:00, 74.22it/s]
+/tmp/tmpvwrllo9g/ligA701.mol2
+<ArrowStringArray>
+[   'C.3_1', 'C.ar6o_3',    'C.1_2',  'C.ar5_3',  'C.ar5_3',    'C.1_2',
+    'C.1_2',    'C.1_2',    'C.1_2',    'C.1_2',   'N.am_2',   'N.am_3',
+   'N.oh_2',   'O.am_1', 'O.3eta_2']
+Length: 15, dtype: str
+[x00407-1] despot score_complex.py took 00:00:12 (HH:MM:SS)
+Completed [x00407-1]: /home/ngupta/main/program_exp/qfit-3.0/test_case/reference_set/x00407-1/x00407-1_DESPOT.csv
+[x00407-1] ref_set_despot took 00:00:25 (HH:MM:SS)
