@@ -70,20 +70,21 @@ def build_ref_argparser(description, positional_names):
     return p
 
 
-def build_pooled_argparser(description):
+def build_pooled_argparser(description, positional_names=None):
     """Argparser for pooled (cross-dataset) plots that, unlike
     build_ref_argparser's reference-set comparisons, don't need the
-    reference set and aren't gated behind -c: the six pipeline run names,
-    the datasets dir/file, and --graphs-dir for the pooled plot output
-    location (same GRAPHS_DIR/<run>/.../<final_run_name> nesting the -c
-    pooled plots use)."""
+    reference set and aren't gated behind -c: the datasets dir/file and
+    --graphs-dir for the pooled plot output location (same
+    GRAPHS_DIR/<run>/.../<final_run_name> nesting the -c pooled plots use),
+    plus whichever positional run-name arguments the caller needs - the six
+    pipeline run names (through final_run_name) by default, same as every
+    caller before rotamer_run_name existed."""
     p = argparse.ArgumentParser(description=description)
-    p.add_argument('run_name')
-    p.add_argument('placer_run_name')
-    p.add_argument('filter_run_name')
-    p.add_argument('placer2_run_name')
-    p.add_argument('filter2_run_name')
-    p.add_argument('final_run_name')
+    for name in (positional_names or [
+        'run_name', 'placer_run_name', 'filter_run_name',
+        'placer2_run_name', 'filter2_run_name', 'final_run_name',
+    ]):
+        p.add_argument(name)
     p.add_argument('--datasets-dir', default=DEFAULT_DATASETS_DIR,
                     help='Root directory containing per-dataset folders')
     p.add_argument('--datasets-file', default=DEFAULT_DATASETS_FILE,
@@ -943,6 +944,259 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
         print(f'  {len(outliers_df)} residue(s) with ref_rscc - structure_rscc >= '
               f'{outlier_min_diff} out of {len(restricted_pairs)} restricted residue(s); '
               f'written to {out_path}')
+
+
+def plot_residues_vs_ref_restricted(args, collect_structure_rscc, collect_restrict_labels,
+                                     out_dir, out_prefix, structure_label, outlier_min_diff=None):
+    """Like plot_residues_vs_ref, but only produces the restricted-residue
+    comparison plot ({out_prefix}_vs_reference_rscc_restricted.png), not the
+    full-structure one - for stages where collect_structure_rscc(dataset)
+    only ever covers a restricted residue set to begin with (e.g.
+    rotamer_optimize's RSR output, scored only for
+    residues_with_placer_conformers.csv), where an "all residues" plot would
+    just duplicate the restricted one.
+
+    collect_structure_rscc(dataset) -> {residue_label: rscc} for that
+    dataset's structure.
+    collect_restrict_labels(dataset) -> set of '{chain}{resnum}' labels to
+    restrict the comparison to.
+
+    If outlier_min_diff is given (not None), also writes
+    {out_prefix}_vs_reference_rscc_outliers.csv to out_dir: every residue
+    where ref_rscc - structure_rscc >= outlier_min_diff - candidate cases
+    where the pipeline picked a worse-fitting rotamer than the reference
+    structure has - sorted by that difference, biggest first (same tally as
+    plot_residues_vs_ref's outliers csv).
+    """
+    datasets = read_datasets(args.datasets_file)
+    restricted_pairs = []
+
+    for dataset in datasets:
+        structure_rscc = collect_structure_rscc(dataset)
+        restrict_labels = collect_restrict_labels(dataset)
+        _, r_pairs = _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels)
+        for pair in r_pairs:
+            pair['dataset'] = dataset
+        restricted_pairs.extend(r_pairs)
+        print(f'  {dataset}: {len(r_pairs)} residue(s) matched to reference within the '
+              f'restricted residue set')
+
+    graphs_dir = Path(out_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    xs = [p['ref_rscc'] for p in restricted_pairs]
+    ys = [p['structure_rscc'] for p in restricted_pairs]
+    out_name = f'{out_prefix}_vs_reference_rscc_restricted.png'
+    plot_rscc_scatter(
+        xs, ys,
+        xlabel='Reference RSCC', ylabel=f'{structure_label} RSCC',
+        title=f'{structure_label} RSCC vs Reference (restricted residues)',
+        out_path=graphs_dir / out_name,
+        color_by_density=True,
+    )
+    if restricted_pairs:
+        write_plot_csv(graphs_dir, out_name,
+                        pd.DataFrame(restricted_pairs)[['dataset', 'residue', 'ref_rscc', 'structure_rscc']])
+
+    if outlier_min_diff is not None:
+        outliers_df = pd.DataFrame(restricted_pairs,
+                                    columns=['dataset', 'residue', 'ref_rscc', 'structure_rscc'])
+        outliers_df['rscc_diff'] = outliers_df['ref_rscc'] - outliers_df['structure_rscc']
+        outliers_df = outliers_df[outliers_df['rscc_diff'] >= outlier_min_diff]
+        outliers_df.sort_values('rscc_diff', ascending=False, inplace=True)
+
+        out_path = graphs_dir / f'{out_prefix}_vs_reference_rscc_outliers.csv'
+        outliers_df.to_csv(out_path, index=False)
+        print(f'  {len(outliers_df)} residue(s) with ref_rscc - structure_rscc >= '
+              f'{outlier_min_diff} out of {len(restricted_pairs)} restricted residue(s); '
+              f'written to {out_path}')
+
+
+def _dataset_rotamer_pipeline_rscc(dataset, args):
+    """Builds this dataset's residue-level backbone/final/rotamer RSCC rows,
+    restricted to residues_with_placer_conformers.csv - the only residues
+    rotamer_refined.pdb ever touches. backbone is the best-across-cluster-
+    reps value from stage 3's {dataset}_backbone_refined_*_rscc.csv (the
+    same 'apo set' baseline run_rscc_aggregator[_pooled]'s backbone-vs-apo/
+    final-vs-apo plots use); final is stage 6's
+    final_model_refined_rscc.csv (pre-rotamer-optimization); rotamer is
+    stage 7's rotamer_refined_rscc.csv. No RSCC is computed here - all three
+    are read from calc_rscc csvs already on disk."""
+    dataset_dir = Path(args.datasets_dir) / dataset
+
+    run_dir = dataset_dir / args.run_name / args.placer_run_name / args.filter_run_name
+    backbone_csvs = sorted(run_dir.glob(f'{dataset}_backbone_refined_*_rscc.csv'))
+    backbone_best = best_rscc_per_residue(backbone_csvs)
+    backbone_vals = {}
+    for residue, rscc in backbone_best.items():
+        base = residue_base(residue)
+        if base not in backbone_vals or rscc > backbone_vals[base]:
+            backbone_vals[base] = rscc
+
+    final_dir = dataset_final_dir(args.datasets_dir, dataset, args)
+    final_df = read_calc_rscc_csv(final_dir / 'final_model_refined_rscc.csv')
+    final_vals = {}
+    for residue, rscc in zip(final_df['residue'], final_df['rscc']):
+        if pd.isna(rscc):
+            continue
+        final_vals[residue_base(residue)] = rscc
+
+    rotamer_dir = final_dir / args.rotamer_run_name
+    rotamer_df = read_calc_rscc_csv(rotamer_dir / 'rotamer_refined_rscc.csv')
+    rotamer_vals = {}
+    for residue, rscc in zip(rotamer_df['residue'], rotamer_df['rscc']):
+        if pd.isna(rscc):
+            continue
+        rotamer_vals[residue_base(residue)] = rscc
+
+    conformer_residues = read_residue_conformer_list(final_dir / 'residues_with_placer_conformers.csv')
+
+    rows = []
+    for base in conformer_residues:
+        rows.append({
+            'residue': base,
+            'backbone': backbone_vals.get(base),
+            'final': final_vals.get(base),
+            'rotamer': rotamer_vals.get(base),
+        })
+    return pd.DataFrame(rows, columns=['residue', 'backbone', 'final', 'rotamer'])
+
+
+def run_rotamer_vs_pipeline_pooled(args):
+    """Pooled (across every dataset in datasets.txt) per-residue RSCC
+    comparison of rotamer_run_name's rotamer_refined structure (stage 7's
+    output) against two other already-scored pipeline structures, restricted
+    to residues_with_placer_conformers.csv:
+      - final_model_refined (stage 6, pre-rotamer-optimization) ->
+        rotamer_refined_vs_final_refined_rscc_restricted.png
+      - backbone_refined (stage 3, best across cluster reps - the 'apo set'
+        baseline) -> rotamer_refined_vs_backbone_refined_rscc_restricted.png
+
+    Doesn't compare against the reference set, so - like
+    plot_protein_rscc_pooled.py - it runs unconditionally at the end of
+    stage 7, not gated behind -c. Each plot's underlying data (including a
+    'dataset' column) is written alongside it as a matching csv via
+    write_plot_csv.
+    """
+    datasets = read_datasets(args.datasets_file)
+    pooled_rows = []
+    for dataset in datasets:
+        df = _dataset_rotamer_pipeline_rscc(dataset, args)
+        if df.empty:
+            print(f'  {dataset}: no restricted-residue RSCC data found; skipping.')
+            continue
+        df = df.copy()
+        df['dataset'] = dataset
+        pooled_rows.append(df)
+
+    if not pooled_rows:
+        print('  No rotamer RSCC data found for any dataset; skipping pooled plots.')
+        return
+    pooled_df = pd.concat(pooled_rows, ignore_index=True)
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+
+    comparisons = [
+        ('final', 'Final-Refined RSCC', 'Rotamer-Refined RSCC vs Final-Refined (restricted residues)',
+         'rotamer_refined_vs_final_refined_rscc_restricted'),
+        ('backbone', 'Backbone-Refined RSCC',
+         'Rotamer-Refined RSCC vs Backbone-Refined (restricted residues)',
+         'rotamer_refined_vs_backbone_refined_rscc_restricted'),
+    ]
+
+    for xcol, xlabel, title, out_stem in comparisons:
+        paired = pooled_df.dropna(subset=[xcol, 'rotamer'])
+        out_name = f'{out_stem}.png'
+        if paired.empty:
+            print(f'  No data points for {out_name}; skipping.')
+            continue
+        plot_rscc_scatter(
+            paired[xcol], paired['rotamer'],
+            xlabel=xlabel, ylabel='Rotamer-Refined RSCC', title=title,
+            out_path=graphs_dir / out_name,
+            color_by_density=True,
+        )
+        write_plot_csv(
+            graphs_dir, out_name,
+            paired[['dataset', 'residue', xcol, 'rotamer']].rename(
+                columns={xcol: f'{xcol}_rscc', 'rotamer': 'rotamer_rscc'}
+            ),
+        )
+
+
+ROTAMER_WORSE_THRESHOLD = 0.1
+
+
+def run_rotamer_worse_residues(args):
+    """Pooled (across every dataset in datasets.txt) CSV of every residue -
+    restricted to residues_with_placer_conformers.csv, the only residues
+    rotamer_refined.pdb ever touches - whose rotamer_refined RSCC is more
+    than ROTAMER_WORSE_THRESHOLD (0.1) worse than either of two baselines:
+      - 'reference': the matched reference-structure residue's RSCC
+        (same match rule as plot_residues_vs_ref_rotamer.py).
+      - 'final_refined': that dataset's pre-rotamer-optimization
+        final_model_refined RSCC (same data _dataset_rotamer_pipeline_rscc
+        already builds for run_rotamer_vs_pipeline_pooled).
+
+    A residue can appear twice (once per comparison) if it clears the
+    threshold against both baselines. No RSCC is computed here - every value
+    is read from calc_rscc csvs already on disk. Requires --ref-set, so -
+    like plot_residues_vs_ref_rotamer.py - only meant to run when -c is
+    given.
+
+    Writes rotamer_refined_worse_residues.csv (columns: dataset, residue,
+    comparison, baseline_rscc, rotamer_rscc, diff), sorted by diff
+    descending, to args.graphs_dir.
+    """
+    datasets = read_datasets(args.datasets_file)
+
+    def final_dir(dataset):
+        return dataset_final_dir(args.datasets_dir, dataset, args)
+
+    def rotamer_dir(dataset):
+        return final_dir(dataset) / args.rotamer_run_name
+
+    rows = []
+    for dataset in datasets:
+        restrict_labels = read_residue_conformer_list(
+            final_dir(dataset) / 'residues_with_placer_conformers.csv')
+
+        rotamer_rscc_df = read_calc_rscc_csv(rotamer_dir(dataset) / 'rotamer_refined_rscc.csv')
+        structure_rscc = dict(zip(rotamer_rscc_df['residue'], rotamer_rscc_df['rscc']))
+        _, ref_pairs = _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels)
+        for pair in ref_pairs:
+            diff = pair['ref_rscc'] - pair['structure_rscc']
+            if diff > ROTAMER_WORSE_THRESHOLD:
+                rows.append({
+                    'dataset': dataset, 'residue': pair['residue'], 'comparison': 'reference',
+                    'baseline_rscc': pair['ref_rscc'], 'rotamer_rscc': pair['structure_rscc'],
+                    'diff': diff,
+                })
+
+        pipeline_df = _dataset_rotamer_pipeline_rscc(dataset, args)
+        pipeline_df = pipeline_df.dropna(subset=['final', 'rotamer'])
+        for residue, final_rscc, rotamer_rscc in zip(
+                pipeline_df['residue'], pipeline_df['final'], pipeline_df['rotamer']):
+            diff = final_rscc - rotamer_rscc
+            if diff > ROTAMER_WORSE_THRESHOLD:
+                rows.append({
+                    'dataset': dataset, 'residue': residue, 'comparison': 'final_refined',
+                    'baseline_rscc': final_rscc, 'rotamer_rscc': rotamer_rscc, 'diff': diff,
+                })
+
+        print(f'  {dataset}: {sum(1 for r in rows if r["dataset"] == dataset)} residue(s) '
+              f'more than {ROTAMER_WORSE_THRESHOLD} worse than reference or final_refined')
+
+    graphs_dir = Path(args.graphs_dir)
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    out_path = graphs_dir / 'rotamer_refined_worse_residues.csv'
+
+    worse_df = pd.DataFrame(
+        rows, columns=['dataset', 'residue', 'comparison', 'baseline_rscc', 'rotamer_rscc', 'diff'])
+    worse_df.sort_values('diff', ascending=False, inplace=True)
+    worse_df.to_csv(out_path, index=False)
+    print(f'  {len(worse_df)} total worse-residue row(s) written to {out_path}')
 
 
 def dataset_final_dir(datasets_dir, dataset, args):
