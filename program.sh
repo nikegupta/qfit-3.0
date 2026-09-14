@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # program.sh - combined driver for the full ligand-fitting/PLACER/RSR pipeline.
-#takes in 7 positional args corresponding to the stages of the pipeline:
-#run_name, placer_run_name, filter_run_name, placer2_run_name, filter2_run_name, final_run_name, despot_run_name
+#takes in 8 positional args corresponding to the stages of the pipeline:
+#run_name, placer_run_name, filter_run_name, placer2_run_name, filter2_run_name, final_run_name, rotamer_run_name, despot_run_name
 #
 # Runs, in order:
 #   0a. convert_ligs                    -> LIG_PDB_DIR/<ligand_name>*/<ligand_name>*.mol2
@@ -47,13 +47,67 @@
 #       one run-wide csv
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
 #                                           sidechain_clash_groups_combined.csv
-#   7a. despot (only runs when <despot_run_name> is given)
+#   7a. rotamer_optimize (only runs when <rotamer_run_name> is given): re-samples chi/aromatic-
+#       angle rotamers for every residue in final_model.pdb (stage 6a's output, BEFORE rsr_final's
+#       refinement) listed in residues_with_placer_conformers.csv that scores below RSCC 0.5
+#       against the dataset's event maps, keeping the resampled conformer only if it improves
+#       RSCC by >= 0.1 - see qfit/command_line/rotamer_optimize.py
+#                                        -> .../<final_run_name>/<rotamer_run_name>/
+#                                           rotamer_optimized.pdb + fitted.pdb + residue_rscc.csv
+#   7b. rsr_rotamer: real-space refines rotamer_optimized.pdb (SINGLE-mode coot refinement,
+#       same real_space_refine_final.py invocation stage 6b's rsr_final uses), restricted to the
+#       same residues_with_placer_conformers.csv residue list rotamer_optimize.py was run against
+#                                        -> .../<final_run_name>/<rotamer_run_name>/rotamer_refined.pdb
+#   7c. calc_rotamer_refined_rscc: per-residue RSCC of rotamer_refined.pdb, restricted (via
+#       calc_rscc's --residues-csv) to residues_with_placer_conformers.csv
+#                                        -> .../<final_run_name>/<rotamer_run_name>/
+#                                           rotamer_refined_rscc.csv
+#   7d. select_optimized_residues: rotamer_optimize's acceptance check runs before RSR, so it
+#       can't see a residue end up worse than final_model_refined.pdb once RSR has moved things
+#       around (this happens even to residues rotamer_optimize never touched, since rsr_rotamer
+#       refines the full residues_with_placer_conformers.csv selection jointly - a neighboring
+#       residue's resampled rotamer can shift an untouched residue's own refined position) - for
+#       every residues_with_placer_conformers.csv residue, compares its RSCC in
+#       final_model_refined_rscc.csv (stage 6c) against rotamer_refined_rscc.csv (stage 7c) and
+#       reverts to final_model_refined's conformation only if its RSCC is at least
+#       REVERT_MIN_DIFF (0.1) higher - most of the raw gap between the two independent
+#       refinement runs is noise, not a real quality difference - see select_optimized_residues.py.
+#       Every plot below (7e/7f/7g) runs after this step and uses its output, not the raw
+#       rotamer_refined.pdb/rotamer_refined_rscc.csv.
+#                                        -> .../<final_run_name>/<rotamer_run_name>/
+#                                           optimized.pdb + optimized_rscc.csv (residue,rscc,
+#                                           source - values read from final_model_refined_rscc.csv/
+#                                           rotamer_refined_rscc.csv, never recomputed)
+#                                           + reverted_residues.csv (residue,final_rscc,
+#                                           rotamer_rscc,diff - just the reverted subset, sorted
+#                                           by diff descending)
+#   7e. plot_residues_vs_ref_rotamer (only with -c): optimized.pdb's residues vs the
+#       reference set, restricted to residues_with_placer_conformers.csv (the only residues
+#       optimized.pdb ever touches)
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
+#                                           <rotamer_run_name>/rotamer_refined_vs_reference_rscc_restricted.png
+#   7f. plot_rotamer_vs_pipeline (always runs, not gated behind -c): optimized.pdb's
+#       residues vs final_model_refined.pdb (stage 6, pre-rotamer-optimization) and vs
+#       backbone_refined (stage 3, best across cluster reps - the same 'apo set' baseline the
+#       stage 9 protein RSCC plots use), restricted to residues_with_placer_conformers.csv
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
+#                                           <rotamer_run_name>/rotamer_refined_vs_final_refined_rscc_restricted.png
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
+#                                           <rotamer_run_name>/rotamer_refined_vs_backbone_refined_rscc_restricted.png
+#   7g. aggregate_rotamer_worse_residues (only with -c): pooled csv (no plot) of every
+#       residues_with_placer_conformers.csv residue whose optimized RSCC is more than 0.1
+#       worse than either the matched reference residue's RSCC or final_model_refined's RSCC -
+#       a triage list, built alongside stage 7e's per-dataset ref-comparison data
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
+#                                           <rotamer_run_name>/rotamer_refined_worse_residues.csv
+#   8a. despot (only runs when <rotamer_run_name> and <despot_run_name> are both given)
 #       extract_ligand_conformers pools every placer2 round-2 conformer (not just filter2's
 #       selected representative) into one ligs.pdb; symmetry_expand --ligand-conformers-pdb
-#       expands final_model_refined.pdb's protein around all of them; convert the expanded
+#       expands optimized.pdb's protein around all of them (stage 7d's output - previously
+#       rotamer_refined.pdb, before select_optimized_residues was inserted); convert the expanded
 #       protein and ligand conformers to mol2 (lig_scripts/pdb_to_mol2.sh,
 #       lig_scripts/protein_to_mol2.sh); score every conformer with DESPOT's score_complex.py
-#                                        -> .../<final_run_name>/<despot_run_name>/
+#                                        -> .../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
 #                                           <dataset>_DESPOT.csv + conformer_map.csv + ligs.pdb
 #       + despot_filter reselects, per filter2 cluster, the pose maximizing
 #         RSCC - --despot_rscc_weight*normalized_DESPOT among that cluster's MSE-vs-DESPOT
@@ -61,36 +115,55 @@
 #         needed), keeping it only if it clears both --despot_rscc_threshold and
 #         --despot_threshold (both unset by default: despot_filter's own defaults apply) -
 #         see despot_filter.py's own docstring
-#                                        -> .../<final_run_name>/<despot_run_name>/despot_filtered.pdb
+#                                        -> .../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#                                           despot_filtered.pdb
 #                                           + despot_filtered_scores.csv (unchanged shape - now
 #                                             describing the reselected winner)
 #                                           + cluster_reps.csv (filter2's cluster_reps.csv, same
 #                                             row order, plus the reselected winner's own info -
 #                                             see despot_filter.py)
-#   7b. plot_despot_energies (per-dataset histogram, heavy-atom-normalized - now reflects every
+#                                           + despot_filtered.pdb's protein: any residue whose
+#                                             only PLACER-derived conformer(s) came from a
+#                                             rejected ligand's placer file (and not ALSO a
+#                                             surviving one) is reset to apo_structure (this
+#                                             pipeline only wants non-apo protein conformations
+#                                             near ligands it actually kept) - see
+#                                             reset_protein_to_apo_where_unbacked
+#                                           + modified_residues.csv (residues_with_placer_
+#                                             conformers.csv, minus whatever got reset above)
+#   8b. plot_despot_energies (per-dataset histogram, heavy-atom-normalized - now reflects every
 #       placer2 conformer's DESPOT score, not just the final poses)
 #                                        -> .../<final_run_name>/graphs/
-#       + plot_despot_energies_pooled   -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
-#   7c. plot_lig_vs_ref_despot (only with -c): despot_filtered.pdb's
+#       + plot_despot_energies_pooled   -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   8c. plot_lig_vs_ref_despot (only with -c): despot_filtered.pdb's
 #       surviving ligands' RSCC (despot_run_name/cluster_reps.csv's despot_rscc - the
 #       reselected winner's own value) vs the reference set, matched the same way as
 #       stages 3d/5b - see rscc_common.py's alive_rows
-#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
-#   7d. plot_despot_ligand_summary: every surviving ligand's normalized
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   8d. plot_despot_ligand_summary: every surviving ligand's normalized
 #       DESPOT score vs its cluster_reps.csv RSCC, no -c needed
-#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
 #       + plot_despot_ligand_summary_single (per-dataset, chain+resi-labeled)
-#                                        -> .../<final_run_name>/<despot_run_name>/
-#   7e. plot_despot_vs_ref (only with -c): each dataset's reference-set
+#                                        -> .../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   8e. plot_despot_vs_ref (only with -c): each dataset's reference-set
 #       DESPOT score (Stage 0d) vs the matched pipeline ligand's DESPOT
 #       score, both normalized per heavy atom, matched the same way as
-#       stages 3d/5b/7c
-#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
-#   7f. plot_rscc_despot_tradeoff (only with -c): per despot_filter-surviving, reference-matched
+#       stages 3d/5b/8c
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   8f. plot_rscc_despot_tradeoff (only with -c): per despot_filter-surviving, reference-matched
 #       ligand, pipeline RSCC - reference RSCC (y) vs reference DESPOT - pipeline DESPOT (x),
-#       reusing 7c/7e's own matching - see rscc_common.py
-#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<despot_run_name>/
-#   8.  analysis_scripts/*.py           -> .../<final_run_name>/graphs/
+#       reusing 8c/8e's own matching - see rscc_common.py
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   8g. plot_residues_vs_ref_despot (only with -c): optimized's per-residue RSCC (same
+#       rotamer_run_name/optimized_rscc.csv values as 7e/7f/7g - despot_filter.py's own input is
+#       now optimized.pdb, not rotamer_refined.pdb) vs the reference
+#       set, restricted to despot_run_name/modified_residues.csv (8a) instead of 7e's
+#       residues_with_placer_conformers.csv - so this point count is <= 7e's, smaller whenever
+#       despot_filter rejected a ligand. Also writes
+#       rotamer_refined_despot_vs_reference_rscc_outliers.csv there (residues >= 0.1 worse than
+#       reference), mirroring 6d/7e's own outliers csvs.
+#                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   9.  analysis_scripts/*.py           -> .../<final_run_name>/graphs/
 #       (cluster-rep and per-residue RSCC plots, filter_2-vs-filter_1 ligand
 #       RSCC, final-vs-apo Z-map statistics, per-dataset final-ligand Z-map
 #       histograms, and per-dataset bfactor-sensitivity plots, from stage 6c's
@@ -102,7 +175,7 @@
 #
 #
 #
-# Modularity: pass only as many of the seven run-name arguments as you want
+# Modularity: pass only as many of the eight run-name arguments as you want
 # to run through (e.g. just <run_name> <placer_run_name> <filter_run_name>
 # stops after stage 3). Each stage's directory tree is nested under the
 # previous stage's, so re-running with a new name at any point (e.g. a new
@@ -110,26 +183,30 @@
 # branches off the old results without touching them. Stage 0 is
 # dataset-scoped rather than run-name-scoped, so it always runs (skipping
 # per-dataset once that dataset's apo RSCC csv exists) regardless of which
-# run-name arguments are given. Stage 7 (despot) is optional even once
-# <final_run_name> is given - it only runs when <despot_run_name> is also
-# given - while stage 8 (analysis) always runs once <final_run_name> is
-# given, independent of stage 7.
+# run-name arguments are given. Stage 7 (rotamer_optimize + rsr + rscc) is
+# optional even once <final_run_name> is given - it only runs when
+# <rotamer_run_name> is also given. Stage 8 (despot) is optional even once
+# <rotamer_run_name> is given - it only runs when <despot_run_name> is also
+# given (an error is raised if <despot_run_name> is given without
+# <rotamer_run_name>, since despot now scores optimized.pdb, stage 7d's
+# output) - while stage 9 (analysis) always runs once <final_run_name> is
+# given, independent of stages 7/8.
 #
 # Idempotency: every step checks whether its own actual output file(s)
-# already exist - for a given dataset (main pipeline steps 0b-0d, 7a) or for the
-# whole run (graphing steps 1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8) - and skips
+# already exist - for a given dataset (main pipeline steps 0b-0d, 7a-7c, 8a) or for the
+# whole run (graphing steps 1b, 1c, 2c, 3d, 4c, 5b, 6d, 7d, 7e, 7f, 8b, 8c, 8d, 8e, 9) - and skips
 # just that piece of work if so, so previous runs are never overwritten.
 # Main pipeline steps with a variable number of outputs per dataset (PLACER
 # and RSR rounds) use a loose "at least one matching output exists" check -
 # a partially-failed dataset is treated as done and needs --overwrite to
 # resume. Pass --overwrite to force every step to re-run in place regardless
 # of existing output (including the graphing steps), or --replot to force
-# just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8) to redo.
-# Stage 8 has no readiness precondition of its own - it runs whenever
+# just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7d, 7e, 7f, 8b, 8c, 8d, 8e, 9) to redo.
+# Stage 9 has no readiness precondition of its own - it runs whenever
 # <final_run_name> is given, and its own idempotency check (like every other
 # graphing step) simply skips any dataset that doesn't yet have the output
 # it needs (e.g. one with no final_model_refined_rscc.csv - see
-# stage8_outputs_exist), rather than blocking the whole stage on it.
+# stage9_outputs_exist), rather than blocking the whole stage on it.
 #
 # Dataset scoping: by default every stage runs over every dataset listed in
 # DATASETS_FILE (datasets.txt). Pass --dataset <id[,id...]> to restrict the
@@ -143,7 +220,7 @@ set -uo pipefail
 
 usage() {
     cat <<EOF
-Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name [despot_run_name]]]]]]
+Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name [rotamer_run_name [despot_run_name]]]]]]]
            [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>] [-c] [--overwrite] [--replot]
            [--dataset <id[,id...]>] [--bfactors <list>]
            [--z_threshold <float>] [--num_peaks <int>]
@@ -155,11 +232,14 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--f2_clustering_cutoff <float>] [--despot_threshold <float>]
            [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
 
-Only <run_name> is required. Supplying fewer than all seven names runs only
+Only <run_name> is required. Supplying fewer than all eight names runs only
 that many stages of the pipeline (see header comment for the stage list).
-<despot_run_name> is optional even when <final_run_name> is given - stage 7
-(DESPOT energy scoring) only runs when it's also supplied; stage 8 (analysis)
-always runs once <final_run_name> is given, independent of stage 7.
+<rotamer_run_name> is optional even when <final_run_name> is given - stage 7
+(rotamer_optimize + rsr + rscc) only runs when it's also supplied.
+<despot_run_name> is optional even when <rotamer_run_name> is given - stage 8
+(DESPOT energy scoring) only runs when it's also supplied (it is an error to
+give <despot_run_name> without <rotamer_run_name>); stage 9 (analysis)
+always runs once <final_run_name> is given, independent of stages 7/8.
 
 Options:
   -n <num_placer_confs>    Number of PLACER conformers for round 1 (placer -n). Default: 1000
@@ -168,7 +248,9 @@ Options:
   -p <num_parallel>        CPU parallelism for every non-PLACER stage (calc_apo_rscc, calc_apo_z,
                             fit_ligand, rsr_placer, filter, rsr_backbone, calc_backbone_refined_rscc,
                             rsr_placer2, filter2, build_final, rsr_final, calc_final_refined_rscc,
-                            calc_final_refined_z, despot, ref_set_despot). Default: 1
+                            calc_final_refined_z, rotamer_optimize, rsr_rotamer,
+                            calc_rotamer_refined_rscc, select_optimized_residues, despot,
+                            ref_set_despot). Default: 1
   -c                       Also compare results to the reference set (REF_SET). Runs
                             calc_ref_set_rscc as stage 0c: per dataset, computes RSCC of
                             REF_SET/<dataset>/<REF_SET_PDB_PATTERN>, skipping any dataset whose
@@ -180,22 +262,24 @@ Options:
                             (cross-dataset) ligand/residue comparison plots into GRAPHS_DIR: stage
                             1c (centroid_rmsd_all), 2c and 4c (calc_placer_sampling, refined
                             + unrefined), 3d (plot_lig_vs_ref_filter1, plot_residues_vs_ref_backbone),
-                            5b (plot_lig_vs_ref_filter2), 6d (plot_residues_vs_ref_final), and (only
-                            when <despot_run_name> is also given) 7c (plot_lig_vs_ref_despot) and 7e
-                            (plot_despot_vs_ref).
+                            5b (plot_lig_vs_ref_filter2), 6d (plot_residues_vs_ref_final), 7e
+                            (plot_residues_vs_ref_rotamer), 7g (aggregate_rotamer_worse_residues),
+                            and (only when <despot_run_name> is also given) 8c
+                            (plot_lig_vs_ref_despot), 8e (plot_despot_vs_ref), 8f
+                            (plot_rscc_despot_tradeoff), and 8g (plot_residues_vs_ref_despot).
   --overwrite              Force every requested step to re-run in place, even if its output
                             already exists (normally such a step is skipped - see "Idempotency"
                             in the header comment). Applies to every stage, including the
-                            graphing steps. Does not affect stage 8's precondition that stage 6
+                            graphing steps. Does not affect stage 9's precondition that stage 6
                             already be complete for every dataset.
-  --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8) to
+  --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7e, 7f, 7g, 8b, 8c, 8d, 8e, 8f, 8g, 9) to
                             re-run in place, even if their output already exists. Does not
                             affect the main pipeline steps (use --overwrite for those too).
   --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
                             (e.g. x00001-1 or x00001-1,x00002-1), instead of every dataset
                             listed in DATASETS_FILE (datasets.txt). Every dataset given must
                             already have a directory under DATASETS_DIR. Applies to every
-                            stage (0-8) for the whole invocation.
+                            stage (0-9) for the whole invocation.
   --bfactors <list>        B-factor(s) passed to calc_rscc_b (stage 6c): a single value
                             (e.g. "20") or a comma-separated list (e.g. "20,40,60,80,100").
                             calc_rscc_b is only run on final_model_refined.pdb, restricted to
@@ -224,15 +308,15 @@ Options:
                                     filter's own argparse defaults apply. Stage 5a (filter2_run_name)
                                     now runs the same "filter" script as stage 3a (filter_run_name)
                                     instead of "filter_all" - see header comment.
-  --despot_threshold <float>       despot_filter --despot-threshold for stage 7a: the reselected
+  --despot_threshold <float>       despot_filter --despot-threshold for stage 8a: the reselected
                                     winning pose's per-heavy-atom-normalized DESPOT score must be
                                     <= this to survive. Left unset by default, so despot_filter's
                                     own argparse default (-1.0) applies.
-  --despot_rscc_threshold <float>  despot_filter --rscc-threshold for stage 7a: the reselected
+  --despot_rscc_threshold <float>  despot_filter --rscc-threshold for stage 8a: the reselected
                                     winning pose's RSCC must be >= this to survive (both this and
                                     --despot_threshold must pass). Left unset by default, so
                                     despot_filter's own argparse default (0.6) applies.
-  --despot_rscc_weight <float>     despot_filter --rscc-weight for stage 7a: per filter2 cluster,
+  --despot_rscc_weight <float>     despot_filter --rscc-weight for stage 8a: per filter2 cluster,
                                     the Pareto-front (MSE vs normalized DESPOT) candidate
                                     maximizing RSCC - despot_rscc_weight*normalized_DESPOT is
                                     selected as that cluster's pose. Left unset by default, so
@@ -249,20 +333,21 @@ Examples:
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 --f1_rscc_cutoff 0.5 --f2_rscc_cutoff 0.7
   $0 run_1 placer_1 filter_1 --dataset x00001-1
   $0 run_1 placer_1 filter_1 --dataset x00001-1,x00002-1,x00003-1
-  $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 despot_1
+  $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1
+  $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1 despot_1
 EOF
     exit 1
 }
 
 # --- User-specified configuration: edit these for your environment ---
-BASE_DIR="/home/ngupta/main/program_exp"
+BASE_DIR="/home/ngupta/main/program_rotamer"
 CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 LIG_PDB_DIR="${BASE_DIR}/pdb_final_geometry"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV_QFIT="nikhils_program_exp"
+CONDA_ENV_QFIT="nikhils_program_rotamer"
 CONDA_ENV_PLACER="placer_env"
-CONDA_ENV_RSR="nikhils_program_exp"
-CONDA_ENV_EVAL="nikhils_program_exp"
+CONDA_ENV_RSR="nikhils_program_rotamer"
+CONDA_ENV_EVAL="nikhils_program_rotamer"
 CONDA_ENV_OBABEL="openbabel"
 CONDA_ENV_DESPOT="DESPOT"
 RUN_PLACER_PY="/home/ngupta/PLACER/PLACER/run_PLACER.py"
@@ -292,6 +377,9 @@ PLOT_LIG_VS_REF_FILTER1_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_filter1.py"
 PLOT_LIG_VS_REF_FILTER2_PY="${ANALYSIS_SCRIPTS_DIR}/plot_lig_vs_ref_filter2.py"
 PLOT_RESIDUES_VS_REF_BACKBONE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_backbone.py"
 PLOT_RESIDUES_VS_REF_FINAL_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_final.py"
+PLOT_RESIDUES_VS_REF_ROTAMER_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_rotamer.py"
+PLOT_ROTAMER_VS_PIPELINE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_rotamer_vs_pipeline.py"
+AGGREGATE_ROTAMER_WORSE_RESIDUES_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_rotamer_worse_residues.py"
 AGGREGATE_CLASH_GROUPS_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_clash_groups.py"
 CENTROID_RMSD_ALL_PY="${ANALYSIS_SCRIPTS_DIR}/centroid_rmsd_all.py"
 CALC_PLACER_SAMPLING_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling.py"
@@ -311,6 +399,7 @@ PLOT_DESPOT_LIGAND_SUMMARY_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand_summar
 PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand_summary_single.py"
 PLOT_DESPOT_VS_REF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_vs_ref.py"
 PLOT_RSCC_DESPOT_TRADEOFF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_rscc_despot_tradeoff.py"
+PLOT_RESIDUES_VS_REF_DESPOT_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_despot.py"
 ASSIGN_BOND_ORDERS_PY="${LIG_SCRIPTS_DIR}/assign_bond_orders.py"
 PDB_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/pdb_to_mol2.sh"
 PROTEIN_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/protein_to_mol2.sh"
@@ -318,14 +407,15 @@ PROTEIN_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/protein_to_mol2.sh"
 for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN" "$RSR_SCRIPT_FINAL" \
          "$RUN_PLACER_PY" "$PLOT_CLUSTER_REPS_PY" "$AGGREGATE_PROTEIN_RSCC_PY" "$AGGREGATE_LIG_RSCC_PY" \
          "$PLOT_LIG_VS_REF_FILTER1_PY" "$PLOT_LIG_VS_REF_FILTER2_PY" \
-         "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY" \
+         "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY" "$PLOT_RESIDUES_VS_REF_ROTAMER_PY" \
+         "$PLOT_ROTAMER_VS_PIPELINE_PY" "$AGGREGATE_ROTAMER_WORSE_RESIDUES_PY" \
          "$CENTROID_RMSD_ALL_PY" "$CALC_PLACER_SAMPLING_PY" "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
          "$PLOT_FIT_LIGAND_COUNTS_PY" "$PLOT_FINAL_VS_APO_Z_PY" "$PLOT_FINAL_LIG_Z_PY" \
          "$PLOT_BFACTOR_SENSITIVITY_PY" "$ASSIGN_BOND_ORDERS_PY" "$PLOT_CLUSTER_REPS_POOLED_PY" \
          "$PLOT_PROTEIN_RSCC_POOLED_PY" "$PLOT_Z_POOLED_PY" \
          "$PLOT_BFACTOR_RHO_POOLED_PY" "$PLOT_DESPOT_ENERGIES_PY" "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
          "$PLOT_LIG_VS_REF_DESPOT_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
-         "$PLOT_DESPOT_VS_REF_PY" "$PLOT_RSCC_DESPOT_TRADEOFF_PY" \
+         "$PLOT_DESPOT_VS_REF_PY" "$PLOT_RSCC_DESPOT_TRADEOFF_PY" "$PLOT_RESIDUES_VS_REF_DESPOT_PY" \
          "$PDB_TO_MOL2_SH" "$PROTEIN_TO_MOL2_SH" "$DESPOT_SCRIPT"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
@@ -350,6 +440,7 @@ filter_run_name=""
 placer2_run_name=""
 filter2_run_name=""
 final_run_name=""
+rotamer_run_name=""
 despot_run_name=""
 
 num_placer_confs=100
@@ -519,6 +610,8 @@ while [[ $# -gt 0 ]]; do
                 filter2_run_name="$1"
             elif [ -z "$final_run_name" ]; then
                 final_run_name="$1"
+            elif [ -z "$rotamer_run_name" ]; then
+                rotamer_run_name="$1"
             elif [ -z "$despot_run_name" ]; then
                 despot_run_name="$1"
             else
@@ -535,6 +628,13 @@ if [ -z "$run_name" ]; then
     usage
 fi
 
+if [ -n "$despot_run_name" ] && [ -z "$rotamer_run_name" ]; then
+    echo "Error: <despot_run_name> was given without <rotamer_run_name> - stage 8 (despot) now" >&2
+    echo "scores optimized.pdb (stage 7d's output), so <rotamer_run_name> is required" >&2
+    echo "whenever <despot_run_name> is given." >&2
+    usage
+fi
+
 # --- Full-run logging: every line this script (and everything it calls) prints from here on is
 # teed into BASE_DIR/logs/<run_name>/<placer_run_name>/.../<deepest run-name given>/log.txt -
 # the same hierarchical nesting convention as every dataset's own output tree. If that log.txt
@@ -545,7 +645,7 @@ fi
 # parallel, still flows through to this top-level tee.
 log_dir="${BASE_DIR}/logs/${run_name}"
 for _log_run_name in "$placer_run_name" "$filter_run_name" "$placer2_run_name" \
-                     "$filter2_run_name" "$final_run_name" "$despot_run_name"; do
+                     "$filter2_run_name" "$final_run_name" "$rotamer_run_name" "$despot_run_name"; do
     [ -n "$_log_run_name" ] && log_dir="${log_dir}/${_log_run_name}"
 done
 unset _log_run_name
@@ -598,7 +698,7 @@ fi
 # Canonical, in-memory list of datasets for this run - read from
 # DATASETS_FILE exactly once, here (whichever it currently points to:
 # datasets.txt by default, or the --dataset override above). Every stage
-# that enumerates datasets directly in this shell (stage8_outputs_exist,
+# that enumerates datasets directly in this shell (stage9_outputs_exist,
 # do_placer, do_placer2, and every parallel-driving
 # do_* function below) iterates this
 # array instead of separately re-reading DATASETS_FILE or - as do_placer2
@@ -619,7 +719,7 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # Everything below this point (dataset names, tunables, consolidated paths)
 # needs to be visible inside the per-dataset *_process_dataset functions even
 # when GNU parallel forks them into new subshells, so it all gets exported.
-export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name despot_run_name
+export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name rotamer_run_name despot_run_name
 export num_placer_confs num_placer2_confs compare_ref_set overwrite replot bfactors
 export z_threshold num_peaks
 export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
@@ -631,7 +731,8 @@ export BASE_DIR DATASETS_DIR DATASETS_FILE CSV_FILE LIG_PDB_DIR ASSIGN_BOND_ORDE
 export RSR_SCRIPT_LIGAND RSR_SCRIPT_PROTEIN RSR_SCRIPT_FINAL
 export ANALYSIS_SCRIPTS_DIR PLOT_CLUSTER_REPS_PY AGGREGATE_PROTEIN_RSCC_PY AGGREGATE_LIG_RSCC_PY
 export PLOT_LIG_VS_REF_FILTER1_PY PLOT_LIG_VS_REF_FILTER2_PY
-export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY GRAPHS_DIR
+export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY PLOT_RESIDUES_VS_REF_ROTAMER_PY GRAPHS_DIR
+export PLOT_ROTAMER_VS_PIPELINE_PY AGGREGATE_ROTAMER_WORSE_RESIDUES_PY
 export AGGREGATE_CLASH_GROUPS_PY
 export CENTROID_RMSD_ALL_PY CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
 export PLOT_FIT_LIGAND_COUNTS_PY
@@ -644,6 +745,7 @@ export PLOT_DESPOT_ENERGIES_PY PLOT_DESPOT_ENERGIES_POOLED_PY PLOT_LIG_VS_REF_DE
 export PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY
 export PLOT_DESPOT_VS_REF_PY
 export PLOT_RSCC_DESPOT_TRADEOFF_PY
+export PLOT_RESIDUES_VS_REF_DESPOT_PY
 export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE EXPAND_DISTANCE_CUTOFF
 export REF_SET REF_SET_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_OBABEL CONDA_ENV_DESPOT
@@ -759,7 +861,7 @@ run_step_pooled() {
 }
 
 # run_step_replot <description> <check_fn> <run_fn>
-# For graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7b, 7c, 7d, 7e, 8): skips run_fn (via
+# For graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7d, 7e, 7f, 8b, 8c, 8d, 8e, 9): skips run_fn (via
 # run_step) when check_fn - a function name taking no args - returns success
 # (0, "all of this step's outputs already exist"), UNLESS --replot or
 # --overwrite was given.
@@ -829,6 +931,72 @@ print_elapsed() {
     printf "%s took %02d:%02d:%02d (HH:MM:SS)\n" "$label" $hours $minutes $seconds
 }
 export -f print_elapsed
+
+# build_cif_list_from_cluster_reps <dataset> <cluster_reps_csv>
+# Prints (to stdout) the comma-separated list of cif_restraints_file paths from every data row
+# of cluster_reps_csv, in row order - the i-th LIG residue in final_model.pdb (resid i, 1-based)
+# corresponds to the i-th (1-indexed) DATA row of filter2's cluster_reps.csv, and RSR (stage 6b's
+# rsr_final and stage 7b's rsr_rotamer) needs one CIF restraints file per LIG residue in that
+# same row order. Returns non-zero (with an ERROR [<dataset>]: message on stderr) if the
+# cif_restraints_file column is missing, any row's CIF path is missing/doesn't exist, or no data
+# rows are found.
+build_cif_list_from_cluster_reps() {
+    local dataset="$1" cluster_reps_csv="$2"
+
+    local header=""
+    IFS= read -r header < "$cluster_reps_csv"
+
+    local cif_col_index=-1
+    local i=0
+    local header_cols
+    IFS=, read -r -a header_cols <<< "$header"
+    for col in "${header_cols[@]}"; do
+        col="${col//$'\r'/}"
+        if [ "$col" = "cif_restraints_file" ]; then
+            cif_col_index=$i
+        fi
+        i=$((i + 1))
+    done
+
+    if [ $cif_col_index -lt 0 ]; then
+        echo "ERROR [${dataset}]: cif_restraints_file column not found in $cluster_reps_csv" >&2
+        return 1
+    fi
+
+    local cif_paths=()
+    local row_num=0
+    local any_cif_missing=0
+    while IFS=, read -r -a row_cols; do
+        row_num=$((row_num + 1))
+        [ $row_num -eq 1 ] && continue
+        [ -z "${row_cols[0]}" ] && continue
+
+        local cif_path="${row_cols[$cif_col_index]}"
+        cif_path="${cif_path//$'\r'/}"
+        cif_path="$(echo -n "$cif_path" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
+
+        if [ -z "$cif_path" ] || [ ! -f "$cif_path" ]; then
+            echo "ERROR [${dataset}]: CIF not found for row ${row_num} of ${cluster_reps_csv}: '${cif_path}'" >&2
+            any_cif_missing=1
+            continue
+        fi
+
+        cif_paths+=("$cif_path")
+    done < "$cluster_reps_csv"
+
+    if [ $any_cif_missing -ne 0 ]; then
+        echo "ERROR [${dataset}]: One or more CIF restraint files were missing, aborting." >&2
+        return 1
+    fi
+
+    if [ ${#cif_paths[@]} -eq 0 ]; then
+        echo "ERROR [${dataset}]: No data rows found in $cluster_reps_csv" >&2
+        return 1
+    fi
+
+    (IFS=,; echo "${cif_paths[*]}")
+}
+export -f build_cif_list_from_cluster_reps
 
 # write_params_txt <output_file> <name=value> [<name=value> ...]
 # Records the CLI-configurable parameters actually used for a stage's run,
@@ -2678,61 +2846,8 @@ rsr_final_process_dataset() {
         return 1
     fi
 
-    # The i-th LIG residue in final_model.pdb (resid i, 1-based) corresponds
-    # to the i-th (1-indexed) DATA row of filter2's cluster_reps.csv.
-    local header=""
-    IFS= read -r header < "$cluster_reps_csv"
-
-    local cif_col_index=-1
-    local i=0
-    local header_cols
-    IFS=, read -r -a header_cols <<< "$header"
-    for col in "${header_cols[@]}"; do
-        col="${col//$'\r'/}"
-        if [ "$col" = "cif_restraints_file" ]; then
-            cif_col_index=$i
-        fi
-        i=$((i + 1))
-    done
-
-    if [ $cif_col_index -lt 0 ]; then
-        echo "ERROR [${dataset}]: cif_restraints_file column not found in $cluster_reps_csv"
-        return 1
-    fi
-
-    local cif_paths=()
-    local row_num=0
-    local any_cif_missing=0
-    while IFS=, read -r -a row_cols; do
-        row_num=$((row_num + 1))
-        [ $row_num -eq 1 ] && continue
-        [ -z "${row_cols[0]}" ] && continue
-
-        local cif_path="${row_cols[$cif_col_index]}"
-        cif_path="${cif_path//$'\r'/}"
-        cif_path="$(echo -n "$cif_path" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
-
-        if [ -z "$cif_path" ] || [ ! -f "$cif_path" ]; then
-            echo "ERROR [${dataset}]: CIF not found for row ${row_num} of ${cluster_reps_csv}: '${cif_path}'"
-            any_cif_missing=1
-            continue
-        fi
-
-        cif_paths+=("$cif_path")
-    done < "$cluster_reps_csv"
-
-    if [ $any_cif_missing -ne 0 ]; then
-        echo "ERROR [${dataset}]: One or more CIF restraint files were missing, aborting."
-        return 1
-    fi
-
-    if [ ${#cif_paths[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No data rows found in $cluster_reps_csv"
-        return 1
-    fi
-
     local cif_list
-    cif_list=$(IFS=,; echo "${cif_paths[*]}")
+    cif_list=$(build_cif_list_from_cluster_reps "$dataset" "$cluster_reps_csv") || return 1
 
     local final_pdb="${final_dir}/final_model.pdb"
     local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
@@ -2748,7 +2863,7 @@ rsr_final_process_dataset() {
     fi
 
     echo "[${dataset}] Map: $map_file"
-    echo "[${dataset}] Using CIF restraints list (${#cif_paths[@]} entries): $cif_list"
+    echo "[${dataset}] Using CIF restraints list: $cif_list"
 
     python "$RSR_SCRIPT_FINAL" \
         "$final_pdb" \
@@ -3034,24 +3149,410 @@ clash_groups_aggregate_outputs_exist() {
 }
 
 ######################################################################
-# Stage 7a: despot
+# Stage 7a: rotamer_optimize
 ######################################################################
-# For each dataset (only runs when despot_run_name is given), scores every placer2 round-2
-# conformer (not just the one pose filter2/build_final_model happened to select) against DESPOT:
-# extract_ligand_conformers pools every conformer into one ligs.pdb, symmetry_expand's
-# --ligand-conformers-pdb mode expands final_model_refined.pdb's protein into a crystal
-# environment realistic for all of them (EXPAND_DISTANCE_CUTOFF, default 10 A), the expanded
-# protein and ligand conformers are converted to mol2 (lig_scripts/pdb_to_mol2.sh,
-# lig_scripts/protein_to_mol2.sh), and DESPOT's score_complex.py scores every conformer at once.
-# despot_filter.py then reselects, per filter2 cluster, the pose that best trades off RSCC
-# against DESPOT (Pareto front over MSE/DESPOT, real RSCC computed internally via qfit's
-# transformer, winner = argmax(RSCC - rscc_weight*normalized_DESPOT), kept only if it clears both
-# --despot_rscc_threshold and --despot_threshold) - see despot_filter.py's own docstring. Every
-# output is written into .../<final_run_name>/<despot_run_name>/, following the same nested
-# run-name convention as every other stage.
+# For each dataset (only runs when rotamer_run_name is given), re-samples chi/aromatic-angle
+# rotamers for every residue in final_model.pdb (stage 6a's output, BEFORE rsr_final's
+# refinement - NOT final_model_refined.pdb) listed in residues_with_placer_conformers.csv that
+# scores below RSCC 0.5 against the dataset's (deduped) event maps, keeping the resampled
+# conformer only if it improves RSCC by >= 0.1 over the starting conformer - see
+# qfit/command_line/rotamer_optimize.py. residues_with_placer_conformers.csv is read implicitly
+# by rotamer_optimize itself, as a sidecar of its model_file argument.
+
+rotamer_optimize_process_dataset() {
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+    local final_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local rotamer_dir="${final_dir}/${rotamer_run_name}"
+    local rotamer_output_folder="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+
+    if [ "$overwrite" -ne 1 ] && files_exist "${rotamer_dir}/rotamer_optimized.pdb"; then
+        echo "Skipping [${dataset}]: rotamer_optimize already complete (${rotamer_dir}/rotamer_optimized.pdb exists)."
+        return 0
+    fi
+
+    local final_pdb="${final_dir}/final_model.pdb"
+    local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
+
+    if [ ! -f "$final_pdb" ]; then
+        echo "ERROR [${dataset}]: final_pdb not found: ${final_pdb}"
+        return 1
+    fi
+    if [ ! -f "$residues_csv" ]; then
+        echo "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
+        return 1
+    fi
+
+    conda_activate "$CONDA_ENV_QFIT"
+
+    local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
+    if [ -z "$lookup" ]; then
+        echo "Warning: No match found for dataset ${dataset}, skipping."
+        return 1
+    fi
+    local resolution=$(echo "$lookup" | awk '{print $3}')
+
+    echo "[${dataset}] Model: $final_pdb"
+    echo "[${dataset}] Residues: $residues_csv"
+    echo "[${dataset}] Resolution: $resolution"
+
+    rotamer_optimize "$dataset_dir" "$final_pdb" "$rotamer_output_folder" -r "$resolution"
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "ERROR [${dataset}]: rotamer_optimize failed with exit code $exit_code"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${final_pdb} -> ${rotamer_dir}/rotamer_optimized.pdb"
+}
+export -f rotamer_optimize_process_dataset
+
+do_rotamer_optimize() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" rotamer_optimize_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 7b: rsr_rotamer
+######################################################################
+# Real-space refines rotamer_optimized.pdb (stage 7a's output), restricted to the same
+# residues_with_placer_conformers.csv residue list rotamer_optimize was run against, via
+# real_space_refine_final.py (SINGLE-mode coot refinement - same invocation stage 6b's rsr_final
+# uses on final_model.pdb).
+
+rsr_rotamer_process_dataset() {
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+    local filter2_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}"
+    local final_dir="${filter2_dir}/${final_run_name}"
+    local rotamer_dir="${final_dir}/${rotamer_run_name}"
+
+    if [ "$overwrite" -ne 1 ] && files_exist "${rotamer_dir}/rotamer_refined.pdb"; then
+        echo "Skipping [${dataset}]: rsr_rotamer already complete (${rotamer_dir}/rotamer_refined.pdb exists)."
+        return 0
+    fi
+
+    conda_activate "$CONDA_ENV_RSR"
+
+    local map_file
+    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_1*" | head -1)
+    if [ -z "$map_file" ]; then
+        echo "ERROR [${dataset}]: No event map found matching ${dataset}-event_1* in ${dataset_dir}"
+        return 1
+    fi
+
+    local cluster_reps_csv="${filter2_dir}/cluster_reps.csv"
+    if [ ! -f "$cluster_reps_csv" ]; then
+        echo "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
+        return 1
+    fi
+
+    local cif_list
+    cif_list=$(build_cif_list_from_cluster_reps "$dataset" "$cluster_reps_csv") || return 1
+
+    local input_pdb="${rotamer_dir}/rotamer_optimized.pdb"
+    local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
+    local output_pdb="${rotamer_dir}/rotamer_refined.pdb"
+
+    if [ ! -f "$input_pdb" ]; then
+        echo "ERROR [${dataset}]: rotamer_optimized.pdb not found: ${input_pdb}"
+        return 1
+    fi
+    if [ ! -f "$residues_csv" ]; then
+        echo "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
+        return 1
+    fi
+
+    echo "[${dataset}] Map: $map_file"
+    echo "[${dataset}] Using CIF restraints list: $cif_list"
+
+    python "$RSR_SCRIPT_FINAL" \
+        "$input_pdb" \
+        "$residues_csv" \
+        "$map_file" \
+        "$output_pdb" \
+        --cif-list "$cif_list"
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
+        return 1
+    fi
+
+    echo "Completed: ${dataset}"
+}
+export -f rsr_rotamer_process_dataset
+
+do_rsr_rotamer() {
+    conda_activate "$CONDA_ENV_RSR"
+    export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" rsr_rotamer_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+
+    unset OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS
+}
+
+######################################################################
+# Stage 7c: calc_rotamer_refined_rscc
+######################################################################
+# Per-residue RSCC of rotamer_refined.pdb (stage 7b's output), restricted (via calc_rscc's
+# --residues-csv) to residues_with_placer_conformers.csv - the same residues rotamer_optimize
+# was run against.
+
+calc_rotamer_refined_rscc_process_dataset() {
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+    local final_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local rotamer_dir="${final_dir}/${rotamer_run_name}"
+    local structure="${rotamer_dir}/rotamer_refined.pdb"
+    local output_csv="${rotamer_dir}/rotamer_refined_rscc.csv"
+
+    if [ "$overwrite" -ne 1 ] && files_exist "$output_csv"; then
+        echo "Skipping [${dataset}]: calc_rotamer_refined_rscc already complete (${output_csv} exists)."
+        return 0
+    fi
+
+    conda_activate "$CONDA_ENV_QFIT"
+    shopt -s nullglob
+
+    local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
+    if [ -z "$lookup" ]; then
+        echo "Warning: No match found for dataset ${dataset}, skipping."
+        return 1
+    fi
+    local resolution=$(echo "$lookup" | awk '{print $3}')
+
+    local event_maps=("${dataset_dir}/${dataset}-event_"*)
+    if [ ${#event_maps[@]} -eq 0 ]; then
+        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        return 1
+    fi
+
+    if [ ! -f "$structure" ]; then
+        echo "Warning [${dataset}]: rotamer_refined.pdb not found: ${structure}, skipping."
+        return 1
+    fi
+
+    local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
+    if [ ! -f "$residues_csv" ]; then
+        echo "Warning [${dataset}]: residues_csv not found: ${residues_csv}, skipping."
+        return 1
+    fi
+
+    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" --residues-csv "$residues_csv"
+
+    local calc_exit=$?
+    if [ $calc_exit -ne 0 ]; then
+        echo "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${structure} -> ${output_csv}"
+}
+export -f calc_rotamer_refined_rscc_process_dataset
+
+do_calc_rotamer_rscc() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" calc_rotamer_refined_rscc_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 7d: select_optimized_residues
+######################################################################
+# rotamer_optimize's own acceptance check happens before RSR (rsr_rotamer, stage 7b), against
+# the unrefined candidate, so it can't see a residue end up worse than final_model_refined.pdb
+# once RSR has moved things around - this happens even to residues rotamer_optimize never
+# touched, since rsr_rotamer refines the full residues_with_placer_conformers.csv selection
+# jointly, not just the accepted ones. For every residue in residues_with_placer_conformers.csv,
+# compares that residue's RSCC in final_model_refined_rscc.csv (stage 6c) against
+# rotamer_refined_rscc.csv (stage 7c) and reverts to final_model_refined's conformation only if
+# its RSCC is at least REVERT_MIN_DIFF (0.1) higher - most of the raw gap between the two
+# independent refinement runs is noise, not a real quality difference - see
+# select_optimized_residues.py.
+#                                        -> .../<final_run_name>/<rotamer_run_name>/
+#                                           optimized.pdb
+#                                           + optimized_rscc.csv (residue,rscc,source - values
+#                                             read from final_model_refined_rscc.csv/
+#                                             rotamer_refined_rscc.csv, never recomputed)
+#                                           + reverted_residues.csv (residue,final_rscc,
+#                                             rotamer_rscc,diff - just the reverted subset, sorted
+#                                             by diff descending)
+# Every rotamer-stage plot below (7e/7f/7g) uses optimized.pdb/optimized_rscc.csv, not the raw
+# rotamer_refined.pdb/rotamer_refined_rscc.csv - hence running after this step, not before it.
+
+select_optimized_residues_process_dataset() {
+    local dataset=$1
+    local dataset_dir="${DATASETS_DIR}/${dataset}"
+    local final_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local rotamer_dir="${final_dir}/${rotamer_run_name}"
+    local final_model="${final_dir}/final_model_refined.pdb"
+    local rotamer_model="${rotamer_dir}/rotamer_refined.pdb"
+    local final_rscc_csv="${final_dir}/final_model_refined_rscc.csv"
+    local rotamer_rscc_csv="${rotamer_dir}/rotamer_refined_rscc.csv"
+    local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
+    local output_pdb="${rotamer_dir}/optimized.pdb"
+    local output_rscc_csv="${rotamer_dir}/optimized_rscc.csv"
+    local reverted_csv="${rotamer_dir}/reverted_residues.csv"
+
+    if [ "$overwrite" -ne 1 ] && files_exist "$output_pdb" "$output_rscc_csv" "$reverted_csv"; then
+        echo "Skipping [${dataset}]: select_optimized_residues already complete (${output_pdb} exists)."
+        return 0
+    fi
+
+    for f in "$final_model" "$rotamer_model" "$final_rscc_csv" "$rotamer_rscc_csv" "$residues_csv"; do
+        if [ ! -f "$f" ]; then
+            echo "Warning [${dataset}]: required file not found: ${f}, skipping."
+            return 1
+        fi
+    done
+
+    conda_activate "$CONDA_ENV_QFIT"
+    select_optimized_residues "$final_model" "$rotamer_model" "$final_rscc_csv" "$rotamer_rscc_csv" \
+        "$residues_csv" "$output_pdb"
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "ERROR [${dataset}]: select_optimized_residues failed with exit code $exit_code"
+        return 1
+    fi
+
+    echo "Completed [${dataset}]: ${output_pdb}, ${output_rscc_csv}, ${reverted_csv}"
+}
+export -f select_optimized_residues_process_dataset
+
+do_select_optimized_residues() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    echo "Starting run"
+    local start_time=$(date +%s)
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_PARALLEL_DEFAULT" select_optimized_residues_process_dataset {}
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 7e: plot_residues_vs_ref_rotamer (only runs when -c is given)
+######################################################################
+# Per-residue RSCC comparison of optimized.pdb vs reference (optimized_rscc.csv, from Stage 7d -
+# not the raw rotamer_refined_rscc.csv), restricted to residues_with_placer_conformers.csv (the
+# only residues optimized.pdb ever touches), pooled across datasets, into
+# GRAPHS_DIR/<run>/.../<final_run_name>/<rotamer_run_name>/. Also writes
+# rotamer_refined_vs_reference_rscc_outliers.csv there (residues >= 0.1 worse than reference),
+# mirroring stage 6's final_refined_vs_reference_rscc_outliers.csv.
+
+do_plot_residues_vs_ref_rotamer() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_RESIDUES_VS_REF_ROTAMER_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$rotamer_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+rotamer_ref_comparison_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    files_exist "${out_dir}/rotamer_refined_vs_reference_rscc_restricted.png"
+}
+
+######################################################################
+# Stage 7f: plot_rotamer_vs_pipeline (runs unconditionally, not gated behind -c)
+######################################################################
+# Per-residue RSCC comparison of optimized.pdb (optimized_rscc.csv, from Stage 7d - not the raw
+# rotamer_refined_rscc.csv) vs two other pipeline structures (final_model_refined and
+# backbone_refined, the latter being the same 'apo set' baseline the stage 9 protein RSCC plots
+# use), restricted to residues_with_placer_conformers.csv, pooled across datasets, into
+# GRAPHS_DIR/<run>/.../<final_run_name>/<rotamer_run_name>/. Doesn't need the reference
+# set, so - like plot_protein_rscc_pooled.py - it always runs.
+
+do_plot_rotamer_vs_pipeline() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_ROTAMER_VS_PIPELINE_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$rotamer_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+rotamer_vs_pipeline_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    files_exist "${out_dir}/rotamer_refined_vs_final_refined_rscc_restricted.png" \
+                "${out_dir}/rotamer_refined_vs_backbone_refined_rscc_restricted.png"
+}
+
+######################################################################
+# Stage 7g: aggregate_rotamer_worse_residues (only runs when -c is given)
+######################################################################
+# Pooled csv (no plot) of every residue - restricted to residues_with_placer_conformers.csv -
+# whose OPTIMIZED RSCC (optimized_rscc.csv, from Stage 7d - not the raw rotamer_refined_rscc.csv)
+# is more than 0.1 worse than either the matched reference-structure residue's RSCC or the
+# pre-rotamer-optimization final_model_refined RSCC (this second comparison should structurally
+# never find a row - see run_rotamer_worse_residues's docstring). A triage list for residues
+# where rotamer_optimize's clash resolution (or the subsequent RSR refinement, or - now -
+# select_optimized_residues's own best-of-final-or-rotamer choice) landed on a worse rotamer than
+# either baseline. Needs the reference set, so gated behind -c like Stage 7e, whose per-dataset
+# ref-comparison csvs it's built alongside.
+
+do_aggregate_rotamer_worse_residues() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$AGGREGATE_ROTAMER_WORSE_RESIDUES_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$rotamer_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+rotamer_worse_residues_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    files_exist "${out_dir}/rotamer_refined_worse_residues.csv"
+}
+
+######################################################################
+# Stage 8a: despot
+######################################################################
+# For each dataset (only runs when rotamer_run_name and despot_run_name are both given), scores
+# every placer2 round-2 conformer (not just the one pose filter2/build_final_model happened to
+# select) against DESPOT: extract_ligand_conformers pools every conformer into one ligs.pdb,
+# symmetry_expand's --ligand-conformers-pdb mode expands optimized.pdb's protein (stage
+# 7d's output - previously rotamer_refined.pdb, before select_optimized_residues was inserted into
+# the pipeline; optimized.pdb is never worse per-residue than rotamer_refined.pdb by construction,
+# see select_optimized_residues.py) into a crystal environment realistic for all of them (EXPAND_DISTANCE_CUTOFF,
+# default 10 A), the expanded protein and ligand conformers are converted to mol2
+# (lig_scripts/pdb_to_mol2.sh, lig_scripts/protein_to_mol2.sh), and DESPOT's score_complex.py
+# scores every conformer at once. despot_filter.py then reselects, per filter2 cluster, the pose
+# that best trades off RSCC against DESPOT (Pareto front over MSE/DESPOT, real RSCC computed
+# internally via qfit's transformer, winner = argmax(RSCC - rscc_weight*normalized_DESPOT), kept
+# only if it clears both --despot_rscc_threshold and --despot_threshold) - see despot_filter.py's
+# own docstring. Every output is written into .../<final_run_name>/<rotamer_run_name>/
+# <despot_run_name>/, following the same nested run-name convention as every other stage.
 #
 # Note: since <dataset>_DESPOT.csv now scores every placer2 conformer rather than just the 4-ish
-# final poses, Stage 7b's per-conformer score histograms (plot_despot_energies.py) reflect that
+# final poses, Stage 8b's per-conformer score histograms (plot_despot_energies.py) reflect that
 # larger, differently-shaped population - an expected consequence of scoring before selection.
 
 despot_process_dataset() {
@@ -3060,8 +3561,10 @@ despot_process_dataset() {
     local placer2_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
     local filter2_dir="${placer2_dir}/${filter2_run_name}"
     local final_dir="${filter2_dir}/${final_run_name}"
-    local final_model="${final_dir}/final_model_refined.pdb"
-    local despot_dir="${final_dir}/${despot_run_name}"
+    local rotamer_dir="${final_dir}/${rotamer_run_name}"
+    local final_model="${rotamer_dir}/optimized.pdb"
+    local apo_structure="${dataset_dir}/${dataset}-aligned-structure.pdb"
+    local despot_dir="${rotamer_dir}/${despot_run_name}"
     local despot_csv_check="${despot_dir}/${dataset}_DESPOT.csv"
     local conformer_map_check="${despot_dir}/conformer_map.csv"
     local despot_filtered_check="${despot_dir}/despot_filtered.pdb"
@@ -3072,7 +3575,11 @@ despot_process_dataset() {
     fi
 
     if [ ! -f "$final_model" ]; then
-        echo "Warning [${dataset}]: final_model_refined.pdb not found: ${final_model}, skipping."
+        echo "Warning [${dataset}]: optimized.pdb not found: ${final_model}, skipping."
+        return 1
+    fi
+    if [ ! -f "$apo_structure" ]; then
+        echo "Warning [${dataset}]: apo structure not found: ${apo_structure}, skipping."
         return 1
     fi
 
@@ -3192,7 +3699,7 @@ despot_process_dataset() {
 
     step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"
-    despot_filter "$final_model" "$filter2_dir" "$despot_dir" "${event_maps[@]}" "$resolution" \
+    despot_filter "$final_model" "$apo_structure" "$filter2_dir" "$despot_dir" "${event_maps[@]}" "$resolution" \
         "$despot_filtered_pdb" "${despot_filter_args[@]}"
     status=$?
     conda_deactivate
@@ -3228,10 +3735,10 @@ do_despot() {
 }
 
 ######################################################################
-# Stage 7b: plot_despot_energies + plot_despot_energies_pooled
+# Stage 8b: plot_despot_energies + plot_despot_energies_pooled
 ######################################################################
 # Per-dataset histogram of heavy-atom-normalized DESPOT ligand binding-energy
-# scores, read from .../<final_run_name>/<despot_run_name>/despot_filtered_scores.csv
+# scores, read from .../<final_run_name>/<rotamer_run_name>/<despot_run_name>/despot_filtered_scores.csv
 # (despot_filter.py's own per-instance normalized_score column - not the raw,
 # un-normalized <dataset>_DESPOT.csv score, which isn't comparable across
 # differently-sized ligands), written into that dataset's existing
@@ -3239,7 +3746,7 @@ do_despot() {
 # too) - the same per-dataset location every other stage-8 plot uses (not
 # nested under despot_run_name) - plus the pooled (cross-dataset) counterpart:
 # every dataset's normalized DESPOT scores combined into one histogram,
-# GRAPHS_DIR/<run>/.../<final_run_name>/<despot_run_name>/ligand_energies.png
+# GRAPHS_DIR/<run>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/ligand_energies.png
 # (nested under despot_run_name, unlike the other pooled plots, since the
 # scores are specific to one despot_run_name). The pooled half is still
 # guarded by run_step_pooled_replot's --dataset check, since it writes into
@@ -3252,7 +3759,7 @@ do_plot_despot_energies() {
     local start_time=$(date +%s)
     python "$PLOT_DESPOT_ENERGIES_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -3261,12 +3768,12 @@ do_plot_despot_energies() {
 do_plot_despot_energies_pooled() {
     conda_activate "$CONDA_ENV_EVAL"
 
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     echo "Starting run"
     local start_time=$(date +%s)
     python "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -3282,13 +3789,13 @@ do_despot_plots() {
 # despot_energies.png (datasets with no DESPOT csv - e.g. no SMILES - can
 # never get a plot, so they're not required).
 despot_plots_outputs_exist() {
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     files_exist "${out_dir}/ligand_energies.png" || return 1
 
     local dataset
     for dataset in "${DATASETS[@]}"; do
         local final_dir="${DATASETS_DIR}/${dataset}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
-        local despot_csv="${final_dir}/${despot_run_name}/${dataset}_DESPOT.csv"
+        local despot_csv="${final_dir}/${rotamer_run_name}/${despot_run_name}/${dataset}_DESPOT.csv"
         if [ -f "$despot_csv" ] && [ ! -f "${final_dir}/graphs/despot_energies.png" ]; then
             return 1
         fi
@@ -3297,24 +3804,24 @@ despot_plots_outputs_exist() {
 }
 
 ######################################################################
-# Stage 7c: plot_lig_vs_ref_despot (only with -c)
+# Stage 8c: plot_lig_vs_ref_despot (only with -c)
 ######################################################################
 # Pooled plot restricted to the ligand poses that survived despot_filter
 # (despot_run_name/despot_filtered.pdb): filter2_run_name/cluster_reps.csv's
 # RSCC for just those surviving instances vs the reference set, matched by
 # centroid distance the same way stages 3d/5b do - see plot_lig_vs_ref_despot.py.
-# Nested under despot_run_name, like Stage 7b's pooled half, since which
+# Nested under despot_run_name, like Stage 8b's pooled half, since which
 # ligands survive is specific to one despot_run_name/--despot_threshold.
 
 do_plot_lig_vs_ref_despot() {
     conda_activate "$CONDA_ENV_EVAL"
 
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     echo "Starting run"
     local start_time=$(date +%s)
     python "$PLOT_LIG_VS_REF_DESPOT_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
         --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
     echo "All jobs completed"
@@ -3322,20 +3829,20 @@ do_plot_lig_vs_ref_despot() {
 }
 
 despot_lig_vs_ref_outputs_exist() {
-    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/lig_vs_reference_rscc.png"
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/lig_vs_reference_rscc.png"
 }
 
 ######################################################################
-# Stage 7d: plot_despot_ligand_summary + plot_despot_ligand_summary_single
+# Stage 8d: plot_despot_ligand_summary + plot_despot_ligand_summary_single
 ######################################################################
 # Pooled scatter of every surviving (despot_filter-kept) ligand's heavy-atom-
 # normalized DESPOT score (x) against its filter2_run_name/cluster_reps.csv
 # RSCC (y) - see plot_despot_ligand_summary.py. Doesn't need -c: RSCC here
 # comes from cluster_reps.csv, not the reference set. Nested under
-# despot_run_name, like Stage 7b/7c, since the surviving ligands are specific
+# despot_run_name, like Stage 8b/8c, since the surviving ligands are specific
 # to one despot_run_name/--despot_threshold. Plus the per-dataset counterpart:
 # each dataset's own surviving ligands only, written directly into that
-# dataset's own .../<final_run_name>/<despot_run_name>/ directory (not
+# dataset's own .../<final_run_name>/<rotamer_run_name>/<despot_run_name>/ directory (not
 # graphs_dir) with each point labeled (chain+resi, e.g. 'C1') since a single
 # dataset typically has few enough surviving ligands for that to stay
 # readable - see plot_despot_ligand_summary_single.py.
@@ -3343,12 +3850,12 @@ despot_lig_vs_ref_outputs_exist() {
 do_plot_despot_ligand_summary() {
     conda_activate "$CONDA_ENV_EVAL"
 
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     echo "Starting run"
     local start_time=$(date +%s)
     python "$PLOT_DESPOT_LIGAND_SUMMARY_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -3361,7 +3868,7 @@ do_plot_despot_ligand_summary_single() {
     local start_time=$(date +%s)
     python "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -3378,12 +3885,12 @@ do_despot_ligand_summary_plots() {
 # per-dataset ligand_summary.png (datasets with no kept ligand never get a
 # plot - single-dataset or pooled - so they're not required).
 despot_ligand_summary_outputs_exist() {
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     files_exist "${out_dir}/ligand_summary.png" || return 1
 
     local dataset
     for dataset in "${DATASETS[@]}"; do
-        local despot_dir="${DATASETS_DIR}/${dataset}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+        local despot_dir="${DATASETS_DIR}/${dataset}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
         local scores_csv="${despot_dir}/despot_filtered_scores.csv"
         if [ -f "$scores_csv" ] && grep -q ',True$' "$scores_csv" && [ ! -f "${despot_dir}/ligand_summary.png" ]; then
             return 1
@@ -3393,25 +3900,25 @@ despot_ligand_summary_outputs_exist() {
 }
 
 ######################################################################
-# Stage 7e: plot_despot_vs_ref (only with -c)
+# Stage 8e: plot_despot_vs_ref (only with -c)
 ######################################################################
 # Pooled scatter of each dataset's reference-set DESPOT score (Stage 0d's
 # REF_SET/<dataset>/<dataset>_DESPOT.csv) against the matched pipeline
 # ligand's DESPOT score (despot_run_name/despot_filtered_scores.csv), both
 # heavy-atom-normalized, matched by centroid distance the same way stages
-# 3d/5b/7c do - see plot_despot_vs_ref.py. Nested under despot_run_name,
-# like Stage 7b/7c/7d, since the pipeline-side scores are specific to one
+# 3d/5b/8c do - see plot_despot_vs_ref.py. Nested under despot_run_name,
+# like Stage 8b/8c/8d, since the pipeline-side scores are specific to one
 # despot_run_name/--despot_threshold.
 
 do_plot_despot_vs_ref() {
     conda_activate "$CONDA_ENV_EVAL"
 
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     echo "Starting run"
     local start_time=$(date +%s)
     python "$PLOT_DESPOT_VS_REF_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
         --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
     echo "All jobs completed"
@@ -3419,28 +3926,28 @@ do_plot_despot_vs_ref() {
 }
 
 despot_vs_ref_outputs_exist() {
-    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/despot_vs_reference.png"
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/despot_vs_reference.png"
 }
 
 ######################################################################
-# Stage 7f: plot_rscc_despot_tradeoff (only with -c)
+# Stage 8f: plot_rscc_despot_tradeoff (only with -c)
 ######################################################################
 # Pooled scatter of despot_filter.py's RSCC/DESPOT reselection tradeoff relative to the
-# reference structure, restricted to despot_filter survivors (same alive_rows as 7c/7e): y =
+# reference structure, restricted to despot_filter survivors (same alive_rows as 8c/8e): y =
 # pipeline RSCC - reference RSCC, x = reference DESPOT - pipeline DESPOT (both normalized) - see
-# plot_rscc_despot_tradeoff.py. Nested under despot_run_name, like Stage 7b/7c/7d/7e, since the
+# plot_rscc_despot_tradeoff.py. Nested under despot_run_name, like Stage 8b/8c/8d/8e, since the
 # pipeline-side scores are specific to one despot_run_name/--despot_threshold/
 # --despot_rscc_threshold/--despot_rscc_weight.
 
 do_plot_rscc_despot_tradeoff() {
     conda_activate "$CONDA_ENV_EVAL"
 
-    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
     echo "Starting run"
     local start_time=$(date +%s)
     python "$PLOT_RSCC_DESPOT_TRADEOFF_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
-        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "$despot_run_name" \
+        "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
         --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
     echo "All jobs completed"
@@ -3448,14 +3955,45 @@ do_plot_rscc_despot_tradeoff() {
 }
 
 rscc_despot_tradeoff_outputs_exist() {
-    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${despot_run_name}/rscc_despot_tradeoff_vs_reference.png"
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/rscc_despot_tradeoff_vs_reference.png"
 }
 
 ######################################################################
-# Stage 8: analysis plots (collapsed into one idempotent unit)
+# Stage 8g: plot_residues_vs_ref_despot (only with -c)
+######################################################################
+# Per-residue RSCC comparison of optimized vs reference (same rotamer_run_name/
+# optimized_rscc.csv values as Stage 7e/7f/7g - despot_filter.py's own input is now optimized.pdb,
+# not rotamer_refined.pdb, so this plot uses optimized_rscc.csv too), restricted to despot_run_name/
+# modified_residues.csv - the residues despot_filter.py's reset_protein_to_apo_where_unbacked
+# left with a non-apo conformation (i.e. residues_with_placer_conformers.csv minus whatever it
+# reset because their only backing placer file's ligand was rejected). Nested under
+# despot_run_name, like Stage 8b/8c/8d/8e/8f, since the modified-residue set is specific to one
+# despot_run_name/--despot_threshold/--despot_rscc_threshold/--despot_rscc_weight.
+
+do_plot_residues_vs_ref_despot() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_RESIDUES_VS_REF_DESPOT_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" \
+        "$final_run_name" "$rotamer_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+despot_residues_vs_ref_outputs_exist() {
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/rotamer_refined_despot_vs_reference_rscc_restricted.png"
+}
+
+######################################################################
+# Stage 9: analysis plots (collapsed into one idempotent unit)
 ######################################################################
 # Every plot below (per-dataset and pooled) is checked/skipped together as
-# one stage - see stage8_outputs_exist() and stage8_plots() at the end of
+# one stage - see stage9_outputs_exist() and stage9_plots() at the end of
 # this section. Individual do_* functions are unchanged; only the
 # orchestration is collapsed.
 
@@ -3626,7 +4164,7 @@ do_plot_bfactor_rho_pooled() {
     print_elapsed "$start_time"
 }
 
-do_stage8_plots() {
+do_stage9_plots() {
     do_plot_cluster_reps_rscc
     do_aggregate_protein_rscc
     do_aggregate_lig_rscc
@@ -3639,7 +4177,7 @@ do_stage8_plots() {
     do_plot_bfactor_rho_pooled
 }
 
-# stage8_outputs_exist: true only if every pooled output already exists,
+# stage9_outputs_exist: true only if every pooled output already exists,
 # and, for every dataset that actually has a final_model_refined_rscc.csv
 # (some legitimately never will - e.g. filter/filter2 rejected every
 # candidate for that dataset, so build_final_model never produced a
@@ -3648,7 +4186,7 @@ do_stage8_plots() {
 # no final_model_refined_rscc.csv can never produce those per-dataset
 # outputs, so it's skipped here rather than permanently blocking stage 8
 # from ever being considered complete.
-stage8_outputs_exist() {
+stage9_outputs_exist() {
     local pooled_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
     files_exist \
         "${pooled_dir}/cluster_reps_1_pooled.png" "${pooled_dir}/cluster_reps_2_pooled.png" \
@@ -3761,29 +4299,50 @@ stage6_final() {
         clash_groups_aggregate_outputs_exist do_aggregate_clash_groups
 }
 
-stage7_despot() {
-    run_step "Stage 7a: despot (${despot_run_name})" do_despot
-    run_step_pooled_replot "Stage 7b: plot_despot_energies + plot_despot_energies_pooled (${despot_run_name})" \
-        despot_plots_outputs_exist do_despot_plots
+stage7_rotamer() {
+    run_step "Stage 7a: rotamer_optimize (${rotamer_run_name})" do_rotamer_optimize
+    run_step "Stage 7b: rsr_rotamer (${rotamer_run_name})" do_rsr_rotamer
+    run_step "Stage 7c: calc_rotamer_refined_rscc (${rotamer_run_name})" do_calc_rotamer_rscc
+    run_step "Stage 7d: select_optimized_residues (${rotamer_run_name})" do_select_optimized_residues
     if [ "$compare_ref_set" -eq 1 ]; then
-        run_step_pooled_replot "Stage 7c: plot_lig_vs_ref_despot (${despot_run_name})" \
-            despot_lig_vs_ref_outputs_exist do_plot_lig_vs_ref_despot
+        run_step_pooled_replot "Stage 7e: plot_residues_vs_ref_rotamer (${rotamer_run_name})" \
+            rotamer_ref_comparison_outputs_exist do_plot_residues_vs_ref_rotamer
     fi
-    run_step_pooled_replot "Stage 7d: plot_despot_ligand_summary + plot_despot_ligand_summary_single (${despot_run_name})" \
-        despot_ligand_summary_outputs_exist do_despot_ligand_summary_plots
+    run_step_pooled_replot "Stage 7f: plot_rotamer_vs_pipeline (${rotamer_run_name})" \
+        rotamer_vs_pipeline_outputs_exist do_plot_rotamer_vs_pipeline
     if [ "$compare_ref_set" -eq 1 ]; then
-        run_step_pooled_replot "Stage 7e: plot_despot_vs_ref (${despot_run_name})" \
-            despot_vs_ref_outputs_exist do_plot_despot_vs_ref
-    fi
-    if [ "$compare_ref_set" -eq 1 ]; then
-        run_step_pooled_replot "Stage 7f: plot_rscc_despot_tradeoff (${despot_run_name})" \
-            rscc_despot_tradeoff_outputs_exist do_plot_rscc_despot_tradeoff
+        run_step_pooled_replot "Stage 7g: aggregate_rotamer_worse_residues (${rotamer_run_name})" \
+            rotamer_worse_residues_outputs_exist do_aggregate_rotamer_worse_residues
     fi
 }
 
-stage8_plots() {
-    run_step_pooled_replot "Stage 8: analysis plots (${final_run_name})" \
-        stage8_outputs_exist do_stage8_plots
+stage8_despot() {
+    run_step "Stage 8a: despot (${despot_run_name})" do_despot
+    run_step_pooled_replot "Stage 8b: plot_despot_energies + plot_despot_energies_pooled (${despot_run_name})" \
+        despot_plots_outputs_exist do_despot_plots
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 8c: plot_lig_vs_ref_despot (${despot_run_name})" \
+            despot_lig_vs_ref_outputs_exist do_plot_lig_vs_ref_despot
+    fi
+    run_step_pooled_replot "Stage 8d: plot_despot_ligand_summary + plot_despot_ligand_summary_single (${despot_run_name})" \
+        despot_ligand_summary_outputs_exist do_despot_ligand_summary_plots
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 8e: plot_despot_vs_ref (${despot_run_name})" \
+            despot_vs_ref_outputs_exist do_plot_despot_vs_ref
+    fi
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 8f: plot_rscc_despot_tradeoff (${despot_run_name})" \
+            rscc_despot_tradeoff_outputs_exist do_plot_rscc_despot_tradeoff
+    fi
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 8g: plot_residues_vs_ref_despot (${despot_run_name})" \
+            despot_residues_vs_ref_outputs_exist do_plot_residues_vs_ref_despot
+    fi
+}
+
+stage9_plots() {
+    run_step_pooled_replot "Stage 9: analysis plots (${final_run_name})" \
+        stage9_outputs_exist do_stage9_plots
 }
 
 # --- Drive the requested stages, in order, stopping after the last name given ---
@@ -3810,10 +4369,13 @@ fi
 
 if [ -n "$final_run_name" ]; then
     stage6_final
-    if [ -n "$despot_run_name" ]; then
-        stage7_despot
+    if [ -n "$rotamer_run_name" ]; then
+        stage7_rotamer
+        if [ -n "$despot_run_name" ]; then
+            stage8_despot
+        fi
     fi
-    stage8_plots
+    stage9_plots
 fi
 
 overall_end=$(date +%s)

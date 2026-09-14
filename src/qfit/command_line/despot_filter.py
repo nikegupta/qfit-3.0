@@ -27,14 +27,31 @@ def build_argparser():
                     "against every given map (max across maps), and keeps whichever member "
                     "maximizes RSCC - rscc_weight*normalized_DESPOT - but only if that winner's "
                     "RSCC and normalized DESPOT score both clear their thresholds, otherwise "
-                    "that cluster's ligand is dropped entirely."
+                    "that cluster's ligand is dropped entirely. Also enforces that every non-apo "
+                    "protein conformation in the output is backed by a placer file whose ligand "
+                    "survived this filtering: any residue whose only PLACER-derived conformer(s) "
+                    "came from rejected-ligand placer file(s) is reset to its apo_structure "
+                    "coordinates (see reset_protein_to_apo_where_unbacked), and the surviving "
+                    "restricted residue list is written to modified_residues.csv."
     )
     p.add_argument(
         'final_model_pdb', type=Path,
-        help='Path to final_model_refined.pdb - supplies the protein atoms (unchanged) and '
-             'each cluster\'s current ligand instance (chain/resi/icode - only its coordinates '
-             'may be replaced by a different conformer; its identity/slot in the output never '
-             'changes).'
+        help='Path to the current protein+ligand structure (e.g. optimized.pdb, stage 7d\'s '
+             'output - never worse per-residue than rotamer_refined.pdb by construction, see '
+             'select_optimized_residues.py) - supplies the protein atoms and each cluster\'s '
+             'current ligand instance (chain/resi/icode - only its coordinates may be replaced by '
+             'a different conformer; its identity/slot in the output never changes). Protein '
+             'residues belonging only to a rejected ligand\'s placer file (see apo_structure) are '
+             'reset rather than carried through unchanged.'
+    )
+    p.add_argument(
+        'apo_structure', type=Path,
+        help='Path to the apo (ligand-free) PANDDA structure for this dataset (the same file '
+             'build_final_model.py uses as its own apo fallback). Any protein residue whose only '
+             'PLACER-derived conformation came from a placer file backing a ligand that this run '
+             'rejects - and that is not ALSO part of a placer file backing a ligand that survives '
+             '- is reset to its coordinates here, since this pipeline only wants non-apo protein '
+             'conformations near ligands it actually kept.'
     )
     p.add_argument(
         'filter2_dir', type=Path,
@@ -79,6 +96,17 @@ def build_argparser():
         '--rscc-weight', dest='rscc_weight', type=float, default=0.05, metavar='<float>',
         help='Weight applied to normalized DESPOT score when picking the winner: '
              'argmax(RSCC - rscc_weight*normalized_DESPOT) (default: 0.05).'
+    )
+    p.add_argument(
+        '--residues-with-placer-conformers-csv', dest='residues_with_placer_conformers_csv',
+        type=Path, default=None, metavar='<path>',
+        help='Path to build_final_model.py\'s residues_with_placer_conformers.csv for this '
+             'dataset/run. Defaults to final_model_pdb.parent.parent/'
+             'residues_with_placer_conformers.csv (i.e. final_model_pdb is '
+             '.../<final_run_name>/<rotamer_run_name>/optimized.pdb and this file lives in '
+             '<final_run_name>/, the normal pipeline layout). Filtered down to '
+             'modified_residues.csv: the residues that keep a non-apo conformation after this '
+             'run\'s reset_protein_to_apo_where_unbacked.'
     )
     return p
 
@@ -199,6 +227,97 @@ CLUSTER_REPS_DESPOT_COLUMNS = [
 ]
 
 
+def _placer_file_residues(placer_file, cache):
+    """Returns the {(chain_id, res_num), ...} set of every non-LIG residue found in ANY model
+    of placer_file - i.e. every protein residue that placer file could have contributed a
+    conformer for, the same per-model union _gatherResidueConformers effectively pools over in
+    build_final_model.py. Memoized in `cache` ({str(path): set}), since the same placer_file can
+    back more than one cluster/ligand instance. Returns an empty set (after warning) for a
+    missing/unreadable file - conservatively, so a broken path never causes a residue to be
+    reset that shouldn't be."""
+    key = str(placer_file)
+    if key in cache:
+        return cache[key]
+
+    path = Path(placer_file)
+    if not path.is_file():
+        print(f'  WARNING: placer file not found, cannot determine its residues: {path}')
+        cache[key] = set()
+        return cache[key]
+
+    residues = set()
+    for model in Structure.fromfile(str(path)).split_models():
+        protein = model.extract('not resname LIG')
+        for chain_id, res_num in zip(protein.chain, protein.resi):
+            residues.add((chain_id, int(res_num)))
+    cache[key] = residues
+    return residues
+
+
+def reset_protein_to_apo_where_unbacked(structure, apo_structure, cluster_rows):
+    """Enforces that every non-apo protein conformation in `structure` is backed by a placer
+    file whose ligand survived DESPOT filtering (this pipeline only wants protein conformations
+    fit near ligands it actually kept).
+
+    For every cluster_row (one per ligand instance, cluster_reps.csv's own 'placer_file' column
+    - the file build_final_model.py actually used to source that instance's protein/ligand
+    conformers), pools that placer file's residues into `passed_residues` if despot_passed else
+    `rejected_residues`. reset_keys = rejected_residues - passed_residues: residues seen only
+    alongside rejected ligand(s), never a surviving one.
+
+    Returns (output_protein_structure, reset_keys) - reset_keys is a sorted list of
+    (chain_id, res_num) that were actually reset (i.e. also found in apo_structure); residues in
+    reset_keys but absent from apo_structure are left as-is (warned about) rather than dropped.
+    """
+    cache = {}
+    passed_residues, rejected_residues = set(), set()
+    for row in cluster_rows:
+        placer_file = row.get('placer_file')
+        if placer_file is None or (isinstance(placer_file, float) and np.isnan(placer_file)):
+            continue
+        residues = _placer_file_residues(placer_file, cache)
+        if row['despot_passed']:
+            passed_residues |= residues
+        else:
+            rejected_residues |= residues
+
+    reset_keys = sorted(rejected_residues - passed_residues)
+
+    chain_arr = structure.chain
+    resi_arr = structure.resi
+    is_lig = structure.resn == 'LIG'
+    is_reset = np.zeros(structure.natoms, dtype=bool)
+
+    actually_reset = []
+    reset_pieces = []
+    for chain_id, res_num in reset_keys:
+        residue_mask = (~is_lig) & (chain_arr == chain_id) & (resi_arr == res_num)
+        if not np.any(residue_mask):
+            continue
+        apo_residue = apo_structure.extract(f'chain {chain_id} and resid {res_num}')
+        if apo_residue.natoms == 0:
+            print(f'  WARNING: {chain_id}{res_num} would be reset to apo (only backed by a '
+                  f'rejected ligand\'s placer file) but has no apo_structure residue - leaving '
+                  f'its current conformation in place.')
+            continue
+        is_reset |= residue_mask
+        reset_pieces.append(apo_residue)
+        actually_reset.append((chain_id, res_num))
+
+    output_structure = structure.extract((~is_lig) & (~is_reset))
+    for piece in reset_pieces:
+        output_structure = output_structure.combine(piece)
+
+    if actually_reset:
+        labels = ', '.join(f'{c}{r}' for c, r in actually_reset)
+        print(f'  Reset {len(actually_reset)} residue(s) to apo (backed only by rejected '
+              f'ligand placer file(s), not a surviving one): {labels}')
+    else:
+        print('  No residues needed resetting to apo.')
+
+    return output_structure, actually_reset
+
+
 def main():
     args = build_argparser().parse_args()
 
@@ -213,7 +332,7 @@ def main():
     cluster_reps_csv = args.filter2_dir / 'cluster_reps.csv'
     cluster_members_csv = args.filter2_dir / 'cluster_members.csv'
     for p in (conformer_map_csv, ligs_pdb, cluster_reps_csv, cluster_members_csv,
-              args.final_model_pdb):
+              args.final_model_pdb, args.apo_structure):
         if not p.is_file():
             sys.exit(f'Error: required file not found: {p}')
 
@@ -242,6 +361,7 @@ def main():
     cluster_members = cluster_members[cluster_members['cluster'].isin(accepted_ids)]
 
     structure = Structure.fromfile(str(args.final_model_pdb))
+    apo_structure = Structure.fromfile(str(args.apo_structure))
     lig_instances = find_final_model_lig_instances(structure)
     if len(lig_instances) != len(cluster_reps):
         print(f'Warning: {len(lig_instances)} LIG instance(s) in {args.final_model_pdb} but '
@@ -258,7 +378,6 @@ def main():
     icode_arr = structure.icode
     is_lig = structure.resn == 'LIG'
 
-    protein_output = structure.extract('not resname LIG')
     pieces = []
     scores_rows = []
     cluster_rows = []
@@ -361,6 +480,9 @@ def main():
                              'raw_score': best['raw_score'],
                              'normalized_score': best['normalized_score'], 'kept': True})
 
+    protein_output, reset_residues = reset_protein_to_apo_where_unbacked(
+        structure, apo_structure, cluster_rows)
+
     pieces.sort(key=lambda piece: (piece[0], piece[1]))
     output_structure = protein_output
     for _, _, piece in pieces:
@@ -377,6 +499,27 @@ def main():
     pd.DataFrame(
         cluster_rows, columns=CLUSTER_REPS_ORIGINAL_COLUMNS + CLUSTER_REPS_DESPOT_COLUMNS
     ).to_csv(despot_cluster_reps_csv, index=False)
+
+    # --- modified_residues.csv: residues_with_placer_conformers.csv, restricted to residues
+    # that still have a non-apo (PLACER-derived) conformation after reset_protein_to_apo_where_
+    # unbacked - i.e. minus every residue reset above. Always <= residues_with_placer_conformers
+    # .csv, since resetting only ever removes residues, never adds any. ---
+    residues_csv = args.residues_with_placer_conformers_csv
+    if residues_csv is None:
+        residues_csv = args.final_model_pdb.parent.parent / 'residues_with_placer_conformers.csv'
+    reset_labels = {f'{chain_id}{res_num}' for chain_id, res_num in reset_residues}
+    modified_residues_csv = args.output_pdb.parent / 'modified_residues.csv'
+    if residues_csv.is_file():
+        with open(residues_csv) as f:
+            all_labels = [line.strip() for line in f if line.strip()]
+        modified_labels = [label for label in all_labels if label not in reset_labels]
+        with open(modified_residues_csv, 'w') as f:
+            for label in modified_labels:
+                f.write(f'{label}\n')
+        print(f'  {len(modified_labels)}/{len(all_labels)} residue(s) from {residues_csv} '
+              f'retained a non-apo conformation; wrote {modified_residues_csv}.')
+    else:
+        print(f'  WARNING: {residues_csv} not found; not writing {modified_residues_csv}.')
 
     n_kept = sum(1 for r in scores_rows if r['kept'])
     print(f'Kept {n_kept}/{len(scores_rows)} ligand instance(s). Wrote {args.output_pdb}, '

@@ -82,6 +82,7 @@ def main():
                 "build_final_model = qfit.command_line.build_final_model:main",
                 "symmetry_expand = qfit.command_line.symmetry_expand:main",
                 "despot_filter = qfit.command_line.despot_filter:main",
+                "select_optimized_residues = qfit.command_line.select_optimized_residues:main",
                 "extract_ligand_conformers = qfit.command_line.extract_ligand_conformers:main",
             ]
         },

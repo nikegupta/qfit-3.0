@@ -1015,13 +1015,16 @@ def plot_residues_vs_ref_restricted(args, collect_structure_rscc, collect_restri
 def _dataset_rotamer_pipeline_rscc(dataset, args):
     """Builds this dataset's residue-level backbone/final/rotamer RSCC rows,
     restricted to residues_with_placer_conformers.csv - the only residues
-    rotamer_refined.pdb ever touches. backbone is the best-across-cluster-
-    reps value from stage 3's {dataset}_backbone_refined_*_rscc.csv (the
-    same 'apo set' baseline run_rscc_aggregator[_pooled]'s backbone-vs-apo/
-    final-vs-apo plots use); final is stage 6's
-    final_model_refined_rscc.csv (pre-rotamer-optimization); rotamer is
-    stage 7's rotamer_refined_rscc.csv. No RSCC is computed here - all three
-    are read from calc_rscc csvs already on disk."""
+    rotamer_refined.pdb/optimized.pdb ever touch. backbone is the best-
+    across-cluster-reps value from stage 3's
+    {dataset}_backbone_refined_*_rscc.csv (the same 'apo set' baseline
+    run_rscc_aggregator[_pooled]'s backbone-vs-apo/final-vs-apo plots use);
+    final is stage 6's final_model_refined_rscc.csv (pre-rotamer-
+    optimization); rotamer is stage 7's optimized_rscc.csv (select_optimized_
+    residues.py's per-residue best-of-final-or-rotamer values, not the raw
+    rotamer_refined_rscc.csv - see program.sh's Stage 7d). No RSCC is
+    computed here - all three are read from calc_rscc csvs already on
+    disk."""
     dataset_dir = Path(args.datasets_dir) / dataset
 
     run_dir = dataset_dir / args.run_name / args.placer_run_name / args.filter_run_name
@@ -1042,7 +1045,7 @@ def _dataset_rotamer_pipeline_rscc(dataset, args):
         final_vals[residue_base(residue)] = rscc
 
     rotamer_dir = final_dir / args.rotamer_run_name
-    rotamer_df = read_calc_rscc_csv(rotamer_dir / 'rotamer_refined_rscc.csv')
+    rotamer_df = read_calc_rscc_csv(rotamer_dir / 'optimized_rscc.csv')
     rotamer_vals = {}
     for residue, rscc in zip(rotamer_df['residue'], rotamer_df['rscc']):
         if pd.isna(rscc):
@@ -1131,13 +1134,21 @@ ROTAMER_WORSE_THRESHOLD = 0.1
 def run_rotamer_worse_residues(args):
     """Pooled (across every dataset in datasets.txt) CSV of every residue -
     restricted to residues_with_placer_conformers.csv, the only residues
-    rotamer_refined.pdb ever touches - whose rotamer_refined RSCC is more
-    than ROTAMER_WORSE_THRESHOLD (0.1) worse than either of two baselines:
+    rotamer_refined.pdb/optimized.pdb ever touch - whose optimized RSCC
+    (select_optimized_residues.py's optimized_rscc.csv, not the raw
+    rotamer_refined_rscc.csv) is more than ROTAMER_WORSE_THRESHOLD (0.1)
+    worse than either of two baselines:
       - 'reference': the matched reference-structure residue's RSCC
         (same match rule as plot_residues_vs_ref_rotamer.py).
       - 'final_refined': that dataset's pre-rotamer-optimization
         final_model_refined RSCC (same data _dataset_rotamer_pipeline_rscc
-        already builds for run_rotamer_vs_pipeline_pooled).
+        already builds for run_rotamer_vs_pipeline_pooled). Since
+        select_optimized_residues.py already keeps whichever of
+        final_model_refined/rotamer_refined scored higher per residue, this
+        comparison should structurally never find any row (optimized RSCC
+        can never be lower than final_model_refined's by construction) -
+        it's left in as a correctness check: any row here means something
+        upstream disagrees with select_optimized_residues.py's own decision.
 
     A residue can appear twice (once per comparison) if it clears the
     threshold against both baselines. No RSCC is computed here - every value
@@ -1162,7 +1173,7 @@ def run_rotamer_worse_residues(args):
         restrict_labels = read_residue_conformer_list(
             final_dir(dataset) / 'residues_with_placer_conformers.csv')
 
-        rotamer_rscc_df = read_calc_rscc_csv(rotamer_dir(dataset) / 'rotamer_refined_rscc.csv')
+        rotamer_rscc_df = read_calc_rscc_csv(rotamer_dir(dataset) / 'optimized_rscc.csv')
         structure_rscc = dict(zip(rotamer_rscc_df['residue'], rotamer_rscc_df['rscc']))
         _, ref_pairs = _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels)
         for pair in ref_pairs:

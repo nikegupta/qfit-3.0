@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 Pooled (across every dataset in datasets.txt) per-residue RSCC comparison:
-rotamer_run_name's rotamer_refined structure vs the reference set, restricted
-to residues_with_placer_conformers.csv - the only residues rotamer_refined.pdb
-ever touches (rotamer_optimize.py only resamples those, and
-calc_rotamer_refined_rscc restricts calc_rscc to them via --residues-csv), so
+rotamer_run_name's OPTIMIZED structure (select_optimized_residues.py's
+optimized.pdb/optimized_rscc.csv - per residue, whichever of
+final_model_refined/rotamer_refined scored higher, NOT the raw
+rotamer_refined_rscc.csv) vs the reference set, restricted to
+residues_with_placer_conformers.csv - the only residues optimized.pdb ever
+touches (rotamer_optimize.py only resamples those, and
+calc_rotamer_refined_rscc/select_optimized_residues restrict to them), so
 there's no separate "all residues" plot the way plot_residues_vs_ref_final.py
 has one (it would just duplicate this one). No RSCC is computed here - both
 sides are read from the calc_rscc csvs already on disk
-(calc_rotamer_refined_rscc and calc_ref_set_rscc).
+(select_optimized_residues and calc_ref_set_rscc).
 
 Produces rotamer_refined_vs_reference_rscc_restricted.png. Also writes
 rotamer_refined_vs_reference_rscc_outliers.csv: every restricted residue
@@ -16,7 +19,8 @@ where ref_rscc - structure_rscc >= OUTLIER_MIN_DIFF (candidate cases where
 the pipeline picked a worse-fitting rotamer than the reference has - same
 tally as plot_residues_vs_ref_final.py's outliers csv).
 
-Run at the end of stage 7, only when -c (compare to reference set) is given.
+Run at the end of stage 7, after select_optimized_residues.py, only when -c
+(compare to reference set) is given.
 
 Usage:
   plot_residues_vs_ref_rotamer.py <run_name> <placer_run_name> <filter_run_name> \\
@@ -51,7 +55,7 @@ def main():
         return final_dir(dataset) / args.rotamer_run_name
 
     def collect_structure_rscc(dataset):
-        df = read_calc_rscc_csv(rotamer_dir(dataset) / 'rotamer_refined_rscc.csv')
+        df = read_calc_rscc_csv(rotamer_dir(dataset) / 'optimized_rscc.csv')
         return dict(zip(df['residue'], df['rscc']))
 
     def collect_restrict_labels(dataset):
