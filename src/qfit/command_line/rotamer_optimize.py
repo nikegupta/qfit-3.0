@@ -1,5 +1,6 @@
 import argparse
 import re
+from collections import namedtuple
 from pathlib import Path
 import time
 import numpy as np
@@ -9,6 +10,32 @@ from qfit import Structure
 from qfit import XMap
 from qfit.xtal.transformer import get_transformer
 from qfit.samplers import ChiRotator, CBAngleRotator, BisectingAngleRotator
+
+from qfit.command_line.sidechain_clash import (
+    SidechainClashResolver, CLASH_VDW_SCALE, HBOND_CLASH_VDW_SCALE, MAX_CLASH_GROUP_SIZE,
+    MAX_CLASH_GROUP_EXPANSIONS, CLASH_DOMAIN_TOP_K, CLASH_SOLVE_NODE_BUDGET,
+)
+
+# Sidechain-sidechain clash resolution, using the same shared engine (qfit.command_line.
+# sidechain_clash) and the same clash variables as build_final_model.py - see
+# Rotamer_Optimizer.run()'s Pass 2 for why rotamer_optimize needs this too: each residue's
+# optimized rotamer is picked independently against the untouched base structure, so two
+# residues that were BOTH independently found to improve can still clash with each other.
+BACKBONE_ATOM_NAMES = {'N', 'CA', 'C', 'O', 'OXT'}
+
+# Per-residue candidate pool built by Rotamer_Optimizer.run() and consumed by
+# SidechainClashResolver (via cost=-rscc, since the resolver always minimizes). coor:
+# (n_candidates, natoms, 3); rscc: (n_candidates,) - both indexed identically, index 0 always
+# the true original (untouched) conformation. A residue that didn't pass the sampling threshold
+# (base_rscc >= rscc_threshold) is fixed: exactly one candidate. A sampled residue carries its
+# full last-chi-angle sampling pool (up to Rotamer_Optimizer.trim conformers, from
+# _sample_sidechains' own top-K trim) as candidates 1..N, alongside its original as candidate 0
+# - not just the single best one - so clash resolution has real alternatives to pick from
+# instead of only "swap or don't". Reverting a group to index 0 (SidechainClashResolver's
+# revert_index=0, see Rotamer_Optimizer.run()) is always safe for exactly this reason.
+_RotamerCandidates = namedtuple(
+    'RotamerCandidates', ['coor', 'rscc', 'template', 'sidechain_mask', 'fixed'],
+)
 
 #symetry aware sidechain rmsd calc
 def _get_coordinate_rmsd(reference_coordinates, new_coordinate_set, atom_names=None):
@@ -87,6 +114,80 @@ def build_argparser():
         type=float,
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
+    p.add_argument(
+        "--rscc_threshold",
+        default=0.5,
+        metavar="<float>",
+        type=float,
+        help="Residues scoring below this RSCC against the event maps are candidates for "
+             "rotamer resampling; residues already at/above it are left untouched (default: 0.5).",
+    )
+    p.add_argument(
+        "--rscc_improvement_threshold",
+        default=0.1,
+        metavar="<float>",
+        type=float,
+        help="A resampled rotamer is only accepted if it improves RSCC over the starting "
+             "conformer by at least this much (default: 0.1).",
+    )
+    p.add_argument(
+        "--clash_vdw_scale",
+        default=CLASH_VDW_SCALE,
+        metavar="<float>",
+        type=float,
+        help="Sidechain-sidechain clash detection: fraction of the summed VDW radii "
+             "of two sidechain atoms (backbone atoms are never checked) below which "
+             f"they are considered clashing (default: {CLASH_VDW_SCALE}). Does not apply "
+             "to N/O pairs - see --hbond_clash_vdw_scale. Same mechanism/variable as "
+             "build_final_model.py's own flag of the same name.",
+    )
+    p.add_argument(
+        "--hbond_clash_vdw_scale",
+        default=HBOND_CLASH_VDW_SCALE,
+        metavar="<float>",
+        type=float,
+        help="Sidechain-sidechain clash detection: same as --clash_vdw_scale, but used "
+             "instead of it whenever the pair is one N atom and one O atom, since a real "
+             f"hydrogen bond legitimately sits closer than a generic clash (default: "
+             f"{HBOND_CLASH_VDW_SCALE})",
+    )
+    p.add_argument(
+        "--max_clash_group_size",
+        default=MAX_CLASH_GROUP_SIZE,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: a group of mutually-reselected "
+             "clashing residues stops absorbing newly-clashing neighbors once it "
+             "would exceed this many residues - the residual clash is logged and "
+             f"the group reverted instead (default: {MAX_CLASH_GROUP_SIZE})",
+    )
+    p.add_argument(
+        "--max_clash_group_expansions",
+        default=MAX_CLASH_GROUP_EXPANSIONS,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: rounds of \"resolve, then absorb "
+             f"new external clashes\" a group is allowed before giving up (default: "
+             f"{MAX_CLASH_GROUP_EXPANSIONS})",
+    )
+    p.add_argument(
+        "--clash_domain_top_k",
+        default=CLASH_DOMAIN_TOP_K,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: number of highest-RSCC candidates "
+             "considered per residue during joint clash-group solving before falling "
+             f"back to the full candidate pool (default: {CLASH_DOMAIN_TOP_K})",
+    )
+    p.add_argument(
+        "--clash_solve_node_budget",
+        default=CLASH_SOLVE_NODE_BUDGET,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: branch-and-bound search nodes "
+             "allowed per clash group before falling back to a heuristic (ICM) "
+             f"reassignment (default: {CLASH_SOLVE_NODE_BUDGET})",
+    )
     return p
 
 class QFitOptions: #copypasted from qfit.py
@@ -121,7 +222,14 @@ class QFitOptions: #copypasted from qfit.py
         self.remove_conformers_below_cutoff = False
 
 class Rotamer_Optimizer():
-    def __init__(self, dataset_dir, model_file, output_folder, resolution):
+    def __init__(self, dataset_dir, model_file, output_folder, resolution,
+                 rscc_threshold=0.5, rscc_improvement_threshold=0.1,
+                 clash_vdw_scale=CLASH_VDW_SCALE,
+                 hbond_clash_vdw_scale=HBOND_CLASH_VDW_SCALE,
+                 max_clash_group_size=MAX_CLASH_GROUP_SIZE,
+                 max_clash_group_expansions=MAX_CLASH_GROUP_EXPANSIONS,
+                 clash_domain_top_k=CLASH_DOMAIN_TOP_K,
+                 clash_solve_node_budget=CLASH_SOLVE_NODE_BUDGET):
         self.dir = dataset_dir
         self.model_file = model_file
         self.output_path = f"{dataset_dir}/{output_folder}"
@@ -138,10 +246,17 @@ class Rotamer_Optimizer():
 
         # Residues scoring below this against the event maps are candidates for optimization;
         # residues already at/above it are left untouched.
-        self.rscc_threshold = 0.5
+        self.rscc_threshold = rscc_threshold
         # An optimized conformer is only accepted if it improves RSCC over the starting
         # conformer by at least this much.
-        self.rscc_improvement_threshold = 0.1
+        self.rscc_improvement_threshold = rscc_improvement_threshold
+
+        self.clash_vdw_scale = clash_vdw_scale
+        self.hbond_clash_vdw_scale = hbond_clash_vdw_scale
+        self.max_clash_group_size = max_clash_group_size
+        self.max_clash_group_expansions = max_clash_group_expansions
+        self.clash_domain_top_k = clash_domain_top_k
+        self.clash_solve_node_budget = clash_solve_node_budget
 
     def _load_event_maps(self):
         """Loads every event map for this dataset. Maps sharing the same 1-BDC value are
@@ -191,11 +306,16 @@ class Rotamer_Optimizer():
         residues = self._load_binding_site_residues()
         print(f'{len(residues)} binding-site residue(s) to check')
 
-        accepted_coords = {}
-        improved_coords = {}
-        all_rows = []
-        num_improved = 0
-
+        # Pass 1: score every residue's starting conformer; for those that pass the sampling
+        # threshold, resample and keep its FULL last-chi-angle candidate pool (not just the
+        # single best one - see _sample_sidechains' own top-K trim), each candidate individually
+        # scored (_calc_rscc_per_conformer). No clash consideration yet: this pass's "top pick"
+        # (index 0 = original, else the pool's own best-RSCC candidate) and 0.1-threshold
+        # accept/reject decision are made exactly as if clashes didn't exist - clash resolution
+        # (Pass 2) only ever reopens a residue's pool when its top pick collides with something.
+        self._candidates = {}
+        top_pick_idx = {}
+        step1_accepted = {}
         for chain_id, resi in residues:
             resi_selstr = f"chain {chain_id} and resi {resi}"
             structure_new = self.base_structure.copy()
@@ -212,46 +332,132 @@ class Rotamer_Optimizer():
 
             time0 = time.time()
             self.current_residue = current_residue
+            sidechain_mask = ~np.isin(np.asarray(current_residue.name), list(BACKBONE_ATOM_NAMES))
 
-            #get rscc/coors for starting conformer
-            self._coor_set = [self.current_residue.coor]
+            #get rscc/coors for starting conformer. Snapshot the true original coordinates
+            #right here, before any sampling/scoring runs - _sample_angle/_sample_sidechains
+            #below repeatedly reassign self.current_residue.coor while exploring candidates, so
+            #current_residue.coor read AFTER them is some arbitrary explored candidate, not the
+            #starting conformation. current_residue.coor's getter always extracts a fresh numpy
+            #array (not a live view), so this copy is safely insulated from those later writes.
+            original_coor = self.current_residue.coor
+            self._coor_set = [original_coor]
             base_rscc = self._calc_rscc_all_events()
             print(f'{chain_id}{resi}: base_rscc={base_rscc:.3f}')
 
+            key = (chain_id, resi)
             if base_rscc >= self.rscc_threshold:
-                all_rows.append((chain_id, resi, base_rscc, None, False))
+                # did not pass the threshold for sampling - fixed, single conformation
+                self._candidates[key] = _RotamerCandidates(
+                    coor=original_coor[None, :, :],
+                    rscc=np.array([base_rscc]),
+                    template=current_residue,
+                    sidechain_mask=sidechain_mask,
+                    fixed=True,
+                )
+                top_pick_idx[key] = 0
+                step1_accepted[key] = False
                 continue
 
             #sample ca-b-y for aromatics
             self._sample_angle()
 
-            #sample sidechains chi
+            #sample sidechains chi - self._coor_set is left holding the last chi angle's own
+            #candidate pool (up to self.trim conformers), not collapsed to a single best one
             self._sample_sidechains()
 
-            #score sidechains to top 1
-            self._convert_and_score_rotamer(1)
-            optimized_rscc = self._calc_rscc_all_events()
+            pool_coor = self._coor_set
+            pool_rscc = self._calc_rscc_per_conformer(pool_coor)
 
-            print(f'{chain_id}{resi}: base_rscc={base_rscc:.3f} optimized_rscc={optimized_rscc:.3f} '
-                  f'({time.time() - time0:.1f}s)')
+            coor = np.concatenate([original_coor[None, :, :], np.stack(pool_coor, axis=0)], axis=0)
+            rscc = np.concatenate([[base_rscc], pool_rscc])
+            top_idx = int(np.argmax(rscc))
+            top_rscc = float(rscc[top_idx])
+            accepted = top_idx != 0 and (top_rscc - base_rscc >= self.rscc_improvement_threshold)
 
-            accepted = optimized_rscc - base_rscc >= self.rscc_improvement_threshold
+            print(f'{chain_id}{resi}: base_rscc={base_rscc:.3f} optimized_rscc={top_rscc:.3f} '
+                  f'({len(pool_coor)} pool candidate(s), {time.time() - time0:.1f}s)')
+
+            self._candidates[key] = _RotamerCandidates(
+                coor=coor, rscc=rscc, template=current_residue,
+                sidechain_mask=sidechain_mask, fixed=False,
+            )
+            top_pick_idx[key] = top_idx
+            step1_accepted[key] = accepted
+
+        # Pass 2: resolve sidechain-sidechain clashes. Seeded from the Pass 1 (clash-blind)
+        # decision: a residue that passed the threshold on its own starts at its top pick;
+        # everything else (never sampled, or sampled but didn't clear the threshold on its own)
+        # starts at its original conformation - it never earned a swap in the first place, so it
+        # isn't given one just to help a neighbor, though it can still BE a clash partner.
+        # _resolveGroup reopens every movable member's full candidate pool (not just its top
+        # pick and original) to find the best-scoring clash-free combination.
+        chosen_idx = {
+            key: (top_pick_idx[key] if step1_accepted.get(key) else 0)
+            for key in self._candidates
+        }
+        resolver = SidechainClashResolver(
+            self._candidates, cost_of=lambda c: -c.rscc,
+            clash_vdw_scale=self.clash_vdw_scale,
+            hbond_clash_vdw_scale=self.hbond_clash_vdw_scale,
+            max_clash_group_size=self.max_clash_group_size,
+            max_clash_group_expansions=self.max_clash_group_expansions,
+            clash_domain_top_k=self.clash_domain_top_k,
+            clash_solve_node_budget=self.clash_solve_node_budget,
+            revert_index=0, group_label='rotamer clash group',
+        )
+        resolver.resolve_sidechain_clashes(chosen_idx)
+
+        # Pass 3: redetermine which residues pass, using whatever candidate each one actually
+        # ended up on after clash resolution - which may differ from its Pass 1 top pick, since
+        # a clash group's best joint combination doesn't have to be each member's own individual
+        # best. A residue only counts as accepted if its FINAL candidate both survived clash
+        # resolution (isn't index 0) and still clears the 0.1 threshold against its own base_rscc.
+        accepted_coords = {}
+        improved_coords = {}
+        all_rows = []
+        num_improved = 0
+        for key, cand in self._candidates.items():
+            chain_id, resi = key
+            if cand.fixed:
+                all_rows.append((chain_id, resi, float(cand.rscc[0]), None, False))
+                continue
+
+            base_rscc = float(cand.rscc[0])
+            top_rscc = float(cand.rscc[top_pick_idx[key]])
+
+            final_idx = chosen_idx[key]
+            final_rscc = float(cand.rscc[final_idx])
+            accepted = final_idx != 0 and (final_rscc - base_rscc >= self.rscc_improvement_threshold)
             if accepted:
-                accepted_coords[(chain_id, resi)] = self._coor_set[0]
+                accepted_coords[key] = cand.coor[final_idx]
                 num_improved += 1
-            if optimized_rscc > base_rscc:
-                improved_coords[(chain_id, resi)] = self._coor_set[0]
-            all_rows.append((chain_id, resi, base_rscc, optimized_rscc, accepted))
+            # fitted.pdb is a pure diagnostic (see its comment below) - reports each residue's
+            # own Pass 1 top pick, unaffected by clash resolution or the 0.1 threshold.
+            if top_rscc > base_rscc:
+                improved_coords[key] = cand.coor[top_pick_idx[key]]
+            all_rows.append((chain_id, resi, base_rscc, top_rscc, accepted))
+
+        # Defensive reset, belt-and-suspenders on top of the .copy() fixes in
+        # _calc_rscc_all_events/_convert_and_score_rotamer: explicitly re-apply every processed
+        # residue's true original coordinates to self.base_structure before writing anything.
+        # cand.coor[0] is always the original (captured before any sampling ran - see Pass 1),
+        # for both fixed and movable residues. This guarantees a rejected residue's own
+        # coordinates in the output are exactly its starting ones, regardless of whether some
+        # other, still-undiscovered path also mutates self.base_structure during scoring.
+        original_coords = {key: cand.coor[0] for key, cand in self._candidates.items()}
+        self._update_coords(self.base_structure, original_coords)
 
         # fitted.pdb carries every residue whose resampled conformer improved RSCC at all, even
-        # if it didn't clear the acceptance threshold - copy the untouched structure before
-        # applying accepted_coords below (accepted_coords is a subset of improved_coords).
+        # if it didn't clear the acceptance threshold - copy the (now-clean) untouched structure
+        # before applying accepted_coords below (accepted_coords is a subset of improved_coords).
         fitted_structure = self.base_structure.copy()
         self._update_coords(fitted_structure, improved_coords)
         fitted_output = self.output_path + '/fitted.pdb'
         self._write_pdb(fitted_structure, fitted_output)
 
-        # rotamer_optimized.pdb only carries residues that cleared the acceptance threshold
+        # rotamer_optimized.pdb only carries residues that survived clash resolution AND
+        # cleared the acceptance threshold
         self._update_coords(self.base_structure, accepted_coords)
         output = self.output_path + '/rotamer_optimized.pdb'
         self._write_pdb(self.base_structure, output)
@@ -383,8 +589,14 @@ class Rotamer_Optimizer():
 
         (chainid, resi, icode) = self.current_residue.identifier_tuple
 
-        #get residue from base structure
-        residue = self.base_structure.extract(f"chain {chainid} and resi {resi}")
+        #get residue from base structure. .copy() is required, not cosmetic: extract() shares
+        #the base structure's own live atom storage rather than copying it (confirmed via object
+        #identity), and get_conformers_mask/get_conformers_densities below write each scored
+        #candidate's coordinates onto the passed-in residue as a side effect of building the
+        #xray structure they sample density from - without .copy() here, that silently leaves
+        #self.base_structure's real, persistent atoms mutated to whatever candidate happened to
+        #be scored last, corrupting every residue that gets sampled (accepted or not).
+        residue = self.base_structure.extract(f"chain {chainid} and resi {resi}").copy()
 
         #make bfactor array
         default_bfactor = 20
@@ -423,8 +635,10 @@ class Rotamer_Optimizer():
 
             (chainid, resi, icode) = self.current_residue.identifier_tuple
 
-            #get residue from base structure
-            residue = self.base_structure.extract(f"chain {chainid} and resi {resi}")
+            #get residue from base structure - .copy() required, see the matching comment in
+            #_convert_and_score_rotamer for why (extract() alone shares self.base_structure's
+            #live atoms, and the transformer mutates them as a scoring side effect).
+            residue = self.base_structure.extract(f"chain {chainid} and resi {resi}").copy()
 
             #make bfactor array
             default_bfactor = 20
@@ -449,9 +663,45 @@ class Rotamer_Optimizer():
 
         return top_rscc
 
+    def _calc_rscc_per_conformer(self, coor_set):
+        """Like _calc_rscc_all_events, but returns one RSCC per conformer in coor_set (still the
+        max across event maps for each) instead of collapsing every (conformer, event map) pair
+        down to a single global max. Used to score every candidate in a residue's last-chi-angle
+        sampling pool individually, so clash resolution has real alternatives - not just the
+        single best one - to search over. Operates on `coor_set` directly rather than
+        self._coor_set so it doesn't disturb whatever the caller is using that for."""
+        scaled_bulk_solvent = 0
+        n = len(coor_set)
+        per_conformer = np.full(n, -np.inf)
+
+        (chainid, resi, icode) = self.current_residue.identifier_tuple
+        default_bfactor = 20
+        bfactor_array = [default_bfactor] * n
+
+        for event_map_name in list(self.event_maps.keys()):
+            # .copy() required - see the matching comment in _convert_and_score_rotamer.
+            residue = self.base_structure.extract(f"chain {chainid} and resi {resi}").copy()
+            transformer = get_transformer("qfit", residue, self.event_maps_models[event_map_name])
+
+            mask = transformer.get_conformers_mask(coor_set, self._rmask)
+            target = self.event_maps[event_map_name].array[mask]
+            for i, density in enumerate(transformer.get_conformers_densities(coor_set, bfactor_array)):
+                model = density[mask]
+                np.maximum(model, scaled_bulk_solvent, out=model)
+                correlation_matrix = np.corrcoef(model, target)
+                rscc = correlation_matrix[0, 1]
+                if rscc > per_conformer[i]:
+                    per_conformer[i] = rscc
+
+        return per_conformer
+
 def main():
     args = build_argparser().parse_args()
-    ro = Rotamer_Optimizer(args.dataset, args.model_file, args.output_folder, args.resolution)
+    ro = Rotamer_Optimizer(args.dataset, args.model_file, args.output_folder, args.resolution,
+                            args.rscc_threshold, args.rscc_improvement_threshold,
+                            args.clash_vdw_scale, args.hbond_clash_vdw_scale,
+                            args.max_clash_group_size, args.max_clash_group_expansions,
+                            args.clash_domain_top_k, args.clash_solve_node_budget)
     ro.run()
 
 if __name__ == '__main__':

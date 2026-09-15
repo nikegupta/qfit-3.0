@@ -69,7 +69,6 @@ machine:
 | `CONDA_ENV_DESPOT` | The DESPOT env from step 3 (`DESPOT`) |
 | `RUN_PLACER_PY` | Absolute path to your PLACER clone's `run_PLACER.py` |
 | `DESPOT_SCRIPT` | Absolute path to your DESPOT clone's `scripts/score_complex.py` |
-| `DESPOT_DATABASE` | `CROWN` (matches `download_data.sh`'s default archives) |
 | `RSR_SCRIPTS_DIR`, `ANALYSIS_SCRIPTS_DIR`, `LIG_SCRIPTS_DIR` | Absolute paths to this qfit-3.0 clone's `rsr_scripts/`, `analysis_scripts/`, `lig_scripts/` |
 
 `BASE_DIR` should already point at this `test_case/` directory — leave it as-is unless

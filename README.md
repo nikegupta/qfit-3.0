@@ -1,172 +1,194 @@
-# qFit 2024v3
+# nikhils_program
 
-
-![](https://github.com/ExcitedStates/qfit-3.0/workflows/tests/badge.svg)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-
-qFit is a collection of programs for modeling multiconformer protein structures. 
-
-Electron density maps obtained from high-resolution X-ray diffraction data are a spatial and temporal average of all conformations within the crystal. 
-qFit evaluates an extremely large number of combinations of sidechain conformers, backbone fragments, and small-molecule ligand conformations to locally explain the electron density.
-
-
-If you use this software, please cite: 
-- [Wankowicz SA, Ravikumar A, Sharma S, Riley BT, Raju A, Hogan DW, van den Bedem H, Keedy DA, & Fraser JS. Uncovering Protein Ensembles: Automated Multiconformer Model Building for X-ray Crystallography and Cryo-EM. eLife. (2024)](https://doi.org/10.7554/eLife.90606.3)
-- [Riley BT, Wankowicz SA, de Oliveira SHP, van Zundert GCP, Hogan DW, Fraser JS, Keedy DA, van den Bedem H. qFit 3: Protein and ligand multiconformer modeling for X-ray crystallographic and single-particle cryo-EM density maps. Protein Sci. 30, 270–285 (2021)](https://dx.doi.org/10.1002/pro.4001)
-- [Keedy DA, Fraser JS, & van den Bedem H. Exposing Hidden Alternative Backbone Conformations in X-ray Crystallography Using qFit. PLoS Comput. Biol. 11, e1004507 (2015)](https://dx.doi.org/10.1371/journal.pcbi.1004507)
-
-qFit-ligand:
-- [Flowers J, Echols N, Correy G, Jaishankar P, Togo T, Renslo A, van den Bedem H, Fraser J, Wankowicz SA. (2024) Expanding Automated Multiconformer Ligand Modeling to Macrocycles and Fragments. eLife. 2025](https://elifesciences.org/reviewed-preprints/103797)
-- [van Zundert GCP, Hudson BM, de Oliveira SHP, Keedy DA, Fonseca R, Heliou A, Suresh P, Borrelli K, Day T, Fraser JS, van den Bedem H. qFit-ligand Reveals Widespread Conformational Heterogeneity of Drug-Like Molecules in X-Ray Electron Density Maps. J. Med. Chem. 61, 11183–11198 (2018)](https://dx.doi.org/10.1021/acs.jmedchem.8b01292)
-
-As this software relies on CVXPY, please also cite:
-- [Agrawal, Verschueren, Diamond, & Boyd. A Rewriting System for Convex Optimization Problems. Journal of Control and Decision. (2018).](https://arxiv.org/abs/1709.04494)
-- [Diamond & Boyd. CVXPY: A Python-Embedded Modeling Language for Convex Optimization. Journal of Machine Learning Research. (2016)](https://www.jmlr.org/papers/volume17/15-408/15-408.pdf)
-
+Nikhil's program is a pipeline for automatically fitting ligands and protein conformational changes to PanDDAs maps.
+Given, per dataset, an apo/ground-state protein model, one or more PanDDA event maps, and a candidate ligand
+(SMILES + crystal cell/space group), the pipeline places the ligand into density, samples and
+refines its conformation (and the surrounding protein sidechains) across several rounds, merges
+everything into one composite model, real-space refines it, optionally re-optimizes rotamers near
+the ligand, and finally rescores the surviving ligand pose with an independent statistical
+potential (DESPOT). Every stage is driven by `program.sh`, a single bash script that wires
+together several console tools from a local `qfit-3.0` checkout, an external PLACER install, and
+an external DESPOT install.
 
 ## Installation
 
-We recommend using the _mamba_ package manager to install _qFit_.
+The pipeline spans four separate pieces of software, each with its own conda environment.
+`program.sh`'s own "User-specified configuration" block (near the top of the file) hardcodes the
+paths and environment names below - edit that block to match wherever you install things.
 
-1. Clone the latest release of the qFit source:
+### 1. qfit-3.0
 
-`git clone -b main https://github.com/ExcitedStates/qfit-3.0.git`
-   
-`cd qfit-3.0`
-   
-2. Create the mamba environment using the downloaded file:
+```bash
+git clone https://github.com/nikegupta/qfit-3.0 program_rotamer/qfit-3.0
+cd qfit-3.0
+conda env create -f environment.yml    # creates "nikhils_program_rotamer" - see name: in the yml
+conda activate nikhils_program
+pip install -e .
+```
 
-`mamba env create -f environment.yml`
+This environment is used for most steps of the pipeline
 
-3. Activate the new mamba environment:
+### 2. PLACER (protein-ligand conformer sampling)
 
-`mamba activate qfit`
+PLACER is a separate repository, not vendored here:
 
-Note: If you encounter difficulties installing on an M1 Mac, you may try the following:
-   
-`conda activate qfit; conda env config vars set CONDA_SUBDIR=osx-64; conda deactivate`
+```bash
+git clone https://github.com/baker-laboratory/PLACER.git
+cd PLACER
+conda env create -f envs/placer_env.yml
+conda activate placer_env
+```
 
-`conda activate qfit`
+Point `program.sh`'s `RUN_PLACER_PY` variable at that checkout's `run_PLACER.py`, and
+`CONDA_ENV_PLACER` at the `placer_env` environment name. PLACER also needs a CUDA-capable GPU
+(cuda-toolkit >= 12.1) - see the PLACER repo's own README for its full requirement list.
 
-4. Install qFit into the mamba environment:
+### 3. DESPOT (final ligand-pose scoring)
 
-   `pip install .`
-   
+Also a separate repository:
 
-### Advanced
+```bash
+git clone https://github.com/KUL-LBMD/DESPOT.git
+cd DESPOT
+conda env create -f environment.yml
+conda activate DESPOT
+pip install -e .
+bash download_data.sh   # downloads the pretrained potentials + metadata (~1.9 GB) into DESPOT/data
+```
 
-If you prefer to manage your environments using other methods, qFit has the following prerequisites:
+Point `DESPOT_SCRIPT` at that checkout's `scripts/score_complex.py` and `CONDA_ENV_DESPOT` at the
+`DESPOT` environment name. `DESPOT_DATABASE` selects which trained potential to score against
+(default: `CROWN`).
 
-* [Python 3.9+](https://python.org)
-* [numpy](https://numpy.org)
-* [scipy](https://scipy.org)
-* [cvxpy](https://www.cvxpy.org)
+### Configuring program.sh
 
-Once dependencies are installed, you can clone the qFit source, and install to your env as above.
+Once all four environments exist, edit the "User-specified configuration" block at the top of
+`program.sh`: `BASE_DIR`, `CONDA_SH` (your `conda.sh` init script), the five `CONDA_ENV_*`
+variables, `RUN_PLACER_PY`, `DESPOT_SCRIPT`. The
+script will refuse to run (with a clear "required file not found" error) if any configured script
+path doesn't actually exist, so a misconfiguration is caught immediately rather than partway
+through a run.
 
+## Input layout
 
-## Usage examples
+Before running the pipeline you need, under `BASE_DIR`:
 
-The `qfit` package comes with several command line tools to model alternate
-conformers into electron densities. You should select the command line tool that
-is most suited for your task. Please refer below for a basic usage example. More specialized and advanced use case examples
-are shown in [example](example/README.md) directory.
+- **`datasets.txt`** - A file listing the datasets to run the pipeline on, one dataset per line.
+- **`datasets/<dataset>/`** - one directory per dataset id, containing:
+  - `<dataset>-aligned-structure.pdb` - the apo/ground-state protein model.
+  - `<dataset>-z_map.native.ccp4` - the zmap for that protein model
+  - `<dataset>-event_<N>_1-BDC_<value>_map.native.ccp4` - one or more PanDDA event maps.
+- **A CSV with required information about the datasets** (path set by `CSV_FILE`, `pxr_fragments.csv` in the github version) with columns
+  `dataset,resolution,ligand_name,a,b,c,alpha,beta,gamma,space_group,smiles` - one row per
+  dataset, giving the candidate ligand's SMILES and the crystal's cell/space group 
+- **`pdb_final_geometry/`** (path set by `LIG_PDB_DIR`) - contains the pdb structure and cif restraints file for each ligand in the dataset.
+- **`reference_set/<dataset>/`** (optional, only needed for `-c`) - a deposited/reference
+  structure per dataset, to compare pipeline output against.
 
-To remove single-conformer model bias, qFit should be used with a composite omit
-map. One way of generating such a map is using the [Phenix software suite](https://www.phenix-online.org/):
+## Running the pipeline
 
-`phenix.composite_omit_map input.mtz model.pdb omit-type=refine`
+```bash
+./program.sh <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name [rotamer_run_name [despot_run_name]]]]]]]
+             [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>]
+             [-c] [--overwrite] [--replot] [--dataset <id[,id...]>] [...many per-stage tunables]
+```
 
-An example test case (PDB: 1G8A) can be found in the [qFit protein example](example/qfit_protein_example/) directory. Additionally, you can find the [cryo-EM qFit protein example](example/qfit_cryoem_example/) (PDB: 7A4M) 
-and the [qFit ligand example](example/qfit_ligand_example/) (PDB: 4MS6) in the [example](example/README.md) directory. 
+Only `<run_name>` is required. The eight positional names correspond to the eight nested stages
+of the pipeline (see below) - supplying fewer of them simply stops the pipeline after that stage,
+and each name becomes a subdirectory nested under the previous one, so re-running with a new name
+at any point branches off cleanly without touching earlier results. Every step checks whether its
+own output already exists and skips it if so (pass `--overwrite` to force a redo, or `--replot`
+to redo just the graphing/analysis steps).
 
+Examples:
 
-### Recommended settings
+```bash
+./program.sh run_1 placer_1 filter_1                                    # stages 0-3 only
+./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1        # through build_final + RSR
+./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1              # + rotamer optimization
+./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1 despot_1     # + DESPOT scoring
+./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1 -c            # + compare to reference_set
+./program.sh run_1 placer_1 filter_1 --dataset x00001-1,x00002-1        # restrict to specific datasets
+```
 
-To model alternate conformers for all residues in an *X-ray crystallography* model using qFit,
-the following command should be used:
+Key flags: `-n`/`-n2` set how many PLACER conformers to sample in rounds 1 and 2 (default 100
+each), these variables most significantly affect run time.
+`-g` sets which GPU id(s) PLACER uses; `-p` sets CPU parallelism for every other stage;
+`-c` additionally scores everything against `reference_set/` for validation. A large set of
+per-stage tunables are passed straight through to the corresponding step; see `./program.sh -h` for the full list.
+For best results `--f2_filter_proportion 1` should be added to prevent excessive culling of potential ligands.
 
-`qfit_protein [COMPOSITE_OMIT_MAP_FILE] -l [LABELS] [PDB_FILE] -p [# OF THREADS]`
+## Pipeline stages
 
-This command will produce a multiconformer model that spans the entirety of the
-input target protein. The final model, with consistent labeling of multiple conformers,
-is output into *multiconformer_model2.pdb*. This file should then
-be used as input to the post-qFit refinement script provided in the [scripts](scripts/post) directory. 
+### Stage 1: fit_ligand
 
-qFit can be run on a single thread, but speeds up significantly with multiple threads. To do this, use the *-p* flag.
+For each dataset, `fit_ligand` scans the event map(s) for density peaks above a Z-score threshold
+and, at each candidate peak and places a copy of the ligand at each peak (or a copy of each possible stereoisomer).
+Each accepted peak produces one seeded ligand-in-protein starting structure,
+recorded in a per-dataset manifest linking it back to the peak and ligand that produced it.
 
-If you wish to specify a different directory for the output, this can be done
-using the flag *-d*.
- 
-By default, qFit expects the labels FWT,PHWT to be present in the input map.
-Different labels can be set accordingly using the flag *-l*.
+### Stage 2: PLACER (round 1) + real-space refinement
 
-Using the example 18GA:
+Each `fit_ligand` seed is handed to **PLACER** (Protein-Ligand Atomistic Conformational Ensemble
+Resolver, run out of a separate install), which stochastically resamples the ligand's atomic
+positions and nearby protein sidechains to generate an ensemble of plausible conformers for
+that seed. Every conformer in the resulting ensemble is then **real-space refined** against the
+event map: a coot-headless-scripted refinement (`rsr_placer`, via `src/rsr_scripts/`) that
+locally minimizes the ligand and surrounding residues into the density without changing the rest
+of the model.
 
-`qfit_protein example/qfit_protein_example/composite_omit_map.mtz -l 2FOFCWT,PH2FOFCWT example/qfit_protein_example/1G8A_refine.pdb`
+### Stage 3: filter
 
-After *multiconformer_model2.pdb* has been generated, refine this model using:
+`filter` clusters the (refined) round-1 conformers spatially, scores every conformer's fit to the
+event map (RSCC), and keeps one representative per cluster. 
+It then real-space refines the protein backbone around each surviving cluster's
+representative (`rsr_backbone`) and computes that backbone's own refined RSCC, giving each
+cluster a refined structural context to hand off to round 2.
 
-`qfit_final_refine_xray.sh example/qfit_protein_example/18GA.mtz example/qfit_protein_example/multiconformer_model2.pdb`
+### Stage 4: PLACER (round 2) + real-space refinement
 
-Additionally, the qFit_occupancy.params file must exist in the directory (this is an output of qFit protein).
+The same PLACER sampling is run again, once per surviving cluster, this time seeded from that
+cluster's real-space-refined backbone (`filter`'s round-1 output) rather than the raw round-1
+seed - a second, more targeted round of conformer sampling now that the local protein environment
+has already been refined once. Every round-2 conformer is again real-space refined
+(`rsr_placer2`).
 
-Bear in mind that this final step currently depends on an existing installation
-of the Phenix software suite. This script is currently written to work with version Phenix 1.21.
+### Stage 5: filter2
 
-To model alternate conformers for all residues in a *cryo-EM* model using qFit,
-the following command should be used:
+The same `filter` script is run again on the round-2 ensemble, once more clustering and picking a
+representative conformer per cluster - this is the final round of pose selection before the
+per-dataset model is assembled.
 
-`qfit_protein [MAP_FILE] -r [RES] [PDB_FILE] -em`
-`qfit_protein example/qfit_cryoem_example/7A4M_box.ccp4 -r 1.7 example/qfit_cryoem_example/7A4M_box.pdb`
+### Stage 6: build_final_model + real-space refinement
 
-After *multiconformer_model2.pdb* has been generated, refine this model using:
+`build_final_model` merges every surviving filter2 cluster's representative ligand pose into a
+single composite structure built on top of the apo protein, resolving any sidechain-sidechain
+clashes that result from combining poses that were each optimized independently. 
+The merged model is then real-space refined as a whole (`rsr_final`), and its
+per-residue and per-ligand RSCC against the event map(s) is computed.
 
-`qfit_final_refine_cryoEM.sh example/qfit_cryoem_example/7A4M_box.ccp4 example/qfit_cryoem_example/multiconformer_model2.pdb example/qfit_cryoem_example/7A4M_box.pdb`
+### Stage 7: rotamer_optimize + real-space refinement
 
-More advanced features of qFit (modeling single residue, more advanced options, and further explainations) are explained in the [example](example/README.md) directory.
+`rotamer_optimize` re-samples chi/aromatic-ring
+rotamers for every residue near the ligand whose RSCC (against the pre-refinement final model)
+falls below a threshold, keeping a resampled rotamer only if it improves RSCC by a meaningful
+margin; it also resolves any new sidechain-sidechain clashes the resampling introduces. The
+result is real-space refined again (`rsr_rotamer`), and its RSCC recomputed. Because RSR can
+shift things after the fact in ways `rotamer_optimize`'s own acceptance check couldn't see,
+`select_optimized_residues` then compares each candidate residue's post-refinement RSCC against
+its RSCC in the (pre-rotamer-optimization) final model and reverts any residue whose RSCC didn't
+actually improve enough to justify the change.
 
-To model alternate conformations of ligands using qFit, we recommend generating a composite omit map excluding bulk solvent with the following command:
+### Stage 8: DESPOT scoring
 
-`phenix.composite_omit_map input.mtz model.pdb omit-type=refine exclude_bulk_solvent=True`
-
-qFit-ligand can be executed the following command:
-
-`qfit_ligand [COMPOSITE_OMIT_MAP_FILE] [PDB_FILE] -l [LABELS] [SELECTION] -sm [SMILES]`
-
-This command facilitates the incorporation of alternate ligand conformations into your protein model. The results are outputted to two files: *multiconformer_ligand_bound_with_protein.pdb*, which is the multiconformer model of the protein-ligand complex, and *multiconformer_ligand_only.pdb*, which is the multiconformer model of the ligand alone. 
-
-After running qFit-ligand, it is recommended to perform a final refinement using the script found in [scripts](scripts/post). Run this in the same directory as your models.
-
-If you wish to specify the number of ligand conformers for qFit to sample, use the flag `-nc [NUM_CONFS]`. The default number is set to 10,000. 
-
-Using the example 4MS6:
-
-`qfit_ligand example/qfit_ligand_example/4ms6_composit_map.mtz example/qfit_ligand_example/4ms6.pdb -l 2FOFCWT,PH2FOFCWT A,702 -sm 'C1C[C@H](NC1)C(=O)CCC(=O)N2CCC[C@H]2C(=O)O' -nc 10000`
-
-To refine *multiconformer_ligand_bound_with_protein.pdb*, use the following command
-
-`qfit_final_refine_ligand.sh 4ms6.mtz`
-
-
-## Contributing
-
-qFit uses [Black](https://github.com/psf/black) to format its code and provides a git hook to verify that code is properly formatted before allowing you to commit.
-
-Before creating a commit, you will have to perform two actions:
-1. Install Black, either through a package manager or by running `python3 -m pip install --user black`
-2. Run `git config core.hooksPath .githooks/` to use the provided pre-commit hook
-
-## License
-
-The code is licensed under the MIT licence (see `LICENSE`).
-
-Several modules were taken from the `pymmlib` package, originally licensed
-under the Artistic License 2.0. See the `licenses` directory for a copy of the
-original source code and its full license.
-
-The `elements.py` is licensed under MIT, Copyright (c) 2005-2015, Christoph
-Gohlke. See file header.
-
-The `Xpleo` software and `LoopTK` package have been major inspirations for the inverse kinematics
-functionality.
+Every round-2 PLACER
+conformer (not just each cluster's single selected representative) is pooled and the model's
+protein is symmetry-expanded around all of them; each conformer is scored against the protein
+with DESPOT's `score_complex.py`, an independent statistical potential for protein-ligand
+interactions. For each filter2 cluster, `despot_filter` looks at the MSE-vs-DESPOT Pareto front
+of that cluster's conformers, computes each front member's own real-space-refined RSCC, and
+picks the conformer that best trades off RSCC against normalized DESPOT score - which can differ
+from the pose stage 5/6/7 carried forward. That winning pose is kept only if it clears both an
+RSCC and a DESPOT-score threshold; otherwise the whole cluster's ligand is dropped from the final
+output, and any residue whose only rotamer support came from a dropped ligand is reset back to
+its apo conformation.
