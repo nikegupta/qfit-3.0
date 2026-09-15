@@ -1,7 +1,7 @@
 # nikhils_program
 
-` Nikhil's program is a pipeline for automatically fitting ligands and protein conformational changes to PanDDAs maps.
- Given, per dataset, an apo/ground-state protein model, one or more PanDDA event maps, and a candidate ligand
+Nikhil's program is a pipeline for automatically fitting ligands and protein conformational changes to PanDDAs maps.
+Given, per dataset, an apo/ground-state protein model, one or more PanDDA event maps, and a candidate ligand
 (SMILES + crystal cell/space group), the pipeline places the ligand into density, samples and
 refines its conformation (and the surrounding protein sidechains) across several rounds, merges
 everything into one composite model, real-space refines it, optionally re-optimizes rotamers near
@@ -22,7 +22,7 @@ paths and environment names below - edit that block to match wherever you instal
 git clone https://github.com/nikegupta/qfit-3.0 program_rotamer/qfit-3.0
 cd qfit-3.0
 conda env create -f environment.yml    # creates "nikhils_program_rotamer" - see name: in the yml
-conda activate nikhils_program_rotamer
+conda activate nikhils_program
 pip install -e .
 ```
 
@@ -43,15 +43,7 @@ Point `program.sh`'s `RUN_PLACER_PY` variable at that checkout's `run_PLACER.py`
 `CONDA_ENV_PLACER` at the `placer_env` environment name. PLACER also needs a CUDA-capable GPU
 (cuda-toolkit >= 12.1) - see the PLACER repo's own README for its full requirement list.
 
-### 3. Open Babel (ligand/protein -> mol2 conversion, used ahead of PLACER and DESPOT)
-
-```bash
-conda create -n openbabel -c conda-forge openbabel
-```
-
-Point `CONDA_ENV_OBABEL` at this environment's name.
-
-### 4. DESPOT (final ligand-pose scoring)
+### 3. DESPOT (final ligand-pose scoring)
 
 Also a separate repository:
 
