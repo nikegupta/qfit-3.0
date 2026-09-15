@@ -10,9 +10,7 @@ import pandas as pd
 from qfit import Structure
 from qfit import XMap
 from qfit.xtal.transformer import get_transformer
-from qfit.command_line.calc_rscc import parse_bdc
-
-DEFAULT_BFACTOR = 20
+from qfit.command_line.calc_rscc import parse_bdc, DEFAULT_BFACTOR
 
 
 def build_argparser():
@@ -96,6 +94,12 @@ def build_argparser():
         '--rscc-weight', dest='rscc_weight', type=float, default=0.05, metavar='<float>',
         help='Weight applied to normalized DESPOT score when picking the winner: '
              'argmax(RSCC - rscc_weight*normalized_DESPOT) (default: 0.05).'
+    )
+    p.add_argument(
+        '--bfactor', dest='bfactor', type=float, default=DEFAULT_BFACTOR, metavar='<float>',
+        help='B-factor used when generating each Pareto-front candidate\'s model density for '
+             f'its own internal RSCC scoring (default: {DEFAULT_BFACTOR}) - same variable/'
+             'default as calc_rscc.py\'s own --bfactor.'
     )
     p.add_argument(
         '--residues-with-placer-conformers-csv', dest='residues_with_placer_conformers_csv',
@@ -429,7 +433,8 @@ def main():
                       f'(cluster {cluster_id}) - skipping this candidate.')
                 continue
             coor = candidate_structure.coor.copy()
-            rscc = score_rscc(candidate_structure, coor, maps, map_models, rmask)
+            rscc = score_rscc(candidate_structure, coor, maps, map_models, rmask,
+                               bfactor=args.bfactor)
             tradeoff = rscc - args.rscc_weight * member['normalized_score']
             if best_tradeoff is None or tradeoff > best_tradeoff:
                 best, best_tradeoff, best_rscc, best_structure = (

@@ -11,26 +11,32 @@
 #   0d. ref_set_despot (only with -c and <despot_run_name>): symmetry_expand + mol2 conversion +
 #       DESPOT score_complex.py on the reference structure
 #                                        -> REF_SET/<dataset>/<dataset>_DESPOT.csv
+#   STAGE_1: Fit_ligand
 #   1a. fit_ligand                      -> <run_name>/
 #   1b. plot_fit_ligand_counts (always) -> GRAPHS_DIR/<run_name>/
 #   1c. centroid_rmsd_all (only with -c) -> GRAPHS_DIR/<run_name>/
+#   STAGE_2: PLACER
 #   2a. placer                          -> <run_name>/<placer_run_name>/
 #   2b. rsr_placer                      -> <run_name>/<placer_run_name>/
 #   2c. calc_placer_sampling (refined + unrefined, only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/<placer_run_name>/
+#   STAGE_3: Filter
 #   3a. filter                          -> .../<filter_run_name>/
 #   3b. rsr_backbone                    -> .../<filter_run_name>/
 #   3c. calc_backbone_refined_rscc      -> .../<filter_run_name>/
 #   3d. plot_lig_vs_ref_filter1, plot_residues_vs_ref_backbone (only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/.../<filter_run_name>/
+#   STAGE_4: PLACER2
 #   4a. placer2                         -> .../<placer2_run_name>/
 #   4b. rsr_placer2                     -> .../<placer2_run_name>/
 #   4c. calc_placer_sampling (refined + unrefined, only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/.../<placer2_run_name>/
+#   STAGE_5: Filter2
 #   5a. filter2 (runs the same `filter` script as stage 3a, not `filter_all`)
 #                                        -> .../<filter2_run_name>/
 #   5b. plot_lig_vs_ref_filter2 (only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/.../<filter2_run_name>/
+#   STAGE_6: Build final (old name)
 #   6a. build_final                     -> .../<final_run_name>/
 #   6b. rsr_final                       -> .../<final_run_name>/
 #   6c. calc_final_refined_rscc         -> .../<final_run_name>/
@@ -39,6 +45,7 @@
 #   6e. aggregate_clash_groups (always): concatenates every dataset's sidechain_clash_groups.csv
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
 #                                           sidechain_clash_groups_combined.csv
+#   STAGE_7: Rotamer_optimize
 #   7a. rotamer_optimize (only with <rotamer_run_name>): resamples chi/aromatic rotamers for
 #       low-RSCC residues in final_model.pdb
 #                                        -> .../<final_run_name>/<rotamer_run_name>/
@@ -57,6 +64,7 @@
 #       RSCC is >0.1 worse than reference or final_model_refined
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/
 #                                           <rotamer_run_name>/rotamer_refined_worse_residues.csv
+#   STAGE_8: Despot
 #   8a. despot (only with <rotamer_run_name> and <despot_run_name>): pools placer2 conformers,
 #       expands optimized.pdb around them, converts to mol2, scores with DESPOT's
 #       score_complex.py, then despot_filter reselects the per-cluster winner and resets any
@@ -73,6 +81,7 @@
 #   8e. plot_residues_vs_ref_despot (only with -c): restricted to despot_run_name/
 #       modified_residues.csv instead of 7e's residues_with_placer_conformers.csv
 #                                        -> GRAPHS_DIR/<run_name>/.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/
+#   STAGE_9: Internal analysis
 #   9.  analysis_scripts/*.py: cluster-rep/per-residue RSCC plots + pooled counterparts, once
 #       <final_run_name> is given; plus plot_rotamer_vs_pipeline (moved from the old 7f) once
 #       <rotamer_run_name> is given; plus plot_despot_energies+pooled and
@@ -111,89 +120,91 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--f1_clustering_cutoff <float>]
            [--f2_filter_proportion <float>] [--f2_min_cluster_proportion <float>]
            [--f2_rscc_cutoff <float>] [--f2_clustering_mode <all-atom|centroid>]
-           [--f2_clustering_cutoff <float>] [--despot_threshold <float>]
+           [--f2_clustering_cutoff <float>] [--f1_clash_vdw_scale <float>] [--f2_clash_vdw_scale <float>]
+           [--despot_threshold <float>]
            [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
+           [--fit_ligand_rmsd_cutoff <float>]
+           [--clash_vdw_scale <float>] [--hbond_clash_vdw_scale <float>]
+           [--max_clash_group_size <int>] [--max_clash_group_expansions <int>]
+           [--clash_domain_top_k <int>] [--clash_solve_node_budget <int>]
+           [--rotamer_rscc_threshold <float>] [--rotamer_rscc_improvement_threshold <float>]
+           [--revert_min_diff <float>] [--bfactor <float>] [--expand_distance_cutoff <float>]
+           [--rsr_n_cycles <int>] [--rsr_map_weight <float>]
+           [--rsr_backbone_cutoff <float>] [--rsr_moved_threshold <float>]
 
 Only <run_name> is required. Supplying fewer than all eight names runs only
 that many stages of the pipeline (see header comment for the stage list).
-<rotamer_run_name> is optional even when <final_run_name> is given - stage 7
-(rotamer_optimize + rsr + rscc) only runs when it's also supplied.
-<despot_run_name> is optional even when <rotamer_run_name> is given - stage 8
-(DESPOT energy scoring) only runs when it's also supplied (it is an error to
-give <despot_run_name> without <rotamer_run_name>); stage 9 (analysis)
-always runs once <final_run_name> is given, independent of stages 7/8.
 
 Options:
   -n <num_placer_confs>    Number of PLACER conformers for round 1 (placer -n). Default: 1000
   -n2 <num_placer2_confs>  Number of PLACER conformers for round 2 (placer2 -n). Default: 1000
   -g <gpu_ids>             Comma-separated GPU ids for both PLACER rounds. Default: 0
-  -p <num_parallel>        CPU parallelism for every non-PLACER stage (calc_apo_rscc,
-                            fit_ligand, rsr_placer, filter, rsr_backbone, calc_backbone_refined_rscc,
-                            rsr_placer2, filter2, build_final, rsr_final, calc_final_refined_rscc,
-                            rotamer_optimize, rsr_rotamer,
-                            calc_rotamer_refined_rscc, select_optimized_residues, despot,
-                            ref_set_despot). Default: 1
-  -c                       Also compare results to the reference set (REF_SET). Runs
-                            calc_ref_set_rscc as stage 0c: per dataset, computes RSCC of
-                            REF_SET/<dataset>/<REF_SET_PDB_PATTERN>, skipping any dataset whose
-                            output csv already exists. When <despot_run_name> is also given, also
-                            runs ref_set_despot as stage 0d: per dataset, DESPOT-scores
-                            REF_SET/<dataset>/<REF_SET_PDB_PATTERN> (symmetry_expand --strip,
-                            mol2 conversion, score_complex.py) into
-                            REF_SET/<dataset>/<dataset>_DESPOT.csv. Also runs pooled
-                            (cross-dataset) ligand/residue comparison plots into GRAPHS_DIR: stage
-                            1c (centroid_rmsd_all), 2c and 4c (calc_placer_sampling, refined
-                            + unrefined), 3d (plot_lig_vs_ref_filter1, plot_residues_vs_ref_backbone),
-                            5b (plot_lig_vs_ref_filter2), 6d (plot_residues_vs_ref_final), 7e
-                            (plot_residues_vs_ref_rotamer), 7f (aggregate_rotamer_worse_residues),
-                            and (only when <despot_run_name> is also given) 8b
-                            (plot_lig_vs_ref_despot), 8c (plot_despot_vs_ref), 8d
-                            (plot_rscc_despot_tradeoff), and 8e (plot_residues_vs_ref_despot).
+  -p <num_parallel>        CPU parallelism for every non-PLACER stage 
+  -c                       Also compare results to the reference set (REF_SET). 
   --overwrite              Force every requested step to re-run in place, even if its output
                             already exists (normally such a step is skipped - see "Idempotency"
                             in the header comment). Applies to every stage, including the
-                            graphing steps. Does not affect stage 9's precondition that stage 6
-                            already be complete for every dataset.
+                            graphing steps. 
   --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7e, 7f, 8b, 8c, 8d, 8e, 9) to
                             re-run in place, even if their output already exists. Does not
                             affect the main pipeline steps (use --overwrite for those too).
   --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
                             (e.g. x00001-1 or x00001-1,x00002-1), instead of every dataset
-                            listed in DATASETS_FILE (datasets.txt). Every dataset given must
-                            already have a directory under DATASETS_DIR. Applies to every
-                            stage (0-9) for the whole invocation.
-  --z_threshold <float>            fit_ligand -z/--z_threshold: Z-score threshold for peak
-                                    detection (stage 1a). Default (unset): fit_ligand's own
-                                    default (4).
-  --num_peaks <int>                fit_ligand -n/--num_peaks: number of peaks to find (stage 1a).
-                                    Default (unset): fit_ligand's own default (100).
-  --f1_filter_proportion <float>       filter --filter_proportion for stage 3a (filter_run_name).
-  --f1_min_cluster_proportion <float>  filter --min_cluster_proportion for stage 3a.
-  --f1_rscc_cutoff <float>             filter --rscc_cutoff for stage 3a.
-  --f1_clustering_mode <all-atom|centroid>  filter --clustering_mode for stage 3a.
-  --f1_clustering_cutoff <float>       filter --clustering_cutoff for stage 3a.
-  --f2_filter_proportion <float>       filter --filter_proportion for stage 5a (filter2_run_name).
-  --f2_min_cluster_proportion <float>  filter --min_cluster_proportion for stage 5a.
-  --f2_rscc_cutoff <float>             filter --rscc_cutoff for stage 5a.
-  --f2_clustering_mode <all-atom|centroid>  filter --clustering_mode for stage 5a.
-  --f2_clustering_cutoff <float>       filter --clustering_cutoff for stage 5a.
-                                    All f1_*/f2_* options are left unset by default, so
-                                    filter's own argparse defaults apply. Stage 5a (filter2_run_name)
-                                    now runs the same "filter" script as stage 3a (filter_run_name)
-                                    instead of "filter_all" - see header comment.
-  --despot_threshold <float>       despot_filter --despot-threshold for stage 8a: the reselected
-                                    winning pose's per-heavy-atom-normalized DESPOT score must be
-                                    <= this to survive. Left unset by default, so despot_filter's
-                                    own argparse default (-1.0) applies.
-  --despot_rscc_threshold <float>  despot_filter --rscc-threshold for stage 8a: the reselected
-                                    winning pose's RSCC must be >= this to survive (both this and
-                                    --despot_threshold must pass). Left unset by default, so
-                                    despot_filter's own argparse default (0.6) applies.
-  --despot_rscc_weight <float>     despot_filter --rscc-weight for stage 8a: per filter2 cluster,
-                                    the Pareto-front (MSE vs normalized DESPOT) candidate
-                                    maximizing RSCC - despot_rscc_weight*normalized_DESPOT is
-                                    selected as that cluster's pose. Left unset by default, so
-                                    despot_filter's own argparse default (0.05) applies.
+                            listed in DATASETS_FILE (datasets.txt). 
+  --z_threshold <float>            Fit_ligand: Z-score threshold for peak detection. Default: 4.
+  --num_peaks <int>                Fit_ligand: number of peaks to find. Default: 100.
+  --fit_ligand_rmsd_cutoff <float> Fit_ligand: RMSD below which two candidate peaks are treated
+                                    as the same peak. Default: 2.
+  --rsr_n_cycles <int>              Real-space refinement cycles. PLACER, Filter, PLACER2,
+                                    Build final, Rotamer_optimize. Default: 1000.
+  --rsr_map_weight <float>         Real-space refinement map-vs-geometry weight. PLACER, Filter,
+                                    PLACER2, Build final, Rotamer_optimize. Default: 50.0.
+  --f1_filter_proportion <float>       Filter: proportion of conformers kept. Default: 0.25.
+  --f1_min_cluster_proportion <float>  Filter: min cluster-size proportion to keep. Default: 0.1.
+  --f1_rscc_cutoff <float>             Filter: minimum RSCC to keep a cluster rep. Default: 0.6.
+  --f1_clustering_mode <all-atom|centroid>  Filter: clustering distance metric. Default: centroid.
+  --f1_clustering_cutoff <float>       Filter: clustering distance cutoff. Default: 2.0.
+  --f1_clash_vdw_scale <float>         Filter: VDW-radius scale for cluster-rep clash detection.
+                                    Default: 0.75.
+  --rsr_backbone_cutoff <float>    Filter: distance from LIG used to pick residues to
+                                    real-space refine. Default: 10.0.
+  --rsr_moved_threshold <float>    Real-space refinement: minimum displacement to log a residue
+                                    as "moved". Filter, Build final, Rotamer_optimize. Default: 0.01.
+  --f2_filter_proportion <float>       Filter2: proportion of conformers kept. Default: 0.25.
+  --f2_min_cluster_proportion <float>  Filter2: min cluster-size proportion to keep. Default: 0.1.
+  --f2_rscc_cutoff <float>             Filter2: minimum RSCC to keep a cluster rep. Default: 0.6.
+  --f2_clustering_mode <all-atom|centroid>  Filter2: clustering distance metric. Default: centroid.
+  --f2_clustering_cutoff <float>       Filter2: clustering distance cutoff. Default: 2.0.
+  --f2_clash_vdw_scale <float>         Filter2: VDW-radius scale for cluster-rep clash detection.
+                                    Default: 0.75.
+  --clash_vdw_scale <float>        Sidechain clash VDW-radius scale, shared by Build final and
+                                    Rotamer_optimize. Default: 0.75.
+  --hbond_clash_vdw_scale <float>  Same as --clash_vdw_scale for an (N, O) hydrogen-bonded atom
+                                    pair. Build final, Rotamer_optimize. Default: 0.6.
+  --max_clash_group_size <int>     Max residues absorbed into one clash group. Build final,
+                                    Rotamer_optimize. Default: 8.
+  --max_clash_group_expansions <int>   Max rounds absorbing new external clashes into a clash
+                                    group. Build final, Rotamer_optimize. Default: 10.
+  --clash_domain_top_k <int>       Candidates considered per residue during clash-group solving.
+                                    Build final, Rotamer_optimize. Default: 25.
+  --clash_solve_node_budget <int>  Branch-and-bound search nodes before falling back to ICM.
+                                    Build final, Rotamer_optimize. Default: 200000.
+  --rotamer_rscc_threshold <float> Rotamer_optimize: RSCC below which a residue is resampled.
+                                    Default: 0.5.
+  --rotamer_rscc_improvement_threshold <float>  Rotamer_optimize: minimum RSCC gain to accept a
+                                    resampled rotamer. Default: 0.1.
+  --revert_min_diff <float>        Rotamer_optimize: minimum RSCC gap to revert a residue to its
+                                    pre-optimization conformation. Default: 0.1.
+  --bfactor <float>                B-factor used for RSCC model density. Filter, Build final,
+                                    Rotamer_optimize, Despot. Default: 20.
+  --expand_distance_cutoff <float> Despot: symmetry-mate distance cutoff (Å) from a ligand atom.
+                                    Default: 10.
+  --despot_threshold <float>       Despot: max per-heavy-atom-normalized DESPOT score a winning
+                                    pose may have to survive. Default: -1.0.
+  --despot_rscc_threshold <float>  Despot: minimum RSCC a winning pose must have to survive.
+                                    Default: 0.6.
+  --despot_rscc_weight <float>     Despot: weight on normalized DESPOT score when picking the
+                                    Pareto-front winner. Default: 0.05.
 
 Examples:
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1
@@ -217,16 +228,14 @@ BASE_DIR="/home/ngupta/main/program_rotamer"
 CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 LIG_PDB_DIR="${BASE_DIR}/pdb_final_geometry"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV_QFIT="nikhils_program_rotamer"
+CONDA_ENV_QFIT="nikhils_program"
 CONDA_ENV_PLACER="placer_env"
-CONDA_ENV_RSR="nikhils_program_rotamer"
-CONDA_ENV_EVAL="nikhils_program_rotamer"
-CONDA_ENV_OBABEL="openbabel"
+CONDA_ENV_RSR="nikhils_program"
+CONDA_ENV_EVAL="nikhils_program"
 CONDA_ENV_DESPOT="DESPOT"
 RUN_PLACER_PY="/home/ngupta/PLACER/PLACER/run_PLACER.py"
 DESPOT_SCRIPT="/home/ngupta/DESPOT/scripts/score_complex.py"
 DESPOT_DATABASE="CROWN"
-EXPAND_DISTANCE_CUTOFF=10
 DATASETS_DIR="${BASE_DIR}/datasets"
 DATASETS_FILE="${BASE_DIR}/datasets.txt"
 RSR_SCRIPTS_DIR="${BASE_DIR}/qfit-3.0/src/rsr_scripts"
@@ -326,10 +335,11 @@ dataset_arg=""
 DATASET_OVERRIDE_FILE=""
 
 # fit_ligand tunables (stage 1a). Left empty by default so fit_ligand's own
-# argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100) apply; only
+# argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100, --rmsd_cutoff=2) apply; only
 # passed through when explicitly set here.
 z_threshold=""
 num_peaks=""
+fit_ligand_rmsd_cutoff=""
 
 # filter tunables (stage 3a, filter_run_name), left empty by default so
 # filter's own argparse defaults apply.
@@ -338,6 +348,7 @@ f1_min_cluster_proportion=""
 f1_rscc_cutoff=""
 f1_clustering_mode=""
 f1_clustering_cutoff=""
+f1_clash_vdw_scale=""
 
 # filter tunables (stage 5a, filter2_run_name) - same underlying `filter`
 # script as f1_*, set independently.
@@ -346,6 +357,50 @@ f2_min_cluster_proportion=""
 f2_rscc_cutoff=""
 f2_clustering_mode=""
 f2_clustering_cutoff=""
+f2_clash_vdw_scale=""
+
+# Sidechain-sidechain clash resolution tunables, shared identically by build_final_model.py
+# (stage 6a) and rotamer_optimize.py (stage 7a) - both now use the same
+# qfit.command_line.sidechain_clash engine, so one set of values drives both. Left empty by
+# default so each script's own argparse defaults apply (clash_vdw_scale=0.75,
+# hbond_clash_vdw_scale=0.6, max_clash_group_size=8, max_clash_group_expansions=10,
+# clash_domain_top_k=25, clash_solve_node_budget=200000).
+clash_vdw_scale=""
+hbond_clash_vdw_scale=""
+max_clash_group_size=""
+max_clash_group_expansions=""
+clash_domain_top_k=""
+clash_solve_node_budget=""
+
+# rotamer_optimize tunables (stage 7a), left empty by default so rotamer_optimize's own
+# argparse defaults apply (--rscc_threshold=0.5, --rscc_improvement_threshold=0.1).
+rotamer_rscc_threshold=""
+rotamer_rscc_improvement_threshold=""
+
+# select_optimized_residues tunable (stage 7d), left empty by default so its own argparse
+# default applies (--revert_min_diff=0.1).
+revert_min_diff=""
+
+# calc_rscc's shared --bfactor, applied identically everywhere calc_rscc or despot_filter's
+# internal RSCC scoring runs (stages 0b/0c/3c/6c/7c/8a). Left empty by default so each script's
+# own argparse default applies (calc_rscc/despot_filter both default to 20).
+bfactor=""
+
+# symmetry_expand's distance_cutoff (stages 0d/8a) - a symmetry mate is only kept within this
+# distance (Å) of a ligand atom. Was previously a fixed, non-configurable constant.
+expand_distance_cutoff="10"
+
+# Real-space refinement tunables, applied identically everywhere the corresponding flag exists
+# on that RSR variant (see real_space_refine*.py --help) - rsr_n_cycles/rsr_map_weight apply to
+# all 5 RSR call sites (rsr_placer, rsr_backbone, rsr_placer2, rsr_final, rsr_rotamer);
+# rsr_backbone_cutoff only to rsr_backbone (real_space_refine_protein.py's own --cutoff);
+# rsr_moved_threshold to rsr_backbone/rsr_final/rsr_rotamer (the 3 variants that report it).
+# Left empty by default so each RSR script's own argparse defaults apply (--n-cycles=1000,
+# --map-weight=50.0, --cutoff=10.0, --moved-threshold=0.01).
+rsr_n_cycles=""
+rsr_map_weight=""
+rsr_backbone_cutoff=""
+rsr_moved_threshold=""
 
 # despot_filter tunables (stage 7a), left empty by default so despot_filter's own argparse
 # defaults apply (--despot-threshold -1.0, --rscc-threshold 0.6, --rscc-weight 0.05).
@@ -445,6 +500,78 @@ while [[ $# -gt 0 ]]; do
             ;;
         --despot_rscc_weight)
             despot_rscc_weight="$2"
+            shift 2
+            ;;
+        --fit_ligand_rmsd_cutoff)
+            fit_ligand_rmsd_cutoff="$2"
+            shift 2
+            ;;
+        --f1_clash_vdw_scale)
+            f1_clash_vdw_scale="$2"
+            shift 2
+            ;;
+        --f2_clash_vdw_scale)
+            f2_clash_vdw_scale="$2"
+            shift 2
+            ;;
+        --clash_vdw_scale)
+            clash_vdw_scale="$2"
+            shift 2
+            ;;
+        --hbond_clash_vdw_scale)
+            hbond_clash_vdw_scale="$2"
+            shift 2
+            ;;
+        --max_clash_group_size)
+            max_clash_group_size="$2"
+            shift 2
+            ;;
+        --max_clash_group_expansions)
+            max_clash_group_expansions="$2"
+            shift 2
+            ;;
+        --clash_domain_top_k)
+            clash_domain_top_k="$2"
+            shift 2
+            ;;
+        --clash_solve_node_budget)
+            clash_solve_node_budget="$2"
+            shift 2
+            ;;
+        --rotamer_rscc_threshold)
+            rotamer_rscc_threshold="$2"
+            shift 2
+            ;;
+        --rotamer_rscc_improvement_threshold)
+            rotamer_rscc_improvement_threshold="$2"
+            shift 2
+            ;;
+        --revert_min_diff)
+            revert_min_diff="$2"
+            shift 2
+            ;;
+        --bfactor)
+            bfactor="$2"
+            shift 2
+            ;;
+        --expand_distance_cutoff)
+            expand_distance_cutoff="$2"
+            shift 2
+            ;;
+        --rsr_n_cycles)
+            rsr_n_cycles="$2"
+            shift 2
+            ;;
+        --rsr_map_weight)
+            rsr_map_weight="$2"
+            shift 2
+            ;;
+        --rsr_backbone_cutoff)
+            rsr_backbone_cutoff="$2"
+            shift 2
+            ;;
+        --rsr_moved_threshold)
+            rsr_moved_threshold="$2"
             shift 2
             ;;
         -h|--help)
@@ -578,11 +705,17 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # when GNU parallel forks them into new subshells, so it all gets exported.
 export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name rotamer_run_name despot_run_name
 export num_placer_confs num_placer2_confs compare_ref_set overwrite replot
-export z_threshold num_peaks
+export z_threshold num_peaks fit_ligand_rmsd_cutoff
 export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
-       f1_clustering_mode f1_clustering_cutoff
+       f1_clustering_mode f1_clustering_cutoff f1_clash_vdw_scale
 export f2_filter_proportion f2_min_cluster_proportion f2_rscc_cutoff \
-       f2_clustering_mode f2_clustering_cutoff
+       f2_clustering_mode f2_clustering_cutoff f2_clash_vdw_scale
+export clash_vdw_scale hbond_clash_vdw_scale max_clash_group_size \
+       max_clash_group_expansions clash_domain_top_k clash_solve_node_budget
+export rotamer_rscc_threshold rotamer_rscc_improvement_threshold
+export revert_min_diff
+export bfactor expand_distance_cutoff
+export rsr_n_cycles rsr_map_weight rsr_backbone_cutoff rsr_moved_threshold
 export despot_threshold despot_rscc_threshold despot_rscc_weight
 export BASE_DIR DATASETS_DIR DATASETS_FILE CSV_FILE LIG_PDB_DIR ASSIGN_BOND_ORDERS_PY
 export RSR_SCRIPT_LIGAND RSR_SCRIPT_PROTEIN RSR_SCRIPT_FINAL
@@ -599,9 +732,9 @@ export PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY
 export PLOT_DESPOT_VS_REF_PY
 export PLOT_RSCC_DESPOT_TRADEOFF_PY
 export PLOT_RESIDUES_VS_REF_DESPOT_PY
-export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE EXPAND_DISTANCE_CUTOFF
+export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE
 export REF_SET REF_SET_PDB_PATTERN
-export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_OBABEL CONDA_ENV_DESPOT
+export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_DESPOT
 export RUN_PLACER_PY
 
 # --- Shared lookup files, built once from CSV_FILE and reused by every stage that needs
@@ -914,7 +1047,8 @@ export -f write_params_txt
 # LOOKUP_FILE/LIG_SMILES_LOOKUP_FILE) and converts that ligand's pdb file(s)
 # under LIG_PDB_DIR to mol2 - assign_bond_orders.py (CONDA_ENV_QFIT: rdkit
 # assigns bond orders from SMILES onto the pdb's 3D coordinates, writes an
-# sdf) then obabel (CONDA_ENV_OBABEL: sdf -> mol2) - same tool
+# sdf) then obabel (also CONDA_ENV_QFIT - openbabel/pdb2pqr are installed there
+# alongside qfit's own dependencies: sdf -> mol2) - same tool
 # pdb_final_geometry's existing per-ligand mol2 files were made with, just
 # with bond orders taken from SMILES instead of eLBOW. LIG_PDB_DIR is laid
 # out one subdirectory per ligand name, e.g.
@@ -984,7 +1118,7 @@ convert_ligs_process_dataset() {
             return 1
         fi
 
-        conda_activate "$CONDA_ENV_OBABEL"
+        conda_activate "$CONDA_ENV_QFIT"
         obabel "$sdf_file" -O "$mol2_file"
         status=$?
         conda_deactivate
@@ -1049,7 +1183,10 @@ calc_apo_rscc_process_dataset() {
         return 1
     fi
 
-    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}"
+    local bfactor_extra_args=()
+    [ -n "$bfactor" ] && bfactor_extra_args+=(--bfactor "$bfactor")
+
+    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" "${bfactor_extra_args[@]}"
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
@@ -1121,7 +1258,10 @@ calc_ref_set_rscc_process_dataset() {
         return 1
     fi
 
-    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}"
+    local bfactor_extra_args=()
+    [ -n "$bfactor" ] && bfactor_extra_args+=(--bfactor "$bfactor")
+
+    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" "${bfactor_extra_args[@]}"
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
@@ -1148,7 +1288,7 @@ do_calc_ref_set_rscc() {
 ######################################################################
 # Scores each dataset's reference-set structure (REF_SET/<dataset>/<REF_SET_PDB_PATTERN>)
 # with DESPOT, the same way as Stage 7a's own final_model_refined.pdb: symmetry_expand
-# into a realistic crystal environment (EXPAND_DISTANCE_CUTOFF), convert the expanded
+# into a realistic crystal environment (expand_distance_cutoff), convert the expanded
 # protein and split-out ligand to mol2, score with DESPOT's score_complex.py. Unlike
 # Stage 7a's input, the reference structure still carries explicit ligand hydrogens, ordered
 # waters, and DMSO (resname DMS, a common crystallization cryoprotectant) (e.g. from PanDDA) -
@@ -1212,7 +1352,7 @@ ref_set_despot_process_dataset() {
     local step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"
     symmetry_expand --strip "$structure" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
-        "$EXPAND_DISTANCE_CUTOFF" "$ligs_dir"
+        "$expand_distance_cutoff" "$ligs_dir"
     local status=$?
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
@@ -1237,7 +1377,7 @@ ref_set_despot_process_dataset() {
     fi
 
     "$PDB_TO_MOL2_SH" "${reference_dataset_dir}/ligs" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" \
-        "$CONDA_ENV_OBABEL" "$ASSIGN_BOND_ORDERS_PY" "${ligand_pdbs[@]}"
+        "$CONDA_ENV_QFIT" "$ASSIGN_BOND_ORDERS_PY" "${ligand_pdbs[@]}"
     status=$?
     if [ $status -ne 0 ]; then
         echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligand_pdbs[*]} with exit code ${status}"
@@ -1246,7 +1386,7 @@ ref_set_despot_process_dataset() {
     fi
 
     step_start_time=$(date +%s)
-    "$PROTEIN_TO_MOL2_SH" "$expanded_pdb" "$CONDA_SH" "$CONDA_ENV_OBABEL"
+    "$PROTEIN_TO_MOL2_SH" "$expanded_pdb" "$CONDA_SH" "$CONDA_ENV_QFIT"
     status=$?
     print_elapsed "$step_start_time" "[${dataset}] pdb2pqr"
     if [ $status -ne 0 ]; then
@@ -1346,16 +1486,17 @@ fit_ligand_process_dataset() {
         local out_dir="${DATASETS_DIR}/${dataset}/${run_name}"
         mkdir -p "${out_dir}"
 
-        echo "  Running fit_ligand: PDB=${dir_name}, sampling=${run_name}"
+        echo "  Running fit_ligand: PDB=${dir_name}, run_name=${run_name}"
 
         local fit_ligand_extra_args=()
         [ -n "$z_threshold" ] && fit_ligand_extra_args+=(-z "$z_threshold")
         [ -n "$num_peaks" ] && fit_ligand_extra_args+=(-n "$num_peaks")
+        [ -n "$fit_ligand_rmsd_cutoff" ] && fit_ligand_extra_args+=(--rmsd_cutoff "$fit_ligand_rmsd_cutoff")
 
         fit_ligand "${DATASETS_DIR}/${dataset}" \
             "${pdb_file}" \
             -r ${resolution} \
-            --sampling ${run_name} \
+            --run_name ${run_name} \
             "${fit_ligand_extra_args[@]}" \
             > "${out_dir}/ligandfit_${dir_name}.txt" 2>&1
 
@@ -1597,11 +1738,16 @@ rsr_placer_process_dataset() {
         echo "[${dataset}] Map:    $map_file"
         echo "[${dataset}] CIF:    $cif_path"
 
+        local rsr_extra_args=()
+        [ -n "$rsr_n_cycles" ] && rsr_extra_args+=(--n-cycles "$rsr_n_cycles")
+        [ -n "$rsr_map_weight" ] && rsr_extra_args+=(--map-weight "$rsr_map_weight")
+
         python "$RSR_SCRIPT_LIGAND" \
             "$input_pdb" \
             "$map_file" \
             "$output_pdb" \
-            --cif-restraints "$cif_path"
+            --cif-restraints "$cif_path" \
+            "${rsr_extra_args[@]}"
         local exit_code=$?
         if [ $exit_code -ne 0 ]; then
             echo "ERROR [${dataset}]: Refinement failed for $input_pdb with exit code $exit_code"
@@ -1702,6 +1848,7 @@ filter_process_dataset() {
     [ -n "$f1_rscc_cutoff" ] && f1_extra_args+=(--rscc_cutoff "$f1_rscc_cutoff")
     [ -n "$f1_clustering_mode" ] && f1_extra_args+=(--clustering_mode "$f1_clustering_mode")
     [ -n "$f1_clustering_cutoff" ] && f1_extra_args+=(--clustering_cutoff "$f1_clustering_cutoff")
+    [ -n "$f1_clash_vdw_scale" ] && f1_extra_args+=(--clash_vdw_scale "$f1_clash_vdw_scale")
 
     filter ${dataset_dir} \
         "${dataset_dir}/${run_name}/${placer_run_name}/*_refined.pdb" \
@@ -1905,12 +2052,19 @@ rsr_backbone_process_dataset() {
     echo "[${dataset}] Map: $map_file"
     echo "[${dataset}] Using CIF restraints list (${#cif_paths[@]} entries): $cif_list"
 
+    local rsr_extra_args=()
+    [ -n "$rsr_n_cycles" ] && rsr_extra_args+=(--n-cycles "$rsr_n_cycles")
+    [ -n "$rsr_map_weight" ] && rsr_extra_args+=(--map-weight "$rsr_map_weight")
+    [ -n "$rsr_backbone_cutoff" ] && rsr_extra_args+=(--cutoff "$rsr_backbone_cutoff")
+    [ -n "$rsr_moved_threshold" ] && rsr_extra_args+=(--moved-threshold "$rsr_moved_threshold")
+
     python "$RSR_SCRIPT_PROTEIN" \
         "$multimodel_pdb" \
         "$apo_pdb" \
         "$map_file" \
         "$output_pdb" \
-        --cif-list "$cif_list"
+        --cif-list "$cif_list" \
+        "${rsr_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
@@ -1980,10 +2134,12 @@ calc_backbone_refined_rscc_process_dataset() {
     fi
 
     local structure output_csv
+    local bfactor_extra_args=()
+    [ -n "$bfactor" ] && bfactor_extra_args+=(--bfactor "$bfactor")
     for structure in "${structures[@]}"; do
         output_csv="${structure%.pdb}_rscc.csv"
 
-        calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}"
+        calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" "${bfactor_extra_args[@]}"
 
         local calc_exit=$?
         if [ $calc_exit -ne 0 ]; then
@@ -2319,11 +2475,16 @@ rsr_placer2_process_dataset() {
         echo "[${dataset}] Map:    $map_file"
         echo "[${dataset}] CIF:    $cif_path"
 
+        local rsr_extra_args=()
+        [ -n "$rsr_n_cycles" ] && rsr_extra_args+=(--n-cycles "$rsr_n_cycles")
+        [ -n "$rsr_map_weight" ] && rsr_extra_args+=(--map-weight "$rsr_map_weight")
+
         python "$RSR_SCRIPT_LIGAND" \
             "$input_pdb" \
             "$map_file" \
             "$output_pdb" \
-            --cif-restraints "$cif_path"
+            --cif-restraints "$cif_path" \
+            "${rsr_extra_args[@]}"
         local exit_code=$?
         if [ $exit_code -ne 0 ]; then
             echo "ERROR [${dataset}]: Refinement failed for $input_pdb with exit code $exit_code"
@@ -2423,6 +2584,7 @@ filter2_process_dataset() {
     [ -n "$f2_rscc_cutoff" ] && f2_extra_args+=(--rscc_cutoff "$f2_rscc_cutoff")
     [ -n "$f2_clustering_mode" ] && f2_extra_args+=(--clustering_mode "$f2_clustering_mode")
     [ -n "$f2_clustering_cutoff" ] && f2_extra_args+=(--clustering_cutoff "$f2_clustering_cutoff")
+    [ -n "$f2_clash_vdw_scale" ] && f2_extra_args+=(--clash_vdw_scale "$f2_clash_vdw_scale")
 
     filter "${dataset_dir}" \
         "${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/*_refined.pdb" \
@@ -2608,12 +2770,21 @@ build_final_process_dataset() {
         return 1
     fi
 
+    local clash_extra_args=()
+    [ -n "$clash_vdw_scale" ] && clash_extra_args+=(--clash_vdw_scale "$clash_vdw_scale")
+    [ -n "$hbond_clash_vdw_scale" ] && clash_extra_args+=(--hbond_clash_vdw_scale "$hbond_clash_vdw_scale")
+    [ -n "$max_clash_group_size" ] && clash_extra_args+=(--max_clash_group_size "$max_clash_group_size")
+    [ -n "$max_clash_group_expansions" ] && clash_extra_args+=(--max_clash_group_expansions "$max_clash_group_expansions")
+    [ -n "$clash_domain_top_k" ] && clash_extra_args+=(--clash_domain_top_k "$clash_domain_top_k")
+    [ -n "$clash_solve_node_budget" ] && clash_extra_args+=(--clash_solve_node_budget "$clash_solve_node_budget")
+
     build_final_model "${dataset_dir}" \
         "${placer2_dir}/*_refined.pdb" \
         "${filter2_dir}/cluster_rep_models.pdb" \
         "${apo_structure}" \
         ${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name} \
-        -r ${resolution}
+        -r ${resolution} \
+        "${clash_extra_args[@]}"
 
     local build_exit=$?
     if [ $build_exit -ne 0 ]; then
@@ -2685,12 +2856,18 @@ rsr_final_process_dataset() {
     echo "[${dataset}] Map: $map_file"
     echo "[${dataset}] Using CIF restraints list: $cif_list"
 
+    local rsr_extra_args=()
+    [ -n "$rsr_n_cycles" ] && rsr_extra_args+=(--n-cycles "$rsr_n_cycles")
+    [ -n "$rsr_map_weight" ] && rsr_extra_args+=(--map-weight "$rsr_map_weight")
+    [ -n "$rsr_moved_threshold" ] && rsr_extra_args+=(--moved-threshold "$rsr_moved_threshold")
+
     python "$RSR_SCRIPT_FINAL" \
         "$final_pdb" \
         "$residues_csv" \
         "$map_file" \
         "$output_pdb" \
-        --cif-list "$cif_list"
+        --cif-list "$cif_list" \
+        "${rsr_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
@@ -2754,7 +2931,10 @@ calc_final_refined_rscc_process_dataset() {
         return 1
     fi
 
-    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}"
+    local bfactor_extra_args=()
+    [ -n "$bfactor" ] && bfactor_extra_args+=(--bfactor "$bfactor")
+
+    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" "${bfactor_extra_args[@]}"
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
@@ -2876,7 +3056,18 @@ rotamer_optimize_process_dataset() {
     echo "[${dataset}] Residues: $residues_csv"
     echo "[${dataset}] Resolution: $resolution"
 
-    rotamer_optimize "$dataset_dir" "$final_pdb" "$rotamer_output_folder" -r "$resolution"
+    local rotamer_extra_args=()
+    [ -n "$rotamer_rscc_threshold" ] && rotamer_extra_args+=(--rscc_threshold "$rotamer_rscc_threshold")
+    [ -n "$rotamer_rscc_improvement_threshold" ] && rotamer_extra_args+=(--rscc_improvement_threshold "$rotamer_rscc_improvement_threshold")
+    [ -n "$clash_vdw_scale" ] && rotamer_extra_args+=(--clash_vdw_scale "$clash_vdw_scale")
+    [ -n "$hbond_clash_vdw_scale" ] && rotamer_extra_args+=(--hbond_clash_vdw_scale "$hbond_clash_vdw_scale")
+    [ -n "$max_clash_group_size" ] && rotamer_extra_args+=(--max_clash_group_size "$max_clash_group_size")
+    [ -n "$max_clash_group_expansions" ] && rotamer_extra_args+=(--max_clash_group_expansions "$max_clash_group_expansions")
+    [ -n "$clash_domain_top_k" ] && rotamer_extra_args+=(--clash_domain_top_k "$clash_domain_top_k")
+    [ -n "$clash_solve_node_budget" ] && rotamer_extra_args+=(--clash_solve_node_budget "$clash_solve_node_budget")
+
+    rotamer_optimize "$dataset_dir" "$final_pdb" "$rotamer_output_folder" -r "$resolution" \
+        "${rotamer_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo "ERROR [${dataset}]: rotamer_optimize failed with exit code $exit_code"
@@ -2951,12 +3142,18 @@ rsr_rotamer_process_dataset() {
     echo "[${dataset}] Map: $map_file"
     echo "[${dataset}] Using CIF restraints list: $cif_list"
 
+    local rsr_extra_args=()
+    [ -n "$rsr_n_cycles" ] && rsr_extra_args+=(--n-cycles "$rsr_n_cycles")
+    [ -n "$rsr_map_weight" ] && rsr_extra_args+=(--map-weight "$rsr_map_weight")
+    [ -n "$rsr_moved_threshold" ] && rsr_extra_args+=(--moved-threshold "$rsr_moved_threshold")
+
     python "$RSR_SCRIPT_FINAL" \
         "$input_pdb" \
         "$residues_csv" \
         "$map_file" \
         "$output_pdb" \
-        --cif-list "$cif_list"
+        --cif-list "$cif_list" \
+        "${rsr_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
@@ -3027,7 +3224,11 @@ calc_rotamer_refined_rscc_process_dataset() {
         return 1
     fi
 
-    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" --residues-csv "$residues_csv"
+    local bfactor_extra_args=()
+    [ -n "$bfactor" ] && bfactor_extra_args+=(--bfactor "$bfactor")
+
+    calc_rscc "${structure}" "${event_maps[@]}" "${resolution}" "${output_csv}" \
+        --residues-csv "$residues_csv" "${bfactor_extra_args[@]}"
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
@@ -3085,9 +3286,12 @@ select_optimized_residues_process_dataset() {
         fi
     done
 
+    local select_extra_args=()
+    [ -n "$revert_min_diff" ] && select_extra_args+=(--revert_min_diff "$revert_min_diff")
+
     conda_activate "$CONDA_ENV_QFIT"
     select_optimized_residues "$final_model" "$rotamer_model" "$final_rscc_csv" "$rotamer_rscc_csv" \
-        "$residues_csv" "$output_pdb"
+        "$residues_csv" "$output_pdb" "${select_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo "ERROR [${dataset}]: select_optimized_residues failed with exit code $exit_code"
@@ -3253,7 +3457,7 @@ despot_process_dataset() {
     # original_ligand_dir captures final_model's own ligand instance for the record only
     # (never read downstream) - the scored ligands are $ligs_pdb via --ligand-conformers-pdb.
     symmetry_expand "$final_model" "$expanded_pdb" "$space_group" "$a" "$b" "$c" "$alpha" "$beta" "$gamma" \
-        "$EXPAND_DISTANCE_CUTOFF" "$original_ligand_dir" --ligand-conformers-pdb "$ligs_pdb"
+        "$expand_distance_cutoff" "$original_ligand_dir" --ligand-conformers-pdb "$ligs_pdb"
     status=$?
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
@@ -3263,7 +3467,7 @@ despot_process_dataset() {
         return 1
     fi
 
-    "$PDB_TO_MOL2_SH" "${despot_dir}/ligs" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_OBABEL" \
+    "$PDB_TO_MOL2_SH" "${despot_dir}/ligs" "$smiles" "$CONDA_SH" "$CONDA_ENV_QFIT" "$CONDA_ENV_QFIT" \
         "$ASSIGN_BOND_ORDERS_PY" "$ligs_pdb"
     status=$?
     if [ $status -ne 0 ]; then
@@ -3273,7 +3477,7 @@ despot_process_dataset() {
     fi
 
     step_start_time=$(date +%s)
-    "$PROTEIN_TO_MOL2_SH" "$expanded_pdb" "$CONDA_SH" "$CONDA_ENV_OBABEL"
+    "$PROTEIN_TO_MOL2_SH" "$expanded_pdb" "$CONDA_SH" "$CONDA_ENV_QFIT"
     status=$?
     print_elapsed "$step_start_time" "[${dataset}] pdb2pqr"
     if [ $status -ne 0 ]; then
@@ -3308,6 +3512,7 @@ despot_process_dataset() {
     [ -n "$despot_threshold" ] && despot_filter_args+=(--despot-threshold "$despot_threshold")
     [ -n "$despot_rscc_threshold" ] && despot_filter_args+=(--rscc-threshold "$despot_rscc_threshold")
     [ -n "$despot_rscc_weight" ] && despot_filter_args+=(--rscc-weight "$despot_rscc_weight")
+    [ -n "$bfactor" ] && despot_filter_args+=(--bfactor "$bfactor")
 
     step_start_time=$(date +%s)
     conda_activate "$CONDA_ENV_QFIT"

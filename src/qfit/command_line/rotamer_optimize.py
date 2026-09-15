@@ -11,41 +11,31 @@ from qfit import XMap
 from qfit.xtal.transformer import get_transformer
 from qfit.samplers import ChiRotator, CBAngleRotator, BisectingAngleRotator
 
-# Sidechain-sidechain clash resolution, matching build_final_model.py's convention (same
-# constants, same VDW-distance clash rule, same N/O hydrogen-bond exception) - see
-# Rotamer_Optimizer._resolveSidechainClashes for why rotamer_optimize needs this too: each
-# residue's optimized rotamer is picked independently against the untouched base structure, so
-# two residues that were BOTH independently found to improve can still clash with each other.
+from qfit.command_line.sidechain_clash import (
+    SidechainClashResolver, CLASH_VDW_SCALE, HBOND_CLASH_VDW_SCALE, MAX_CLASH_GROUP_SIZE,
+    MAX_CLASH_GROUP_EXPANSIONS, CLASH_DOMAIN_TOP_K, CLASH_SOLVE_NODE_BUDGET,
+)
 
-# fraction of summed VDW radii below which two sidechain atoms are considered clashing
-CLASH_VDW_SCALE = 0.75
-# looser scale used instead of CLASH_VDW_SCALE when the clashing pair is one N atom and one O
-# atom - a real N-H...O or O-H...N hydrogen bond legitimately sits closer than CLASH_VDW_SCALE
-# would otherwise tolerate
-HBOND_CLASH_VDW_SCALE = 0.6
+# Sidechain-sidechain clash resolution, using the same shared engine (qfit.command_line.
+# sidechain_clash) and the same clash variables as build_final_model.py - see
+# Rotamer_Optimizer.run()'s Pass 2 for why rotamer_optimize needs this too: each residue's
+# optimized rotamer is picked independently against the untouched base structure, so two
+# residues that were BOTH independently found to improve can still clash with each other.
 BACKBONE_ATOM_NAMES = {'N', 'CA', 'C', 'O', 'OXT'}
-# safety caps for _resolveSidechainClashes - see _resolveGroup's docstring
-MAX_CLASH_GROUP_SIZE = 8  # residues; stop absorbing new neighbors past this
-MAX_CLASH_GROUP_EXPANSIONS = 10  # rounds of "resolve, then absorb new external clashes"
-CLASH_DOMAIN_TOP_K = 25  # candidates considered per residue during joint solving
-CLASH_SOLVE_NODE_BUDGET = 200_000  # branch-and-bound search nodes before falling back to ICM
 
 # Per-residue candidate pool built by Rotamer_Optimizer.run() and consumed by
-# _resolveSidechainClashes. coor: (n_candidates, natoms, 3); rscc: (n_candidates,) - both
-# indexed identically, index 0 always the true original (untouched) conformation. A residue
-# that didn't pass the sampling threshold (base_rscc >= rscc_threshold) is fixed: exactly one
-# candidate. A sampled residue carries its full last-chi-angle sampling pool (up to
-# Rotamer_Optimizer.trim conformers, from _sample_sidechains' own top-K trim) as candidates
-# 1..N, alongside its original as candidate 0 - not just the single best one - so clash
-# resolution has real alternatives to pick from instead of only "swap or don't".
+# SidechainClashResolver (via cost=-rscc, since the resolver always minimizes). coor:
+# (n_candidates, natoms, 3); rscc: (n_candidates,) - both indexed identically, index 0 always
+# the true original (untouched) conformation. A residue that didn't pass the sampling threshold
+# (base_rscc >= rscc_threshold) is fixed: exactly one candidate. A sampled residue carries its
+# full last-chi-angle sampling pool (up to Rotamer_Optimizer.trim conformers, from
+# _sample_sidechains' own top-K trim) as candidates 1..N, alongside its original as candidate 0
+# - not just the single best one - so clash resolution has real alternatives to pick from
+# instead of only "swap or don't". Reverting a group to index 0 (SidechainClashResolver's
+# revert_index=0, see Rotamer_Optimizer.run()) is always safe for exactly this reason.
 _RotamerCandidates = namedtuple(
     'RotamerCandidates', ['coor', 'rscc', 'template', 'sidechain_mask', 'fixed'],
 )
-
-
-class _NodeBudgetExceeded(Exception):
-    """Raised internally by _branchAndBound to abort the search once its node budget is
-    exhausted; caught by its caller to trigger the ICM fallback."""
 
 #symetry aware sidechain rmsd calc
 def _get_coordinate_rmsd(reference_coordinates, new_coordinate_set, atom_names=None):
@@ -124,6 +114,80 @@ def build_argparser():
         type=float,
         help="Map resolution (Å) (only use when providing CCP4 map files)",
     )
+    p.add_argument(
+        "--rscc_threshold",
+        default=0.5,
+        metavar="<float>",
+        type=float,
+        help="Residues scoring below this RSCC against the event maps are candidates for "
+             "rotamer resampling; residues already at/above it are left untouched (default: 0.5).",
+    )
+    p.add_argument(
+        "--rscc_improvement_threshold",
+        default=0.1,
+        metavar="<float>",
+        type=float,
+        help="A resampled rotamer is only accepted if it improves RSCC over the starting "
+             "conformer by at least this much (default: 0.1).",
+    )
+    p.add_argument(
+        "--clash_vdw_scale",
+        default=CLASH_VDW_SCALE,
+        metavar="<float>",
+        type=float,
+        help="Sidechain-sidechain clash detection: fraction of the summed VDW radii "
+             "of two sidechain atoms (backbone atoms are never checked) below which "
+             f"they are considered clashing (default: {CLASH_VDW_SCALE}). Does not apply "
+             "to N/O pairs - see --hbond_clash_vdw_scale. Same mechanism/variable as "
+             "build_final_model.py's own flag of the same name.",
+    )
+    p.add_argument(
+        "--hbond_clash_vdw_scale",
+        default=HBOND_CLASH_VDW_SCALE,
+        metavar="<float>",
+        type=float,
+        help="Sidechain-sidechain clash detection: same as --clash_vdw_scale, but used "
+             "instead of it whenever the pair is one N atom and one O atom, since a real "
+             f"hydrogen bond legitimately sits closer than a generic clash (default: "
+             f"{HBOND_CLASH_VDW_SCALE})",
+    )
+    p.add_argument(
+        "--max_clash_group_size",
+        default=MAX_CLASH_GROUP_SIZE,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: a group of mutually-reselected "
+             "clashing residues stops absorbing newly-clashing neighbors once it "
+             "would exceed this many residues - the residual clash is logged and "
+             f"the group reverted instead (default: {MAX_CLASH_GROUP_SIZE})",
+    )
+    p.add_argument(
+        "--max_clash_group_expansions",
+        default=MAX_CLASH_GROUP_EXPANSIONS,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: rounds of \"resolve, then absorb "
+             f"new external clashes\" a group is allowed before giving up (default: "
+             f"{MAX_CLASH_GROUP_EXPANSIONS})",
+    )
+    p.add_argument(
+        "--clash_domain_top_k",
+        default=CLASH_DOMAIN_TOP_K,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: number of highest-RSCC candidates "
+             "considered per residue during joint clash-group solving before falling "
+             f"back to the full candidate pool (default: {CLASH_DOMAIN_TOP_K})",
+    )
+    p.add_argument(
+        "--clash_solve_node_budget",
+        default=CLASH_SOLVE_NODE_BUDGET,
+        metavar="<int>",
+        type=int,
+        help="Sidechain-sidechain clash detection: branch-and-bound search nodes "
+             "allowed per clash group before falling back to a heuristic (ICM) "
+             f"reassignment (default: {CLASH_SOLVE_NODE_BUDGET})",
+    )
     return p
 
 class QFitOptions: #copypasted from qfit.py
@@ -158,7 +222,14 @@ class QFitOptions: #copypasted from qfit.py
         self.remove_conformers_below_cutoff = False
 
 class Rotamer_Optimizer():
-    def __init__(self, dataset_dir, model_file, output_folder, resolution):
+    def __init__(self, dataset_dir, model_file, output_folder, resolution,
+                 rscc_threshold=0.5, rscc_improvement_threshold=0.1,
+                 clash_vdw_scale=CLASH_VDW_SCALE,
+                 hbond_clash_vdw_scale=HBOND_CLASH_VDW_SCALE,
+                 max_clash_group_size=MAX_CLASH_GROUP_SIZE,
+                 max_clash_group_expansions=MAX_CLASH_GROUP_EXPANSIONS,
+                 clash_domain_top_k=CLASH_DOMAIN_TOP_K,
+                 clash_solve_node_budget=CLASH_SOLVE_NODE_BUDGET):
         self.dir = dataset_dir
         self.model_file = model_file
         self.output_path = f"{dataset_dir}/{output_folder}"
@@ -175,12 +246,17 @@ class Rotamer_Optimizer():
 
         # Residues scoring below this against the event maps are candidates for optimization;
         # residues already at/above it are left untouched.
-        self.rscc_threshold = 0.5
+        self.rscc_threshold = rscc_threshold
         # An optimized conformer is only accepted if it improves RSCC over the starting
         # conformer by at least this much.
-        self.rscc_improvement_threshold = 0.1
+        self.rscc_improvement_threshold = rscc_improvement_threshold
 
-        self.max_clash_group_size = MAX_CLASH_GROUP_SIZE
+        self.clash_vdw_scale = clash_vdw_scale
+        self.hbond_clash_vdw_scale = hbond_clash_vdw_scale
+        self.max_clash_group_size = max_clash_group_size
+        self.max_clash_group_expansions = max_clash_group_expansions
+        self.clash_domain_top_k = clash_domain_top_k
+        self.clash_solve_node_budget = clash_solve_node_budget
 
     def _load_event_maps(self):
         """Loads every event map for this dataset. Maps sharing the same 1-BDC value are
@@ -320,7 +396,17 @@ class Rotamer_Optimizer():
             key: (top_pick_idx[key] if step1_accepted.get(key) else 0)
             for key in self._candidates
         }
-        self._resolveSidechainClashes(chosen_idx)
+        resolver = SidechainClashResolver(
+            self._candidates, cost_of=lambda c: -c.rscc,
+            clash_vdw_scale=self.clash_vdw_scale,
+            hbond_clash_vdw_scale=self.hbond_clash_vdw_scale,
+            max_clash_group_size=self.max_clash_group_size,
+            max_clash_group_expansions=self.max_clash_group_expansions,
+            clash_domain_top_k=self.clash_domain_top_k,
+            clash_solve_node_budget=self.clash_solve_node_budget,
+            revert_index=0, group_label='rotamer clash group',
+        )
+        resolver.resolve_sidechain_clashes(chosen_idx)
 
         # Pass 3: redetermine which residues pass, using whatever candidate each one actually
         # ended up on after clash resolution - which may differ from its Pass 1 top pick, since
@@ -383,416 +469,6 @@ class Rotamer_Optimizer():
                 improved_rscc_str = f'{optimized_rscc}' if optimized_rscc is not None else 'NA'
                 f.write(f'{chain_id}{resi},{base_rscc},{improved_rscc_str},{"yes" if accepted else "no"}\n')
         print(f'{num_improved}/{len(all_rows)} residue(s) improved; written to {residue_rscc_output}')
-
-    # ---- sidechain-sidechain clash resolution -----------------------------
-    #
-    # Every residue's Pass 1 pick is decided independently, which can leave pairs of residues
-    # whose sidechains clash with each other (a residue's top pick is only ever checked against
-    # the FIXED, untouched base structure - never against another residue's own pick). The
-    # methods below find those pairs, group them by connectivity, and jointly reselect each
-    # group to the highest-total-RSCC combination that clashes with nothing - inside the group
-    # or out - searching each movable member's FULL last-chi-angle candidate pool, not just its
-    # top pick vs. original. Ported from build_final_model.py's own sidechain clash resolution:
-    # same clash rule, same grouping/expansion strategy, and (since a pool here can hold ~10+
-    # candidates, same as build_final_model.py's own residues) the same top-K domain truncation
-    # plus branch-and-bound/ICM solver.
-
-    def _residueReachSpheres(self):
-        """Per residue, returns (centroids, reach): reach[key] is the distance from
-        centroids[key] to the farthest sidechain atom across every gathered candidate of that
-        residue - a conservative bounding sphere. Two residues can only possibly sidechain-clash
-        if their reach-spheres overlap (plus a margin covering the VDW clash threshold), which
-        lets the clash search skip an exact atom-pairwise check for residue pairs that are
-        obviously too far apart. Residues with no sidechain atoms (e.g. glycine) get reach 0."""
-        centroids = {}
-        reach = {}
-        for key, cand in self._candidates.items():
-            if not cand.sidechain_mask.any():
-                centroids[key] = cand.coor[0].mean(axis=0)
-                reach[key] = 0.0
-                continue
-            pts = cand.coor[:, cand.sidechain_mask, :].reshape(-1, 3)
-            centroid = pts.mean(axis=0)
-            centroids[key] = centroid
-            reach[key] = float(np.max(np.linalg.norm(pts - centroid, axis=1)))
-        return centroids, reach
-
-    def _candidatePairsWithinReach(self, keys_a, centroids, reach, keys_b=None, margin=3.0):
-        """Yields (key1, key2) pairs - key1 from keys_a, key2 from keys_b (defaults to keys_a
-        itself, in which case each unordered pair is yielded once) - whose reach-spheres come
-        within `margin` of overlapping. `margin` just needs to conservatively cover the largest
-        plausible VDW clash threshold - it does not need to be exact, since this is only a cheap
-        prefilter and every pair it yields still gets an exact atom-pairwise check."""
-        self_pairs = keys_b is None
-        keys_b = keys_a if self_pairs else keys_b
-        for i, k1 in enumerate(keys_a):
-            others = keys_b[i + 1:] if self_pairs else keys_b
-            for k2 in others:
-                if k1 == k2:
-                    continue
-                d = np.linalg.norm(centroids[k1] - centroids[k2])
-                if d <= reach[k1] + reach[k2] + margin:
-                    yield k1, k2
-
-    def _domainCompatibilityMatrix(self, key1, idx1, key2, idx2):
-        """Returns an (len(idx1), len(idx2)) boolean matrix: True where candidate idx1[i] of
-        residue key1 does NOT sidechain-clash with candidate idx2[j] of residue key2 (sidechain
-        atoms only). The per-atom-pair threshold is CLASH_VDW_SCALE * summed VDW radii, EXCEPT
-        for an (N, O) atom pair (either order), which uses HBOND_CLASH_VDW_SCALE instead - a
-        real N-H...O or O-H...N hydrogen bond legitimately sits closer than a generic clash
-        would tolerate. idx1/idx2 are arrays of candidate indices."""
-        cand1, cand2 = self._candidates[key1], self._candidates[key2]
-        mask1, mask2 = cand1.sidechain_mask, cand2.sidechain_mask
-        if not mask1.any() or not mask2.any():
-            return np.ones((len(idx1), len(idx2)), dtype=bool)
-
-        coor1 = cand1.coor[idx1][:, mask1, :]  # (n1, a1, 3)
-        coor2 = cand2.coor[idx2][:, mask2, :]  # (n2, a2, 3)
-        vdw1 = np.asarray(cand1.template.vdw_radius)[mask1]  # (a1,)
-        vdw2 = np.asarray(cand2.template.vdw_radius)[mask2]  # (a2,)
-        e1 = np.asarray(cand1.template.e)[mask1]  # (a1,) element symbols
-        e2 = np.asarray(cand2.template.e)[mask2]  # (a2,)
-
-        vdw_sum = vdw1[:, None] + vdw2[None, :]  # (a1, a2)
-        is_n_o_pair = (
-            ((e1 == 'N')[:, None] & (e2 == 'O')[None, :])
-            | ((e1 == 'O')[:, None] & (e2 == 'N')[None, :])
-        )  # (a1, a2)
-        scale = np.where(is_n_o_pair, HBOND_CLASH_VDW_SCALE, CLASH_VDW_SCALE)
-        thresh = scale * vdw_sum  # (a1, a2)
-
-        diff = coor1[:, None, :, None, :] - coor2[None, :, None, :, :]  # (n1,n2,a1,a2,3)
-        dists = np.linalg.norm(diff, axis=-1)  # (n1,n2,a1,a2)
-        clashing = np.any(dists < thresh[None, None, :, :], axis=(2, 3))  # (n1,n2)
-        return ~clashing
-
-    def _pairClashes(self, key1, idx1, key2, idx2):
-        """Whether residue key1's candidate idx1 sidechain-clashes with residue key2's
-        candidate idx2 (both single indices, not arrays)."""
-        compat = self._domainCompatibilityMatrix(key1, np.array([idx1]), key2, np.array([idx2]))
-        return not compat[0, 0]
-
-    def _findClashingPairs(self, keys, chosen_idx, centroids, reach):
-        """Among `keys`' CURRENT choices in chosen_idx, returns every pair that
-        sidechain-clashes (after the reach-sphere prefilter)."""
-        return [
-            (k1, k2) for k1, k2 in self._candidatePairsWithinReach(keys, centroids, reach)
-            if self._pairClashes(k1, chosen_idx[k1], k2, chosen_idx[k2])
-        ]
-
-    def _externalClashes(self, group, chosen_idx, centroids, reach):
-        """Among `group`'s CURRENT choices in chosen_idx, returns every pair that
-        sidechain-clashes with a residue outside the group."""
-        others = [k for k in self._candidates if k not in group]
-        return [
-            (k1, k2) for k1, k2 in self._candidatePairsWithinReach(group, centroids, reach, keys_b=others)
-            if self._pairClashes(k1, chosen_idx[k1], k2, chosen_idx[k2])
-        ]
-
-    def _connectedComponents(self, keys, pairs):
-        """Groups `keys` into connected components of the graph formed by `pairs` (undirected
-        edges). Keys with no edge at all are omitted."""
-        adjacency = {k: set() for k in keys}
-        for k1, k2 in pairs:
-            adjacency[k1].add(k2)
-            adjacency[k2].add(k1)
-
-        seen = set()
-        components = []
-        for k in keys:
-            if k in seen or not adjacency[k]:
-                continue
-            stack = [k]
-            seen.add(k)
-            comp = []
-            while stack:
-                cur = stack.pop()
-                comp.append(cur)
-                for nb in adjacency[cur]:
-                    if nb not in seen:
-                        seen.add(nb)
-                        stack.append(nb)
-            components.append(sorted(comp))
-        return components
-
-    def _format_group(self, keys):
-        return ', '.join(f'{c}{r}' for c, r in keys)
-
-    def _assignmentClashFree(self, group, assignment):
-        """Whether `assignment` ({key: local_candidate_index}, one per member of `group`) has
-        zero pairwise sidechain clash among every pair in `group`. `group` is always small
-        (capped by max_clash_group_size), so this is a plain O(n^2) check."""
-        return all(
-            not self._pairClashes(k1, assignment[k1], k2, assignment[k2])
-            for i, k1 in enumerate(group) for k2 in group[i + 1:]
-        )
-
-    def _domainsFor(self, group, top_k):
-        """{key: candidate indices to consider}, cheapest-first (highest RSCC first, since this
-        module maximizes rather than minimizes). top_k=None means every candidate (no
-        truncation); fixed residues always get their single candidate regardless of top_k."""
-        domains = {}
-        for key in group:
-            cand = self._candidates[key]
-            if cand.fixed:
-                domains[key] = np.array([0])
-            else:
-                order = np.argsort(-cand.rscc)
-                domains[key] = order if top_k is None else order[:top_k]
-        return domains
-
-    def _solveGroupAssignmentOverDomains(self, group, domains, domain_label):
-        """Solves the joint RSCC-maximization problem (see _solveGroupAssignment) over exactly
-        the given `domains` - no truncation or widening here. Returns ({key:
-        global_candidate_index}, resolved) where resolved is False if no combination within
-        these domains eliminates every pairwise clash."""
-        compat = {}
-        for i, key1 in enumerate(group):
-            for key2 in group[i + 1:]:
-                compat[(key1, key2)] = self._domainCompatibilityMatrix(
-                    key1, domains[key1], key2, domains[key2]
-                )
-
-        result = self._branchAndBound(group, domains, compat)
-        if result is None:
-            print(f'  rotamer clash group [{self._format_group(group)}]: exact search over the '
-                  f'{domain_label} domain found no fully compatible combination (or exhausted its '
-                  f'node budget); falling back to a heuristic (ICM) reassignment.')
-            result = self._icmAssignment(group, domains, compat)
-
-        assignment = {key: int(domains[key][local_i]) for key, local_i in result.items()}
-        return assignment, self._assignmentClashFree(group, assignment)
-
-    def _solveGroupAssignment(self, group):
-        """Returns ({key: chosen_candidate_index}, resolved) for one clash group: the
-        combination of candidates (one per residue, searched over each movable member's FULL
-        last-chi-angle candidate pool plus its original - not just its top pick vs. original) that
-        maximizes total RSCC subject to no pairwise sidechain clash within the group - and
-        whether that goal was actually achieved.
-
-        Efficiency: each residue's domain is first truncated to its CLASH_DOMAIN_TOP_K
-        highest-RSCC candidates (a low-scoring candidate essentially never wins even when it's
-        compatible), then solved exactly via _branchAndBound (DFS, most-constrained-residue-
-        first, pruned by an admissible cost bound); if that exceeds its node budget, or finds no
-        fully-compatible combination within the truncated domains, _icmAssignment (a fast,
-        always-terminating local-search heuristic) is used instead. If even that doesn't find a
-        fully compatible combination, this retries ONCE with each residue's FULL (untruncated)
-        domain before conceding.
-
-        `resolved` is only False if even the full-domain retry couldn't eliminate every internal
-        clash - this shouldn't normally happen, since base_structure (final_model.pdb) was
-        already clash-resolved by build_final_model.py, so "every movable residue at its original
-        candidate (index 0)" is itself always a valid, clash-free combination as long as that
-        resolution fully covered this residue set."""
-        top_k_domains = self._domainsFor(group, CLASH_DOMAIN_TOP_K)
-        assignment, resolved = self._solveGroupAssignmentOverDomains(
-            group, top_k_domains, f'top-{CLASH_DOMAIN_TOP_K}'
-        )
-
-        if not resolved:
-            full_domains = self._domainsFor(group, top_k=None)
-            assignment, resolved = self._solveGroupAssignmentOverDomains(group, full_domains, 'full')
-
-        if not resolved:
-            movable = [k for k in group if not self._candidates[k].fixed]
-            fallback = {k: 0 for k in group if self._candidates[k].fixed}
-            fallback.update({k: 0 for k in movable})
-            return fallback, False
-
-        return assignment, True
-
-    def _branchAndBound(self, group, domains, compat, node_budget=CLASH_SOLVE_NODE_BUDGET):
-        """Exact DFS branch-and-bound over `domains` (local candidate indices per residue),
-        maximizing total RSCC subject to `compat` (pairwise domain-compatibility matrices - see
-        _domainCompatibilityMatrix - keyed by (key1, key2) in `group` order). Residues are
-        visited most-constrained-first (smallest domain first); within a residue, candidates are
-        tried highest-RSCC-first, and a branch is pruned once its partial score plus the best
-        possible completion (each remaining residue's own maximum candidate RSCC - an admissible
-        upper bound, since it ignores compatibility) can no longer beat the best solution found
-        so far.
-
-        Returns {key: local_domain_index} for the optimal assignment, or None if the node budget
-        was exhausted before one fully-compatible assignment was found (including the case where
-        none exists at all within these domains)."""
-        order = sorted(group, key=lambda k: len(domains[k]))
-        scores = [self._candidates[key].rscc[domains[key]] for key in order]
-        best_first = [np.argsort(-s) for s in scores]
-
-        n = len(order)
-        suffix_max = [0.0] * (n + 1)
-        for k in range(n - 1, -1, -1):
-            suffix_max[k] = suffix_max[k + 1] + float(scores[k].max())
-
-        def get_matrix(k1, k2):
-            key1, key2 = order[k1], order[k2]
-            if (key1, key2) in compat:
-                return compat[(key1, key2)], False
-            return compat[(key2, key1)], True
-
-        current = [None] * n
-        best = {'assignment': None, 'score': -float('inf')}
-        nodes = {'count': 0}
-
-        def compat_ok(k, local_i):
-            for prev in range(k):
-                m, swapped = get_matrix(prev, k)
-                i, j = (current[prev], local_i) if not swapped else (local_i, current[prev])
-                if not m[i, j]:
-                    return False
-            return True
-
-        def dfs(k, score_so_far):
-            if score_so_far + suffix_max[k] <= best['score']:
-                return
-            nodes['count'] += 1
-            if nodes['count'] > node_budget:
-                raise _NodeBudgetExceeded()
-            if k == n:
-                best['assignment'] = list(current)
-                best['score'] = score_so_far
-                return
-            for local_i in best_first[k]:
-                if not compat_ok(k, local_i):
-                    continue
-                current[k] = local_i
-                dfs(k + 1, score_so_far + float(scores[k][local_i]))
-            current[k] = None
-
-        try:
-            dfs(0, 0.0)
-        except _NodeBudgetExceeded:
-            return None
-
-        if best['assignment'] is None:
-            return None
-        return {key: idx for key, idx in zip(order, best['assignment'])}
-
-    def _icmAssignment(self, group, domains, compat, max_iters=25):
-        """Iterated Conditional Modes: a fast, always-terminating heuristic for the same joint
-        RSCC-maximization problem _branchAndBound solves exactly. Starting every residue at its
-        own highest-RSCC candidate, repeatedly revisits each residue in `group` in turn and
-        reassigns it to its highest-RSCC candidate that's compatible with every OTHER residue's
-        CURRENT pick, until a full pass changes nothing (or max_iters is hit). May still leave
-        residual clashes if even the (already top-K-truncated) domains contain no fully mutually
-        compatible combination at all.
-
-        Returns {key: local_domain_index}."""
-        def get_matrix(key_a, key_b):
-            if (key_a, key_b) in compat:
-                return compat[(key_a, key_b)], False
-            return compat[(key_b, key_a)], True
-
-        current = {key: 0 for key in group}
-
-        for _ in range(max_iters):
-            changed = False
-            for key in group:
-                scores = self._candidates[key].rscc[domains[key]]
-                for local_i in np.argsort(-scores):
-                    ok = True
-                    for other in group:
-                        if other == key:
-                            continue
-                        m, swapped = get_matrix(key, other)
-                        i, j = (local_i, current[other]) if not swapped else (current[other], local_i)
-                        if not m[i, j]:
-                            ok = False
-                            break
-                    if ok:
-                        if local_i != current[key]:
-                            current[key] = int(local_i)
-                            changed = True
-                        break
-            if not changed:
-                break
-
-        return current
-
-    def _resolveGroup(self, group, chosen_idx, centroids, reach):
-        """Jointly reselects one clash group to the highest-total-RSCC combination of
-        candidates with no sidechain clash inside the group (see _solveGroupAssignment) -
-        mutating chosen_idx in place for every member. If the new picks clash with a residue
-        outside the group, that residue is absorbed into the group and the whole group is
-        resolved again, repeating until stable (same expansion strategy as
-        build_final_model.py's _resolveGroup)."""
-        group = list(group)
-        original_group = list(group)
-        hit_cap = False
-        unresolved = False
-
-        for _round in range(MAX_CLASH_GROUP_EXPANSIONS):
-            assignment, resolved = self._solveGroupAssignment(group)
-            for key, idx in assignment.items():
-                chosen_idx[key] = idx
-
-            if not resolved:
-                unresolved = True
-                print(f'WARNING: rotamer clash group [{self._format_group(group)}] could NOT be '
-                      f'fully resolved - no combination from each member\'s sampled candidate '
-                      f'pool eliminates every clash within the group; reverting every movable '
-                      f'member of this group to its original conformation.')
-                break
-
-            external = self._externalClashes(group, chosen_idx, centroids, reach)
-            new_members = sorted({k2 for (_, k2) in external if k2 not in group})
-            if not new_members:
-                break
-
-            if len(group) + len(new_members) > self.max_clash_group_size:
-                hit_cap = True
-                print(f'WARNING: rotamer clash group [{self._format_group(group)}] would grow '
-                      f'past max_clash_group_size={self.max_clash_group_size} residues after '
-                      f'absorbing [{self._format_group(new_members)}]; stopping expansion here. '
-                      f'Every movable member of this group is reverted to its original '
-                      f'conformation rather than risk leaving a residual clash unresolved.')
-                for key in group:
-                    if not self._candidates[key].fixed:
-                        chosen_idx[key] = 0
-                break
-
-            group.extend(new_members)
-        else:
-            hit_cap = True
-            print(f'WARNING: rotamer clash group [{self._format_group(group)}] kept absorbing '
-                  f'new neighbors past {MAX_CLASH_GROUP_EXPANSIONS} round(s); reverting every '
-                  f'movable member of this group to its original conformation.')
-            for key in group:
-                if not self._candidates[key].fixed:
-                    chosen_idx[key] = 0
-
-        flagged = hit_cap or unresolved
-        verb = 'left with a residual clash (reverted to original)' if flagged else 'resolved'
-        print(f'rotamer clash group [{self._format_group(group)}] ({len(group)} residue(s), '
-              f'{len(original_group)} originally clashing) {verb}.')
-
-        return {'residues': group, 'original_residues': original_group,
-                'hit_cap': hit_cap, 'unresolved': unresolved}
-
-    def _resolveSidechainClashes(self, chosen_idx):
-        """Finds every sidechain-sidechain clash among the current candidate picks in
-        chosen_idx (every residue starts at its Pass 1 decision: its top pick if that
-        independently cleared the 0.1 threshold, else its original), groups clashing residues by
-        connectivity, and resolves each group via _resolveGroup - mutating chosen_idx in place.
-        Returns a list of per-group summary rows."""
-        centroids, reach = self._residueReachSpheres()
-        keys = list(self._candidates.keys())
-
-        initial_pairs = self._findClashingPairs(keys, chosen_idx, centroids, reach)
-        groups = self._connectedComponents(keys, initial_pairs)
-
-        if groups:
-            print(f'{len(groups)} sidechain-sidechain clash group(s) found among independently '
-                  f'optimized rotamer picks; resolving each jointly.')
-
-        group_rows = []
-        settled = set()
-        for group in groups:
-            if settled.issuperset(group):
-                continue
-            row = self._resolveGroup(group, chosen_idx, centroids, reach)
-            settled.update(row['residues'])
-            group_rows.append(row)
-        return group_rows
 
     def _update_coords(self, structure, coords_by_residue):
         new_coor = structure.coor.copy()
@@ -1021,7 +697,11 @@ class Rotamer_Optimizer():
 
 def main():
     args = build_argparser().parse_args()
-    ro = Rotamer_Optimizer(args.dataset, args.model_file, args.output_folder, args.resolution)
+    ro = Rotamer_Optimizer(args.dataset, args.model_file, args.output_folder, args.resolution,
+                            args.rscc_threshold, args.rscc_improvement_threshold,
+                            args.clash_vdw_scale, args.hbond_clash_vdw_scale,
+                            args.max_clash_group_size, args.max_clash_group_expansions,
+                            args.clash_domain_top_k, args.clash_solve_node_budget)
     ro.run()
 
 if __name__ == '__main__':

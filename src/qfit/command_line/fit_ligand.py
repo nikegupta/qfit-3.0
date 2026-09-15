@@ -47,14 +47,25 @@ def build_argparser():
         help="Z-score threshold for peak detection (default: 5)",
     )
     p.add_argument(
-        "--sampling",
+        "--run_name",
         required=True,
-        help='geometric sampling parameters as an underscore seperated list (ie 3_3_3_3_5_0.5)'
+        help='Pipeline run_name, used to name this dataset\'s output subdirectory '
+             '(dataset / run_name) - not a numeric sampling parameter despite the historical '
+             '"--sampling" flag name this replaces.'
+    )
+    p.add_argument(
+        "--rmsd_cutoff",
+        default=2,
+        metavar="<float>",
+        type=float,
+        help="Peak de-duplication: two candidate peaks whose placed-ligand RMSD is below this "
+             "are treated as the same peak (default: 2).",
     )
     return p
 
 class LigandPlacer():
-    def __init__(self, dataset, ligand_file, resolution, geom_params, num_peaks=5, z_threshold=5):
+    def __init__(self, dataset, ligand_file, resolution, run_name, num_peaks=5, z_threshold=5,
+                 rmsd_cutoff=2):
         # Read in args
         self.dataset = dataset
         self.dataset_name = str(dataset).split('/')[-1]
@@ -63,12 +74,12 @@ class LigandPlacer():
         self.resolution = resolution
         self.num_peaks = num_peaks
         self.z_threshold = z_threshold
-        self.geom_params = geom_params
+        self.run_name = run_name
         self._rmask = 0.5 + self.resolution / 3.0
-        self.rmsd_cutoff = 2
+        self.rmsd_cutoff = rmsd_cutoff
 
         #make output folder
-        self.output_dir = self.dataset / self.geom_params
+        self.output_dir = self.dataset / self.run_name
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Per-dataset manifest linking every fit_ligand output pdb directly to
@@ -77,7 +88,7 @@ class LigandPlacer():
         # strip the trailing _{integer}") as the way downstream pipeline
         # steps (filtering, CIF restraint lookup, etc.) recover which ligand
         # a given output belongs to. Multiple LigandPlacer invocations (one
-        # per candidate ligand) can target the same dataset/geom_params
+        # per candidate ligand) can target the same dataset/run_name
         # output directory, so entries are appended under a file lock rather
         # than each invocation overwriting the others' rows.
         self.manifest_path = self.output_dir / 'fit_ligand_manifest.csv'
@@ -155,7 +166,7 @@ class LigandPlacer():
         peak_index, output_pdb).
 
         Because several LigandPlacer runs (one per candidate ligand) can
-        write into the same dataset/geom_params directory, this appends
+        write into the same dataset/run_name directory, this appends
         under an exclusive lock (fcntl.flock) rather than each invocation
         managing its own file, and determines whether a header is needed by
         checking the actual file size under the lock (not a separate
@@ -472,8 +483,8 @@ class LigandPlacer():
 def main():
     p = build_argparser()
     args = p.parse_args()
-    placer = LigandPlacer(args.dataset, args.ligand, args.resolution, 
-                          args.sampling, args.num_peaks, args.z_threshold)
+    placer = LigandPlacer(args.dataset, args.ligand, args.resolution,
+                          args.run_name, args.num_peaks, args.z_threshold, args.rmsd_cutoff)
     placer.run()
 
 if __name__ == '__main__':

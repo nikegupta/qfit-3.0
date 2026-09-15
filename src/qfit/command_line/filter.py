@@ -78,8 +78,8 @@ def build_argparser():
         type=float,
         help="Proportion (0-1) of the total number of input conformers "
              "(summed across all placer_files) to filter down to. "
-             "e.g. 0.1 keeps the best 10%% of all input conformers. "
-             "(default: 0.1)",
+             "e.g. 0.25 keeps the best 25%% of all input conformers. "
+             "(default: 0.25)",
     )
     p.add_argument(
         "--min_cluster_proportion",

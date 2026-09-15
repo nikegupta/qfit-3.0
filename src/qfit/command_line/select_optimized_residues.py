@@ -70,6 +70,11 @@ def build_argparser():
         help='Path to write the merged structure to (optimized.pdb). optimized_rscc.csv is '
              'written alongside it, in the same directory.'
     )
+    p.add_argument(
+        '--revert_min_diff', type=float, default=REVERT_MIN_DIFF, metavar='<float>',
+        help='Minimum final_rscc - rotamer_rscc for a residue to be reverted to its '
+             f'final_model_refined conformation (default: {REVERT_MIN_DIFF}).'
+    )
     return p
 
 
@@ -82,7 +87,8 @@ def _residue_rscc_map(rscc_csv):
     return {residue: rscc for residue, rscc in zip(df['residue'], df['rscc']) if pd.notna(rscc)}
 
 
-def select_optimized_residues(final_structure, rotamer_structure, final_rscc, rotamer_rscc, labels):
+def select_optimized_residues(final_structure, rotamer_structure, final_rscc, rotamer_rscc, labels,
+                               revert_min_diff=REVERT_MIN_DIFF):
     """For every label ("{chain}{resnum}") in `labels`, compares final_rscc[label] against
     rotamer_rscc[label] and decides which structure that residue's conformation should come from
     in the merged output: 'final_model_refined' only if its RSCC is at least REVERT_MIN_DIFF
@@ -116,7 +122,7 @@ def select_optimized_residues(final_structure, rotamer_structure, final_rscc, ro
                   f'conformation without comparison.')
             source = 'rotamer_refined'
             kept_rscc = r_rscc if r_rscc is not None else f_rscc
-        elif f_rscc - r_rscc >= REVERT_MIN_DIFF:
+        elif f_rscc - r_rscc >= revert_min_diff:
             source = 'final_model_refined'
             kept_rscc = f_rscc
         else:
@@ -148,7 +154,7 @@ def select_optimized_residues(final_structure, rotamer_structure, final_rscc, ro
 
     n_final = sum(1 for d in decisions if d['source'] == 'final_model_refined')
     print(f'  {n_final}/{len(decisions)} residue(s) reverted to final_model_refined (RSCC at '
-          f'least {REVERT_MIN_DIFF} higher than rotamer_refined); '
+          f'least {revert_min_diff} higher than rotamer_refined); '
           f'{len(decisions) - n_final} kept from rotamer_refined.')
 
     return output_structure, decisions
@@ -172,7 +178,8 @@ def main():
     rotamer_structure = Structure.fromfile(str(args.rotamer_pdb))
 
     output_structure, decisions = select_optimized_residues(
-        final_structure, rotamer_structure, final_rscc, rotamer_rscc, labels)
+        final_structure, rotamer_structure, final_rscc, rotamer_rscc, labels,
+        args.revert_min_diff)
 
     args.output_pdb.parent.mkdir(parents=True, exist_ok=True)
     output_structure.tofile(str(args.output_pdb))
