@@ -41,7 +41,7 @@ from rscc_common import (
 
 def main():
     args = build_placer_sampling_argparser(__doc__).parse_args()
-    mode_b, run_tag = resolve_placer_sampling_mode(args)
+    mode_b, _ = resolve_placer_sampling_mode(args)
 
     datasets = read_datasets(args.datasets_file)
     all_rows = []
@@ -68,7 +68,7 @@ def main():
     out_name = 'placer_sampling_unrefined.png'
     plot_distance_histogram(
         [row['rmsd'] for row in all_rows],
-        title=f'Placer Sampling (Unrefined): Reference Ligand to Nearest Sampled Model\n{run_tag}',
+        title='Placer Sampling RMSD (Unrefined)',
         xlabel='Minimum Ligand RMSD to Closest Raw Sampled Model (Å)',
         out_path=out_dir / out_name,
         bin_width=0.25,

@@ -57,7 +57,7 @@ def main():
 
     plot_rscc_despot_tradeoff(
         args, run_dir_for_dataset,
-        title='RSCC/DESPOT reselection tradeoff vs Reference, DESPOT-filtered',
+        title='RSCC/DESPOT Tradeoff vs Reference',
         out_name='rscc_despot_tradeoff_vs_reference.png',
         alive_rows_for_dataset=alive_rows_for_dataset,
         cluster_csv_override_for_dataset=cluster_csv_override_for_dataset,

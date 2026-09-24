@@ -196,7 +196,7 @@ class QFitOptions: #copypasted from qfit.py
         self.clash_scaling_factor = 0.75
         self.external_clash = False
         self.dofs_per_iteration = 1
-        self.dihedral_stepsize = 12
+        self.dihedral_stepsize = 6
         self.hydro = False
         self.rmsd_cutoff = DEFAULT_RMSD_CUTOFF
 
@@ -213,7 +213,7 @@ class QFitOptions: #copypasted from qfit.py
 
         # N-CA-CB angle sampling
         self.sample_angle = True
-        self.sample_angle_range = 7.5
+        self.sample_angle_range = 3.75
         self.sample_angle_step = 7.5
 
         # Rotamer sampling
@@ -242,7 +242,7 @@ class Rotamer_Optimizer():
         self.base_structure = Structure.fromfile(self.model_file)
         self.base_structure = self.base_structure.extract("e", "H", "!=")
 
-        self.trim = 10
+        self.trim = 20
 
         # Residues scoring below this against the event maps are candidates for optimization;
         # residues already at/above it are left untouched.

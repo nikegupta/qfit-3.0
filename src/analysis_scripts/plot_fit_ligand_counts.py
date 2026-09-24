@@ -59,7 +59,7 @@ def main():
     out_name = 'fit_ligand_counts.png'
     plot_count_histogram(
         [row['count'] for row in rows],
-        title=f'Fit-Ligand Output Poses per Dataset ({args.run_name})',
+        title=f'Fit-Ligand Poses per Dataset ({args.run_name})',
         xlabel='Number of fit_ligand Output Poses',
         out_path=out_dir / out_name,
     )

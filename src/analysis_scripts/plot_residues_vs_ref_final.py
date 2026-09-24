@@ -51,7 +51,7 @@ def main():
 
     plot_residues_vs_ref(
         args, collect_structure_rscc, collect_restrict_labels,
-        out_dir=args.graphs_dir, out_prefix='final_refined', structure_label='Final-Refined',
+        out_dir=args.graphs_dir, out_prefix='final_refined', structure_label='Final',
         outlier_min_diff=OUTLIER_MIN_DIFF,
     )
 

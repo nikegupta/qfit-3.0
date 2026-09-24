@@ -156,7 +156,7 @@ def main():
     out_name = 'centroid_rmsd_all.png'
     plot_distance_histogram(
         [row['dist'] for row in all_rows],
-        title=f'Ligand Centroid Distance: fit_ligand Structures vs Reference ({args.run_name})',
+        title=f'fit_ligand vs Reference Centroid Distance ({args.run_name})',
         xlabel='Minimum Centroid Distance to Closest fit_ligand Pose (Å)',
         out_path=out_dir / out_name,
         bin_width=1.0,

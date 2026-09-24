@@ -72,7 +72,7 @@ def main():
     plot_residues_vs_ref_restricted(
         args, collect_structure_rscc, collect_restrict_labels,
         out_dir=args.graphs_dir, out_prefix='rotamer_refined_despot',
-        structure_label='Modified Residues',
+        structure_label='Modified',
         outlier_min_diff=OUTLIER_MIN_DIFF,
     )
 

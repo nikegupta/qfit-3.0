@@ -12,6 +12,12 @@ from qfit import XMap
 from qfit.xtal.transformer import get_transformer
 from qfit.command_line.calc_rscc import parse_bdc, DEFAULT_BFACTOR
 
+# Default margin (in standard deviations of that axis, across a cluster's own candidates) a
+# candidate must beat another by, in BOTH mse and normalized DESPOT score, to count as
+# dominating it for the Pareto front - see pareto_front()'s own docstring for why this isn't 0
+# (the original, unmargined comparison).
+PARETO_MARGIN_STD = 0.05
+
 
 def build_argparser():
     p = argparse.ArgumentParser(
@@ -96,6 +102,14 @@ def build_argparser():
              'argmax(RSCC - rscc_weight*normalized_DESPOT) (default: 0.05).'
     )
     p.add_argument(
+        '--pareto-margin-std', dest='pareto_margin_std', type=float,
+        default=PARETO_MARGIN_STD, metavar='<float>',
+        help='How many standard deviations of margin (per axis: MSE, normalized DESPOT score) a '
+             'candidate must beat another by to count as dominating it for the Pareto front - '
+             f'see pareto_front()\'s docstring (default: {PARETO_MARGIN_STD}). 0 recovers the '
+             'original, unmargined comparison.'
+    )
+    p.add_argument(
         '--bfactor', dest='bfactor', type=float, default=DEFAULT_BFACTOR, metavar='<float>',
         help='B-factor used when generating each Pareto-front candidate\'s model density for '
              f'its own internal RSCC scoring (default: {DEFAULT_BFACTOR}) - same variable/'
@@ -115,18 +129,30 @@ def build_argparser():
     return p
 
 
-def pareto_front(mses, scores):
-    """Returns a bool list, True for every index i whose (mse, score) is non-dominated: no other
-    index j has mses[j] <= mses[i] and scores[j] <= scores[i] with at least one strictly lower
-    (both lower is better for MSE and normalized DESPOT score alike). O(n^2), fine at
-    per-cluster sizes. Identical to program_exp/test/extract_nondominated_candidates.py's
-    pareto_front(), the exploratory workflow this reselection is promoted from."""
+def pareto_front(mses, scores, margin_std=PARETO_MARGIN_STD):
+    """Returns a bool list, True for every index i whose (mse, score) is non-dominated. Point j
+    dominates point i only if it beats i by MORE than margin_std standard deviations (of that
+    axis, computed across every point passed in here) in BOTH mse and normalized DESPOT score -
+    not the plain "less-or-equal in both, strictly lower in at least one" comparison this
+    started as. That plain comparison is highly sensitive to noise-level differences between
+    near-identical candidates: a candidate can get pruned off the front - and so never have its
+    RSCC computed at all (RSCC is only computed for front survivors - see main()) - just because
+    some other candidate edged it out by an amount too small to be a real difference. Requiring
+    a real margin (default: 0.25 standard deviations) in both dimensions before counting as
+    dominated keeps more plausible candidates in play, at the cost of computing RSCC for a
+    larger front. margin_std=0 recovers the original, strict comparison exactly (a 0-point
+    margin can never exceed 0, so it degrades to the plain <=/< comparison above's intent, aside
+    from the "at least one strictly lower" nuance no longer being separately required once both
+    dimensions must already each be strictly margin-better). O(n^2), fine at per-cluster sizes."""
+    mses = np.asarray(mses, dtype=float)
+    scores = np.asarray(scores, dtype=float)
     n = len(mses)
+    mse_margin = margin_std * mses.std()
+    score_margin = margin_std * scores.std()
     non_dominated = []
     for i in range(n):
         dominated = any(
-            j != i and mses[j] <= mses[i] and scores[j] <= scores[i]
-            and (mses[j] < mses[i] or scores[j] < scores[i])
+            j != i and mses[j] <= mses[i] - mse_margin and scores[j] <= scores[i] - score_margin
             for j in range(n)
         )
         non_dominated.append(not dominated)
@@ -258,6 +284,86 @@ def _placer_file_residues(placer_file, cache):
     return residues
 
 
+def _full_atom_mask(struct, subset_mask):
+    """Translates subset_mask - a boolean array aligned to struct's own (possibly
+    already-filtered) atom order, i.e. len(subset_mask) == struct.natoms - into a boolean mask
+    aligned to struct's full, underlying (pre-selection) atom array.
+
+    Structure.extract() applies a raw (non-string) selection array directly against the object's
+    full underlying atom array, not against the object's own current selection - so handing it a
+    mask built in struct's own atom order silently selects the wrong atoms wherever that order
+    has a gap relative to the full array. This matters here specifically because
+    reset_protein_to_apo_where_unbacked's output_structure is itself already a 'not resname LIG'
+    selection before replace_residue_in_place below ever touches it. Identical to
+    symmetry_expand.py's own _full_atom_mask (see that module's docstring for the full
+    explanation) - duplicated here rather than imported since these are independent,
+    self-contained command-line scripts."""
+    full_mask = np.zeros(struct.total_length, dtype=bool)
+    if struct.selection is None:
+        full_mask[:] = subset_mask
+    else:
+        full_indices = np.array(list(struct.selection))
+        full_mask[full_indices[subset_mask]] = True
+    return full_mask
+
+
+def replace_residue_in_place(target_structure, chain_id, res_num, replacement_structure, label):
+    """Overwrites target_structure's atoms for (chain_id, res_num) with replacement_structure's
+    same-named atoms' coordinates/B-factor/occupancy, IN PLACE - i.e. at the same position in
+    target_structure's own underlying atom array - rather than deleting the residue and
+    appending replacement_structure's copy of it at the end. The remove-and-append approach
+    relocates the residue to wherever it falls in the appended tail of the eventual output pdb,
+    which silently breaks any downstream tool that infers chain connectivity from sequential
+    atom order rather than real 3D distances - pdb2pqr30 (run by protein_to_mol2.sh ahead of
+    DESPOT scoring, i.e. right after this function runs) is exactly such a tool: it can see a
+    residue relocated away from its real neighbors as a chain break, and cap the "orphaned"
+    residue with a fake N/C-terminus (an extra OXT atom carrying real partial charge) even
+    though the residue's actual 3D geometry is perfectly bonded to both neighbors. Same fix as
+    select_optimized_residues.py's identically-named function, duplicated here rather than
+    imported since these are two independent, self-contained command-line scripts.
+
+    Relies on Structure.extract() returning a view over the SAME underlying atom storage as
+    target_structure (confirmed empirically - mutating an extracted view's .coor/.b/.q mutates
+    target_structure itself), so no separate re-assembly/combine() step is needed afterward. Both
+    input masks are translated via _full_atom_mask before being handed to extract() - safe even
+    though target_structure here is already a filtered ('not resname LIG') selection, not the
+    freshly-loaded structure.
+
+    Returns True on success. Returns False (target_structure left untouched for this residue) if
+    either structure doesn't have this residue at all, or the two don't have exactly the same
+    atom-name set for it - an identity mismatch can't be resolved by a like-for-like in-place
+    swap, so the caller should fall back to the old remove-and-append behavior for just this
+    residue in that case.
+    """
+    target_subset_mask = (target_structure.chain == chain_id) & (target_structure.resi == res_num)
+    if not np.any(target_subset_mask):
+        return False
+    repl_subset_mask = (replacement_structure.chain == chain_id) & (replacement_structure.resi == res_num)
+    if not np.any(repl_subset_mask):
+        return False
+
+    target_view = target_structure.extract(_full_atom_mask(target_structure, target_subset_mask))
+    repl_view = replacement_structure.extract(_full_atom_mask(replacement_structure, repl_subset_mask))
+
+    target_names = list(target_view.name)
+    repl_names = list(repl_view.name)
+    if sorted(target_names) != sorted(repl_names):
+        print(f'  WARNING: {label} has a different atom set in the replacement structure '
+              f'({sorted(repl_names)}) than in the target structure ({sorted(target_names)}) - '
+              f'cannot do an in-place swap; falling back to append (this residue may end up out '
+              f'of sequential order in the output pdb).')
+        return False
+
+    repl_coor_by_name = dict(zip(repl_names, repl_view.coor))
+    repl_b_by_name = dict(zip(repl_names, repl_view.b))
+    repl_q_by_name = dict(zip(repl_names, repl_view.q))
+
+    target_view.coor = np.array([repl_coor_by_name[name] for name in target_names])
+    target_view.b = np.array([repl_b_by_name[name] for name in target_names])
+    target_view.q = np.array([repl_q_by_name[name] for name in target_names])
+    return True
+
+
 def reset_protein_to_apo_where_unbacked(structure, apo_structure, cluster_rows):
     """Enforces that every non-apo protein conformation in `structure` is backed by a placer
     file whose ligand survived DESPOT filtering (this pipeline only wants protein conformations
@@ -287,30 +393,39 @@ def reset_protein_to_apo_where_unbacked(structure, apo_structure, cluster_rows):
 
     reset_keys = sorted(rejected_residues - passed_residues)
 
-    chain_arr = structure.chain
-    resi_arr = structure.resi
     is_lig = structure.resn == 'LIG'
-    is_reset = np.zeros(structure.natoms, dtype=bool)
+    # A view sharing structure's own underlying atom storage (see replace_residue_in_place) -
+    # atoms are reset to apo IN PLACE below, at their original position in the protein's residue
+    # order, rather than removed and re-appended at the end.
+    output_structure = structure.extract(~is_lig)
 
     actually_reset = []
-    reset_pieces = []
+    fallback_mask = np.zeros(output_structure.natoms, dtype=bool)
+    fallback_pieces = []
     for chain_id, res_num in reset_keys:
-        residue_mask = (~is_lig) & (chain_arr == chain_id) & (resi_arr == res_num)
+        residue_mask = (output_structure.chain == chain_id) & (output_structure.resi == res_num)
         if not np.any(residue_mask):
             continue
+        label = f'{chain_id}{res_num}'
+        if replace_residue_in_place(output_structure, chain_id, res_num, apo_structure, label):
+            actually_reset.append((chain_id, res_num))
+            continue
+        # Atom-set mismatch - fall back to the old remove-and-append behavior for just this one
+        # residue (replace_residue_in_place already printed why).
         apo_residue = apo_structure.extract(f'chain {chain_id} and resid {res_num}')
         if apo_residue.natoms == 0:
             print(f'  WARNING: {chain_id}{res_num} would be reset to apo (only backed by a '
                   f'rejected ligand\'s placer file) but has no apo_structure residue - leaving '
                   f'its current conformation in place.')
             continue
-        is_reset |= residue_mask
-        reset_pieces.append(apo_residue)
+        fallback_mask |= residue_mask
+        fallback_pieces.append(apo_residue)
         actually_reset.append((chain_id, res_num))
 
-    output_structure = structure.extract((~is_lig) & (~is_reset))
-    for piece in reset_pieces:
-        output_structure = output_structure.combine(piece)
+    if fallback_pieces:
+        output_structure = output_structure.extract(~fallback_mask)
+        for piece in fallback_pieces:
+            output_structure = output_structure.combine(piece)
 
     if actually_reset:
         labels = ', '.join(f'{c}{r}' for c, r in actually_reset)
@@ -421,7 +536,8 @@ def main():
             continue
 
         nondominated = pareto_front([m['mse'] for m in member_infos],
-                                     [m['normalized_score'] for m in member_infos])
+                                     [m['normalized_score'] for m in member_infos],
+                                     margin_std=args.pareto_margin_std)
 
         best, best_tradeoff, best_rscc, best_structure = None, None, None, None
         for member, keep in zip(member_infos, nondominated):

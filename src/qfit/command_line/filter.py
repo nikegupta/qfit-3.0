@@ -337,7 +337,13 @@ class Filter():
             #placer_file, a cluster needs more than 0.1 * 100 = 10 members
             #to survive; smaller clusters are treated as noise. This runs
             #before the RSCC filter.
-            n_per_placer_file = len(next(iter(self.coor_sets.values())))
+            # self.coor_sets is empty whenever the placer_files glob matched
+            # nothing at all (zip() with an empty placer_files list means the
+            # main loop above never ran) - next()'s default avoids a
+            # StopIteration in that case; self.cluster_reps is already empty
+            # too by this point, so the count-filter loop below is a no-op
+            # regardless of what n_per_placer_file ends up being.
+            n_per_placer_file = len(next(iter(self.coor_sets.values()), []))
 
             filtered_cluster_reps = {}
             for cluster_id in self.cluster_reps:
@@ -693,6 +699,26 @@ class Filter():
             entry_info.append((score,placer_file,index,ligand_coor))
 
         n_entries = len(ligand_coor_sets)
+
+        # scipy's squareform/linkage need at least 2 observations to build a
+        # distance matrix (an empty or single-entry condensed distance array
+        # raises "The number of observations cannot be determined on an
+        # empty distance matrix") - handle both cases directly rather than
+        # letting that exception propagate. n_entries == 0 happens whenever
+        # every candidate conformer got filtered out upstream (not a bug -
+        # just means this dataset/binding site had nothing survive), and
+        # should still produce a valid (empty) cluster_reps.csv rather than
+        # crashing the whole filter run.
+        if n_entries == 0:
+            self.clusters = {}
+            self.cluster_reps = {}
+            return
+
+        if n_entries == 1:
+            self.clusters = {1: [entry_info[0]]}
+            rep = self._selectClusterRepresentative(self.clusters[1])
+            self.cluster_reps = {1: rep + (1,)}
+            return
 
         # build the pairwise distance matrix between ligand conformers, using
         # either full all-atom RMSD or centroid-to-centroid distance
