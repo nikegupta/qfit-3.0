@@ -46,7 +46,7 @@ def main():
         values1_df = cluster_rep_rscc_values(csv1)
         plot_rscc_histogram(
             values1_df['rscc'],
-            title=f'Cluster-Rep RSCC ({dataset}, {args.filter_run_name})',
+            title=f'Cluster-Rep RSCC ({args.filter_run_name})',
             xlabel='RSCC',
             out_path=graphs_dir / 'cluster_reps_1.png',
         )
@@ -58,7 +58,7 @@ def main():
         values2_df = cluster_rep_rscc_values(csv2)
         plot_rscc_histogram(
             values2_df['rscc'],
-            title=f'Cluster-Rep RSCC ({dataset}, {args.filter2_run_name})',
+            title=f'Cluster-Rep RSCC ({args.filter2_run_name})',
             xlabel='RSCC',
             out_path=graphs_dir / 'cluster_reps_2.png',
         )

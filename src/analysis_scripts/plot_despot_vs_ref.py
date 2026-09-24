@@ -51,7 +51,7 @@ def main():
 
     plot_despot_vs_ref(
         args, run_dir_for_dataset,
-        title='DESPOT Score vs Reference, DESPOT-filtered',
+        title='DESPOT Score vs Reference',
         out_name='despot_vs_reference.png',
         alive_rows_for_dataset=alive_rows_for_dataset,
     )

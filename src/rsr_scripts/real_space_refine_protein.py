@@ -24,6 +24,18 @@ devnull.close()
 
 EXTRA_FIELDS = ["b_factor", "occupancy", "charge"]
 
+# Two atoms in the same residue closer than this (in the PRE-refinement structure) are treated
+# as covalently bonded - a purely geometric heuristic (no per-residue-type chemistry table
+# needed), comfortably above any real bond length (including C-S ~1.8 A) and comfortably below
+# any real non-bonded contact.
+BOND_DETECT_CUTOFF = 1.9
+# A bond (per the above) whose length changes by more than this between pre- and
+# post-refinement is treated as real-space refinement diverging into a broken local minimum,
+# not a legitimate refinement adjustment - deliberately generous so this only catches gross
+# failures (e.g. a sidechain torsion landing in a nonphysical conformation), never ordinary
+# refinement movement.
+BOND_LENGTH_TOLERANCE = 0.5
+
 
 class NoNearbyProteinResiduesError(RuntimeError):
     """Raised when no apo protein residues fall within the cutoff distance of
@@ -217,6 +229,84 @@ def compute_residue_displacements(pre_array, post_array, residues):
     return results
 
 
+def find_intra_residue_bonds(atom_array, residues):
+    """For each (chain_id, res_id) in residues, returns [(atom_name1, atom_name2), ...] for
+    every pair of that residue's own atoms within BOND_DETECT_CUTOFF of each other in
+    atom_array - i.e. every bond inferred directly from geometry, with no hardcoded
+    per-residue-type bond table needed (works the same for a standard amino acid or anything
+    else that might show up)."""
+    coords_by_residue = {}
+    names_by_residue = {}
+    for atom in atom_array:
+        key = (atom.chain_id, atom.res_id)
+        coords_by_residue.setdefault(key, []).append(np.array(atom.coord, dtype=float))
+        names_by_residue.setdefault(key, []).append(atom.atom_name)
+
+    bonds = {}
+    for key in residues:
+        coords = coords_by_residue.get(key)
+        names = names_by_residue.get(key)
+        if not coords:
+            bonds[key] = []
+            continue
+        coords = np.array(coords)
+        n = len(coords)
+        pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if np.linalg.norm(coords[i] - coords[j]) <= BOND_DETECT_CUTOFF:
+                    pairs.append((names[i], names[j]))
+        bonds[key] = pairs
+    return bonds
+
+
+def find_blown_out_bonds(pre_array, post_array, residues):
+    """Checks every intra-residue bond inferred from pre_array (see find_intra_residue_bonds)
+    against its own length in post_array, for each (chain_id, res_id) in residues. Returns
+    {(chain_id, res_id): [(atom_name1, atom_name2, pre_length, post_length), ...]} for every
+    residue with at least one bond whose length changed by more than BOND_LENGTH_TOLERANCE - a
+    proper refinement adjustment never stretches or collapses an existing bond by anywhere near
+    this much, so this is a strong, cheap signal that real-space refinement diverged for that
+    residue rather than converging on a legitimate conformation."""
+    bonds_by_residue = find_intra_residue_bonds(pre_array, residues)
+    pre_coords = build_atom_coord_map(pre_array)
+    post_coords = build_atom_coord_map(post_array)
+
+    blown_out = {}
+    for (chain_id, res_id), pairs in bonds_by_residue.items():
+        bad = []
+        for name1, name2 in pairs:
+            pre1 = pre_coords.get((chain_id, res_id, name1))
+            pre2 = pre_coords.get((chain_id, res_id, name2))
+            post1 = post_coords.get((chain_id, res_id, name1))
+            post2 = post_coords.get((chain_id, res_id, name2))
+            if pre1 is None or pre2 is None or post1 is None or post2 is None:
+                continue
+            pre_len = float(np.linalg.norm(pre1 - pre2))
+            post_len = float(np.linalg.norm(post1 - post2))
+            if abs(post_len - pre_len) > BOND_LENGTH_TOLERANCE:
+                bad.append((name1, name2, pre_len, post_len))
+        if bad:
+            blown_out[(chain_id, res_id)] = bad
+    return blown_out
+
+
+def revert_blown_out_residues(pre_array, post_array, blown_out):
+    """Mutates post_array in place, overwriting every atom's coordinates for each residue key
+    in blown_out with that same atom's PRE-refinement coordinates from pre_array - i.e. backs
+    out real-space refinement's result entirely for just those residues, leaving every other
+    (successfully refined) residue untouched. Atoms matched by (chain_id, res_id, atom_name),
+    same convention as build_atom_coord_map/compute_residue_displacements."""
+    pre_coords = build_atom_coord_map(pre_array)
+    for i in range(len(post_array)):
+        key = (post_array.chain_id[i], post_array.res_id[i])
+        if key not in blown_out:
+            continue
+        pre_c = pre_coords.get((key[0], key[1], post_array.atom_name[i]))
+        if pre_c is not None:
+            post_array.coord[i] = pre_c
+
+
 def refine_model(mc, merged_pdb_path, map_path, cif_restraints, selection_cid,
                   n_cycles, map_weight, difference_map):
     """Run real-space refinement on the merged (apo protein + LIG) structure,
@@ -393,6 +483,22 @@ def main():
             refined_array = pdb.get_structure(
                 pdb.PDBFile.read(str(tmp_out)), model=1, extra_fields=EXTRA_FIELDS
             )
+
+            # Sanity check: real-space refinement can occasionally diverge into a broken local
+            # minimum for a single residue (e.g. a poorly-density-supported sidechain torsion) -
+            # catch that here (a bond stretched/collapsed by more than BOND_LENGTH_TOLERANCE)
+            # and revert just that residue to its pre-refinement conformation, rather than
+            # letting a chemically nonsensical result silently pass through to the output pdb.
+            blown_out = find_blown_out_bonds(merged_array, refined_array, protein_residues)
+            if blown_out:
+                print(f"  WARNING: {len(blown_out)} residue(s) had a bond length change of "
+                      f"more than {BOND_LENGTH_TOLERANCE} A during refinement - reverting to "
+                      f"their pre-refinement conformation:")
+                for (chain_id, res_id), bad_bonds in sorted(blown_out.items()):
+                    for name1, name2, pre_len, post_len in bad_bonds:
+                        print(f"    {chain_id}{res_id} {name1}-{name2}: {pre_len:.2f} A -> "
+                              f"{post_len:.2f} A")
+                revert_blown_out_residues(merged_array, refined_array, blown_out)
 
             displacements = compute_residue_displacements(
                 apo_array_template, refined_array, all_apo_residues

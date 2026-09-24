@@ -165,14 +165,11 @@ def main():
         for model_idx, (atom_array, cif_path) in enumerate(
             zip(original_arrays, cif_per_model), start=1
         ):
-            print(f"\nRefining model {model_idx} with {cif_path.name}...")
-
             lig_cids = get_lig_cids(atom_array)
             if not lig_cids:
                 print(f"  No LIG residues in model {model_idx}, skipping.")
                 refined_arrays.append(atom_array)
                 continue
-            print(f"  Found {len(lig_cids)} LIG residue(s): {lig_cids}")
 
             tmp_in  = tmpdir / f"model_{model_idx}_in.pdb"
             tmp_out = tmpdir / f"model_{model_idx}_out.pdb"
@@ -195,7 +192,6 @@ def main():
 
             updated_array = transplant_lig_coords(atom_array, refined_array)
             refined_arrays.append(updated_array)
-            print(f"  Model {model_idx} done.")
 
     print(f"\nWriting refined multi-model PDB to {args.output_pdb}")
     with open(args.output_pdb, 'w') as out_f:

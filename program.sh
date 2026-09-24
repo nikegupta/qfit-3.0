@@ -31,6 +31,10 @@
 #   4b. rsr_placer2                     -> .../<placer2_run_name>/
 #   4c. calc_placer_sampling (refined + unrefined, only with -c)
 #                                        -> GRAPHS_DIR/<run_name>/.../<placer2_run_name>/
+#   4d. plot_placer2_vs_placer1_rmsd (only with -c): scatter of placer_sampling.csv's 'rmsd'
+#       column, placer2 (y) vs placer_1 (x), for every reference ligand present in both
+#                                        -> GRAPHS_DIR/<run_name>/.../<placer2_run_name>/
+#                                           placer2_vs_placer1_rmsd.png
 #   STAGE_5: Filter2
 #   5a. filter2 (runs the same `filter` script as stage 3a, not `filter_all`)
 #                                        -> .../<filter2_run_name>/
@@ -266,6 +270,7 @@ AGGREGATE_CLASH_GROUPS_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_clash_groups.py"
 CENTROID_RMSD_ALL_PY="${ANALYSIS_SCRIPTS_DIR}/centroid_rmsd_all.py"
 CALC_PLACER_SAMPLING_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling.py"
 CALC_PLACER_SAMPLING_UNREFINED_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling_unrefined.py"
+PLOT_PLACER2_VS_PLACER1_RMSD_PY="${ANALYSIS_SCRIPTS_DIR}/plot_placer2_vs_placer1_rmsd.py"
 PLOT_FIT_LIGAND_COUNTS_PY="${ANALYSIS_SCRIPTS_DIR}/plot_fit_ligand_counts.py"
 PLOT_CLUSTER_REPS_POOLED_PY="${ANALYSIS_SCRIPTS_DIR}/plot_cluster_reps_rscc_pooled.py"
 PLOT_PROTEIN_RSCC_POOLED_PY="${ANALYSIS_SCRIPTS_DIR}/plot_protein_rscc_pooled.py"
@@ -287,6 +292,7 @@ for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN"
          "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY" "$PLOT_RESIDUES_VS_REF_ROTAMER_PY" \
          "$PLOT_ROTAMER_VS_PIPELINE_PY" "$AGGREGATE_ROTAMER_WORSE_RESIDUES_PY" \
          "$CENTROID_RMSD_ALL_PY" "$CALC_PLACER_SAMPLING_PY" "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
+         "$PLOT_PLACER2_VS_PLACER1_RMSD_PY" \
          "$PLOT_FIT_LIGAND_COUNTS_PY" "$ASSIGN_BOND_ORDERS_PY" "$PLOT_CLUSTER_REPS_POOLED_PY" \
          "$PLOT_PROTEIN_RSCC_POOLED_PY" \
          "$PLOT_DESPOT_ENERGIES_PY" "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
@@ -309,6 +315,10 @@ done
 if [ $# -eq 0 ]; then
     usage
 fi
+
+# Captured before the parsing loop below consumes "$@" via shift, purely so the exact invocation
+# can be echoed into log.txt's parameter dump (see print_run_parameters).
+orig_args=("$@")
 
 run_name=""
 placer_run_name=""
@@ -647,6 +657,89 @@ fi
 exec > >(tee "$log_file") 2>&1
 echo "Logging full run output to: ${log_file}"
 
+# --- Dump every tunable command-line parameter for this run at the top of log.txt, so the log
+# is self-describing (what value was actually used, vs. falling through to the underlying
+# script's own argparse default) without needing to cross-reference program.sh or re-run with
+# --help. A flag left at its empty-string sentinel means it was not passed on the command line,
+# so the underlying script's own default (shown here) applies - these documented defaults must
+# be kept in sync with usage()'s "Default: ..." text and the underlying scripts' argparse
+# defaults if either ever changes.
+print_run_parameters() {
+    echo "=== Run parameters ==="
+    echo "Invocation: $0 ${orig_args[*]}"
+    echo
+    echo "-- Stage names --"
+    printf '  %-20s %s\n' "run_name" "$run_name"
+    printf '  %-20s %s\n' "placer_run_name" "${placer_run_name:-<unset>}"
+    printf '  %-20s %s\n' "filter_run_name" "${filter_run_name:-<unset>}"
+    printf '  %-20s %s\n' "placer2_run_name" "${placer2_run_name:-<unset>}"
+    printf '  %-20s %s\n' "filter2_run_name" "${filter2_run_name:-<unset>}"
+    printf '  %-20s %s\n' "final_run_name" "${final_run_name:-<unset>}"
+    printf '  %-20s %s\n' "rotamer_run_name" "${rotamer_run_name:-<unset>}"
+    printf '  %-20s %s\n' "despot_run_name" "${despot_run_name:-<unset>}"
+    echo
+    echo "-- General options --"
+    printf '  %-38s %s\n' "-n (num_placer_confs)" "$num_placer_confs"
+    printf '  %-38s %s\n' "-n2 (num_placer2_confs)" "$num_placer2_confs"
+    printf '  %-38s %s\n' "-g (gpu_ids)" "$gpu_ids"
+    printf '  %-38s %s\n' "-p (num_parallel)" "${num_parallel:-<unset>}"
+    printf '  %-38s %s\n' "-c (compare_ref_set)" "$compare_ref_set"
+    printf '  %-38s %s\n' "--overwrite" "$overwrite"
+    printf '  %-38s %s\n' "--replot" "$replot"
+    printf '  %-38s %s\n' "--dataset" "${dataset_arg:-<all datasets>}"
+    echo
+    echo "-- Fit_ligand --"
+    printf '  %-38s %s\n' "--z_threshold" "${z_threshold:-<default: 4>}"
+    printf '  %-38s %s\n' "--num_peaks" "${num_peaks:-<default: 100>}"
+    printf '  %-38s %s\n' "--fit_ligand_rmsd_cutoff" "${fit_ligand_rmsd_cutoff:-<default: 2>}"
+    echo
+    echo "-- Real-space refinement (PLACER, Filter, PLACER2, Build final, Rotamer_optimize) --"
+    printf '  %-38s %s\n' "--rsr_n_cycles" "${rsr_n_cycles:-<default: 1000>}"
+    printf '  %-38s %s\n' "--rsr_map_weight" "${rsr_map_weight:-<default: 50.0>}"
+    printf '  %-38s %s\n' "--rsr_backbone_cutoff" "${rsr_backbone_cutoff:-<default: 10.0>}"
+    printf '  %-38s %s\n' "--rsr_moved_threshold" "${rsr_moved_threshold:-<default: 0.01>}"
+    echo
+    echo "-- Filter --"
+    printf '  %-38s %s\n' "--f1_filter_proportion" "${f1_filter_proportion:-<default: 0.25>}"
+    printf '  %-38s %s\n' "--f1_min_cluster_proportion" "${f1_min_cluster_proportion:-<default: 0.1>}"
+    printf '  %-38s %s\n' "--f1_rscc_cutoff" "${f1_rscc_cutoff:-<default: 0.6>}"
+    printf '  %-38s %s\n' "--f1_clustering_mode" "${f1_clustering_mode:-<default: centroid>}"
+    printf '  %-38s %s\n' "--f1_clustering_cutoff" "${f1_clustering_cutoff:-<default: 2.0>}"
+    printf '  %-38s %s\n' "--f1_clash_vdw_scale" "${f1_clash_vdw_scale:-<default: 0.75>}"
+    echo
+    echo "-- Filter2 --"
+    printf '  %-38s %s\n' "--f2_filter_proportion" "${f2_filter_proportion:-<default: 0.25>}"
+    printf '  %-38s %s\n' "--f2_min_cluster_proportion" "${f2_min_cluster_proportion:-<default: 0.1>}"
+    printf '  %-38s %s\n' "--f2_rscc_cutoff" "${f2_rscc_cutoff:-<default: 0.6>}"
+    printf '  %-38s %s\n' "--f2_clustering_mode" "${f2_clustering_mode:-<default: centroid>}"
+    printf '  %-38s %s\n' "--f2_clustering_cutoff" "${f2_clustering_cutoff:-<default: 2.0>}"
+    printf '  %-38s %s\n' "--f2_clash_vdw_scale" "${f2_clash_vdw_scale:-<default: 0.75>}"
+    echo
+    echo "-- Build final / Rotamer_optimize sidechain clash resolution --"
+    printf '  %-38s %s\n' "--clash_vdw_scale" "${clash_vdw_scale:-<default: 0.75>}"
+    printf '  %-38s %s\n' "--hbond_clash_vdw_scale" "${hbond_clash_vdw_scale:-<default: 0.6>}"
+    printf '  %-38s %s\n' "--max_clash_group_size" "${max_clash_group_size:-<default: 8>}"
+    printf '  %-38s %s\n' "--max_clash_group_expansions" "${max_clash_group_expansions:-<default: 10>}"
+    printf '  %-38s %s\n' "--clash_domain_top_k" "${clash_domain_top_k:-<default: 25>}"
+    printf '  %-38s %s\n' "--clash_solve_node_budget" "${clash_solve_node_budget:-<default: 200000>}"
+    echo
+    echo "-- Rotamer_optimize --"
+    printf '  %-38s %s\n' "--rotamer_rscc_threshold" "${rotamer_rscc_threshold:-<default: 0.5>}"
+    printf '  %-38s %s\n' "--rotamer_rscc_improvement_threshold" "${rotamer_rscc_improvement_threshold:-<default: 0.1>}"
+    printf '  %-38s %s\n' "--revert_min_diff" "${revert_min_diff:-<default: 0.1>}"
+    echo
+    echo "-- Shared (Filter, Filter2, Build final, Rotamer_optimize, Despot) --"
+    printf '  %-38s %s\n' "--bfactor" "${bfactor:-<default: 20>}"
+    echo
+    echo "-- Despot --"
+    printf '  %-38s %s\n' "--expand_distance_cutoff" "$expand_distance_cutoff"
+    printf '  %-38s %s\n' "--despot_threshold" "${despot_threshold:-<default: -1.0>}"
+    printf '  %-38s %s\n' "--despot_rscc_threshold" "${despot_rscc_threshold:-<default: 0.6>}"
+    printf '  %-38s %s\n' "--despot_rscc_weight" "${despot_rscc_weight:-<default: 0.05>}"
+    echo "======================="
+}
+print_run_parameters
+
 if [ "$compare_ref_set" -eq 1 ] && [ ! -d "$REF_SET" ]; then
     echo "Error: -c given but reference set directory not found: ${REF_SET}" >&2
     exit 1
@@ -725,6 +818,7 @@ export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY PLOT_RESID
 export PLOT_ROTAMER_VS_PIPELINE_PY AGGREGATE_ROTAMER_WORSE_RESIDUES_PY
 export AGGREGATE_CLASH_GROUPS_PY
 export CENTROID_RMSD_ALL_PY CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
+export PLOT_PLACER2_VS_PLACER1_RMSD_PY
 export PLOT_FIT_LIGAND_COUNTS_PY
 export PLOT_CLUSTER_REPS_POOLED_PY PLOT_PROTEIN_RSCC_POOLED_PY
 export PLOT_DESPOT_ENERGIES_PY PLOT_DESPOT_ENERGIES_POOLED_PY PLOT_LIG_VS_REF_DESPOT_PY PLOT_DESPOT_LIGAND_SUMMARY_PY
@@ -848,6 +942,40 @@ glob_nonempty() {
     [ ${#matches[@]} -gt 0 ]
 }
 export -f glob_nonempty
+
+# log_issue <dataset> <message> ["err"]
+# Every per-dataset Warning [.../ERROR [... message anywhere in this script
+# funnels through here instead of a bare echo, so console/log.txt output is
+# completely unchanged (same text, same stream - pass "err" as the 3rd arg
+# for the handful of call sites that used to redirect to stderr) but each
+# message is ALSO appended to that dataset's own issues.txt, when
+# despot_run_name is given for this invocation. This gives one aggregated,
+# at-a-glance file per dataset covering every known "expected" problem
+# (missing upstream output, an empty cluster_reps.csv, a sub-script's
+# non-zero exit code, etc.) without having to grep the full pipeline log -
+# see filter.py's own empty-cluster_reps.csv handling for the kind of
+# non-fatal condition this is meant to surface, not hide.
+#
+# Written under the same nested path despot output itself lives in
+# (.../<final_run_name>/<rotamer_run_name>/<despot_run_name>/issues.txt) -
+# despot_run_name being set implies every run-name variable up through
+# final_run_name is already set too, since despot is the last stage in the
+# chain. rotamer_run_name may be empty (it's optional); an empty path
+# segment just collapses harmlessly.
+log_issue() {
+    local dataset="$1" message="$2" stream="${3:-}"
+    if [ "$stream" = "err" ]; then
+        echo "$message" >&2
+    else
+        echo "$message"
+    fi
+    if [ -n "${despot_run_name:-}" ]; then
+        local issues_dir="${DATASETS_DIR}/${dataset}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
+        mkdir -p "$issues_dir"
+        echo "$message" >> "${issues_dir}/issues.txt"
+    fi
+}
+export -f log_issue
 
 # run_step <description> <command...>
 run_step() {
@@ -978,7 +1106,7 @@ build_cif_list_from_cluster_reps() {
     done
 
     if [ $cif_col_index -lt 0 ]; then
-        echo "ERROR [${dataset}]: cif_restraints_file column not found in $cluster_reps_csv" >&2
+        log_issue "${dataset}" "ERROR [${dataset}]: cif_restraints_file column not found in $cluster_reps_csv" "err"
         return 1
     fi
 
@@ -995,7 +1123,7 @@ build_cif_list_from_cluster_reps() {
         cif_path="$(echo -n "$cif_path" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
 
         if [ -z "$cif_path" ] || [ ! -f "$cif_path" ]; then
-            echo "ERROR [${dataset}]: CIF not found for row ${row_num} of ${cluster_reps_csv}: '${cif_path}'" >&2
+            log_issue "${dataset}" "ERROR [${dataset}]: CIF not found for row ${row_num} of ${cluster_reps_csv}: '${cif_path}'" "err"
             any_cif_missing=1
             continue
         fi
@@ -1004,12 +1132,12 @@ build_cif_list_from_cluster_reps() {
     done < "$cluster_reps_csv"
 
     if [ $any_cif_missing -ne 0 ]; then
-        echo "ERROR [${dataset}]: One or more CIF restraint files were missing, aborting." >&2
+        log_issue "${dataset}" "ERROR [${dataset}]: One or more CIF restraint files were missing, aborting." "err"
         return 1
     fi
 
     if [ ${#cif_paths[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No data rows found in $cluster_reps_csv" >&2
+        log_issue "${dataset}" "ERROR [${dataset}]: No data rows found in $cluster_reps_csv" "err"
         return 1
     fi
 
@@ -1065,7 +1193,7 @@ convert_ligs_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
     local fragment_id=$(echo "$lookup" | awk '{print $2}')
@@ -1073,7 +1201,7 @@ convert_ligs_process_dataset() {
     local smiles_lookup=$(grep "^${dataset} " "$LIG_SMILES_LOOKUP_FILE")
     local smiles=$(echo "$smiles_lookup" | awk '{print $2}')
     if [ -z "$smiles" ]; then
-        echo "Warning [${dataset}]: no SMILES for ligand_name=${fragment_id}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no SMILES for ligand_name=${fragment_id}, skipping."
         return 1
     fi
 
@@ -1088,7 +1216,7 @@ convert_ligs_process_dataset() {
     done < <(find "$LIG_PDB_DIR" -maxdepth 1 -mindepth 1 -type d -name "${fragment_id}*" -print0 | sort -z)
 
     if [[ ${#pdb_dirs[@]} -eq 0 ]]; then
-        echo "Warning [${dataset}]: No directories found matching '${fragment_id}' under ${LIG_PDB_DIR}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: No directories found matching '${fragment_id}' under ${LIG_PDB_DIR}, skipping."
         return 1
     fi
 
@@ -1164,13 +1292,13 @@ calc_apo_rscc_process_dataset() {
     fi
 
     if [ ! -f "$structure" ]; then
-        echo "Warning [${dataset}]: aligned structure not found: ${structure}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: aligned structure not found: ${structure}, skipping."
         return 1
     fi
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
     local resolution=$(echo "$lookup" | awk '{print $3}')
@@ -1179,7 +1307,7 @@ calc_apo_rscc_process_dataset() {
 
     local event_maps=("${dataset_dir}/${dataset}-event_"*)
     if [ ${#event_maps[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
         return 1
     fi
 
@@ -1190,7 +1318,7 @@ calc_apo_rscc_process_dataset() {
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
         return 1
     fi
 
@@ -1225,7 +1353,7 @@ calc_ref_set_rscc_process_dataset() {
     local reference_dataset_dir="${REF_SET}/${dataset}"
 
     if [ ! -d "$reference_dataset_dir" ]; then
-        echo "Warning [${dataset}]: reference set folder ${reference_dataset_dir} not found, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: reference set folder ${reference_dataset_dir} not found, skipping."
         return 1
     fi
 
@@ -1239,13 +1367,13 @@ calc_ref_set_rscc_process_dataset() {
     fi
 
     if [ ! -f "$structure" ]; then
-        echo "Warning [${dataset}]: reference structure not found: ${structure}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: reference structure not found: ${structure}, skipping."
         return 1
     fi
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
     local resolution=$(echo "$lookup" | awk '{print $3}')
@@ -1254,7 +1382,7 @@ calc_ref_set_rscc_process_dataset() {
 
     local event_maps=("${dataset_dir}/${dataset}-event_"*)
     if [ ${#event_maps[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
         return 1
     fi
 
@@ -1265,7 +1393,7 @@ calc_ref_set_rscc_process_dataset() {
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
         return 1
     fi
 
@@ -1304,7 +1432,7 @@ ref_set_despot_process_dataset() {
     local reference_dataset_dir="${REF_SET}/${dataset}"
 
     if [ ! -d "$reference_dataset_dir" ]; then
-        echo "Warning [${dataset}]: reference set folder ${reference_dataset_dir} not found, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: reference set folder ${reference_dataset_dir} not found, skipping."
         return 1
     fi
 
@@ -1318,13 +1446,13 @@ ref_set_despot_process_dataset() {
     fi
 
     if [ ! -f "$structure" ]; then
-        echo "Warning [${dataset}]: reference structure not found: ${structure}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: reference structure not found: ${structure}, skipping."
         return 1
     fi
 
     local cell_lookup=$(grep "^${dataset} " "$DESPOT_CELL_LOOKUP_FILE")
     if [ -z "$cell_lookup" ]; then
-        echo "Warning [${dataset}]: no crystal cell/space group info found in ${CSV_FILE}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no crystal cell/space group info found in ${CSV_FILE}, skipping."
         return 1
     fi
     local cl_dataset a b c alpha beta gamma space_group
@@ -1333,7 +1461,7 @@ ref_set_despot_process_dataset() {
     local smiles_lookup=$(grep "^${dataset} " "$LIG_SMILES_LOOKUP_FILE")
     local smiles=$(echo "$smiles_lookup" | awk '{print $2}')
     if [ -z "$smiles" ]; then
-        echo "Warning [${dataset}]: no SMILES found, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no SMILES found, skipping."
         return 1
     fi
 
@@ -1357,7 +1485,7 @@ ref_set_despot_process_dataset() {
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: symmetry_expand failed with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: symmetry_expand failed with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
         return 1
     fi
@@ -1371,7 +1499,7 @@ ref_set_despot_process_dataset() {
     local ligand_pdbs=("${ligs_dir}"/lig*.pdb)
     shopt -u nullglob
     if [ ${#ligand_pdbs[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no ligand (resname LIG) instance found in ${structure}; skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no ligand (resname LIG) instance found in ${structure}; skipping."
         print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
         return 1
     fi
@@ -1380,7 +1508,7 @@ ref_set_despot_process_dataset() {
         "$CONDA_ENV_QFIT" "$ASSIGN_BOND_ORDERS_PY" "${ligand_pdbs[@]}"
     status=$?
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligand_pdbs[*]} with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligand_pdbs[*]} with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
         return 1
     fi
@@ -1390,7 +1518,7 @@ ref_set_despot_process_dataset() {
     status=$?
     print_elapsed "$step_start_time" "[${dataset}] pdb2pqr"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: protein_to_mol2.sh failed on ${expanded_pdb} with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: protein_to_mol2.sh failed on ${expanded_pdb} with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
         return 1
     fi
@@ -1402,7 +1530,7 @@ ref_set_despot_process_dataset() {
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] despot score_complex.py"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: DESPOT score_complex.py failed with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: DESPOT score_complex.py failed with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] ref_set_despot"
         return 1
     fi
@@ -1444,7 +1572,7 @@ fit_ligand_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}"
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}"
         return 1
     fi
 
@@ -1462,7 +1590,7 @@ fit_ligand_process_dataset() {
     done < <(find "$LIG_PDB_DIR" -maxdepth 1 -mindepth 1 -type d -name "${fragment_id}*" -print0 | sort -z)
 
     if [[ ${#pdb_dirs[@]} -eq 0 ]]; then
-        echo "Warning: No directories found matching '${fragment_id}' for dataset ${dataset}"
+        log_issue "${dataset}" "Warning: No directories found matching '${fragment_id}' for dataset ${dataset}"
         return 1
     fi
 
@@ -1668,15 +1796,15 @@ rsr_placer_process_dataset() {
     echo "Processing ${dataset}..."
 
     local map_file
-    map_file=$(find "$dataset_dir" -maxdepth 1 -name "${dataset}-event_1*" | head -1)
+    map_file=$(find "$dataset_dir" -maxdepth 1 -name "${dataset}-event_*" | head -1)
     if [ -z "$map_file" ]; then
-        echo "ERROR [${dataset}]: No event map found matching ${dataset}-event_1*"
+        log_issue "${dataset}" "ERROR [${dataset}]: No event map found matching ${dataset}-event_*"
         return 1
     fi
 
     local manifest_file="${dataset_dir}/${run_name}/fit_ligand_manifest.csv"
     if [ ! -f "$manifest_file" ]; then
-        echo "ERROR [${dataset}]: Manifest not found: ${manifest_file}"
+        log_issue "${dataset}" "ERROR [${dataset}]: Manifest not found: ${manifest_file}"
         return 1
     fi
 
@@ -1706,7 +1834,7 @@ rsr_placer_process_dataset() {
     mapfile -t pdb_files < <(find "$placer_dir" -maxdepth 1 -name "*_model.pdb")
 
     if [ ${#pdb_files[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No *_model.pdb files found in $placer_dir"
+        log_issue "${dataset}" "ERROR [${dataset}]: No *_model.pdb files found in $placer_dir"
         return 1
     fi
 
@@ -1720,13 +1848,13 @@ rsr_placer_process_dataset() {
         local cif_path="${key_to_cif[$key]}"
 
         if [ -z "$cif_path" ]; then
-            echo "ERROR [${dataset}]: No manifest entry found for key '${key}' (from $input_pdb)"
+            log_issue "${dataset}" "ERROR [${dataset}]: No manifest entry found for key '${key}' (from $input_pdb)"
             any_failed=1
             continue
         fi
 
         if [ ! -f "$cif_path" ]; then
-            echo "ERROR [${dataset}]: CIF not found: ${cif_path}"
+            log_issue "${dataset}" "ERROR [${dataset}]: CIF not found: ${cif_path}"
             any_failed=1
             continue
         fi
@@ -1750,7 +1878,7 @@ rsr_placer_process_dataset() {
             "${rsr_extra_args[@]}"
         local exit_code=$?
         if [ $exit_code -ne 0 ]; then
-            echo "ERROR [${dataset}]: Refinement failed for $input_pdb with exit code $exit_code"
+            log_issue "${dataset}" "ERROR [${dataset}]: Refinement failed for $input_pdb with exit code $exit_code"
             any_failed=1
         else
             echo "Completed: ${dataset} / $(basename "$input_pdb")"
@@ -1833,7 +1961,7 @@ filter_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
 
@@ -1859,7 +1987,7 @@ filter_process_dataset() {
 
     local filter_exit=$?
     if [ $filter_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: filter failed with exit code ${filter_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: filter failed with exit code ${filter_exit}"
         return 1
     fi
 
@@ -1873,13 +2001,13 @@ filter_process_dataset() {
     # --- Post-hoc: annotate cluster_reps.csv with a cif_restraints_file column ---
     local cluster_csv="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/cluster_reps.csv"
     if [ ! -f "$cluster_csv" ]; then
-        echo "Warning [${dataset}]: cluster_reps.csv not found at ${cluster_csv}, skipping CIF annotation."
+        log_issue "${dataset}" "Warning [${dataset}]: cluster_reps.csv not found at ${cluster_csv}, skipping CIF annotation."
         return 0
     fi
 
     local manifest_file="${dataset_dir}/${run_name}/fit_ligand_manifest.csv"
     if [ ! -f "$manifest_file" ]; then
-        echo "ERROR [${dataset}]: Manifest not found: ${manifest_file}, cannot annotate CIF restraints."
+        log_issue "${dataset}" "ERROR [${dataset}]: Manifest not found: ${manifest_file}, cannot annotate CIF restraints."
         return 1
     fi
 
@@ -1923,7 +2051,7 @@ filter_process_dataset() {
 
             local cif_path="${key_to_cif[$key]}"
             if [ -z "$cif_path" ]; then
-                echo "Warning [${dataset}]: No manifest entry found for key '${key}' (from ${placer_file})" >&2
+                log_issue "${dataset}" "Warning [${dataset}]: No manifest entry found for key '${key}' (from ${placer_file})" "err"
                 cif_path="NA"
             fi
 
@@ -1964,9 +2092,9 @@ rsr_backbone_process_dataset() {
     conda_activate "$CONDA_ENV_RSR"
 
     local map_file
-    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_1*" | head -1)
+    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_*" | head -1)
     if [ -z "$map_file" ]; then
-        echo "ERROR [${dataset}]: No event map found matching ${dataset}-event_1* in ${dataset_dir}"
+        log_issue "${dataset}" "ERROR [${dataset}]: No event map found matching ${dataset}-event_* in ${dataset_dir}"
         return 1
     fi
 
@@ -1974,7 +2102,7 @@ rsr_backbone_process_dataset() {
     local cluster_reps_csv="${run_dir}/cluster_reps.csv"
 
     if [ ! -f "$cluster_reps_csv" ]; then
-        echo "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
+        log_issue "${dataset}" "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
         return 1
     fi
 
@@ -1994,7 +2122,7 @@ rsr_backbone_process_dataset() {
     done
 
     if [ $cif_col_index -lt 0 ]; then
-        echo "ERROR [${dataset}]: cif_restraints_file column not found in ${cluster_reps_csv}"
+        log_issue "${dataset}" "ERROR [${dataset}]: cif_restraints_file column not found in ${cluster_reps_csv}"
         return 1
     fi
 
@@ -2011,12 +2139,12 @@ rsr_backbone_process_dataset() {
         cif_path="$(echo -n "$cif_path" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
 
         if [ -z "$cif_path" ]; then
-            echo "ERROR [${dataset}]: Empty cif_restraints_file value on row ${row_num} of ${cluster_reps_csv}"
+            log_issue "${dataset}" "ERROR [${dataset}]: Empty cif_restraints_file value on row ${row_num} of ${cluster_reps_csv}"
             any_cif_missing=1
             continue
         fi
         if [ ! -f "$cif_path" ]; then
-            echo "ERROR [${dataset}]: CIF not found: ${cif_path} (row ${row_num} of ${cluster_reps_csv})"
+            log_issue "${dataset}" "ERROR [${dataset}]: CIF not found: ${cif_path} (row ${row_num} of ${cluster_reps_csv})"
             any_cif_missing=1
             continue
         fi
@@ -2024,12 +2152,12 @@ rsr_backbone_process_dataset() {
     done < "$cluster_reps_csv"
 
     if [ $any_cif_missing -ne 0 ]; then
-        echo "ERROR [${dataset}]: One or more CIF restraint files were missing, aborting."
+        log_issue "${dataset}" "ERROR [${dataset}]: One or more CIF restraint files were missing, aborting."
         return 1
     fi
 
     if [ ${#cif_paths[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No data rows found in $cluster_reps_csv"
+        log_issue "${dataset}" "ERROR [${dataset}]: No data rows found in $cluster_reps_csv"
         return 1
     fi
 
@@ -2041,11 +2169,11 @@ rsr_backbone_process_dataset() {
     local output_pdb="${run_dir}/${dataset}_backbone_refined.pdb"
 
     if [ ! -f "$multimodel_pdb" ]; then
-        echo "ERROR [${dataset}]: multimodel_pdb not found: ${multimodel_pdb}"
+        log_issue "${dataset}" "ERROR [${dataset}]: multimodel_pdb not found: ${multimodel_pdb}"
         return 1
     fi
     if [ ! -f "$apo_pdb" ]; then
-        echo "ERROR [${dataset}]: apo_pdb not found: ${apo_pdb}"
+        log_issue "${dataset}" "ERROR [${dataset}]: apo_pdb not found: ${apo_pdb}"
         return 1
     fi
 
@@ -2067,7 +2195,7 @@ rsr_backbone_process_dataset() {
         "${rsr_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
+        log_issue "${dataset}" "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
         return 1
     fi
 
@@ -2112,7 +2240,7 @@ calc_backbone_refined_rscc_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
 
@@ -2122,14 +2250,14 @@ calc_backbone_refined_rscc_process_dataset() {
 
     local event_maps=("${dataset_dir}/${dataset}-event_"*)
     if [ ${#event_maps[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
         return 1
     fi
 
     local run_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}"
     local structures=("${run_dir}/${dataset}_backbone_refined_"*.pdb)
     if [ ${#structures[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no structures found matching ${run_dir}/${dataset}_backbone_refined_*.pdb, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no structures found matching ${run_dir}/${dataset}_backbone_refined_*.pdb, skipping."
         return 1
     fi
 
@@ -2143,7 +2271,7 @@ calc_backbone_refined_rscc_process_dataset() {
 
         local calc_exit=$?
         if [ $calc_exit -ne 0 ]; then
-            echo "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
+            log_issue "${dataset}" "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
             continue
         fi
         echo "Completed [${dataset}]: ${structure} -> ${output_csv}"
@@ -2371,15 +2499,15 @@ rsr_placer2_process_dataset() {
     echo "Processing ${dataset}..."
 
     local map_file
-    map_file=$(find "$dataset_dir" -maxdepth 1 -name "${dataset}-event_1*" | head -1)
+    map_file=$(find "$dataset_dir" -maxdepth 1 -name "${dataset}-event_*" | head -1)
     if [ -z "$map_file" ]; then
-        echo "ERROR [${dataset}]: No event map found matching ${dataset}-event_1*"
+        log_issue "${dataset}" "ERROR [${dataset}]: No event map found matching ${dataset}-event_*"
         return 1
     fi
 
     local cluster_reps_csv="${filter_dir}/cluster_reps.csv"
     if [ ! -f "$cluster_reps_csv" ]; then
-        echo "ERROR [${dataset}]: cluster_reps.csv not found: ${cluster_reps_csv}"
+        log_issue "${dataset}" "ERROR [${dataset}]: cluster_reps.csv not found: ${cluster_reps_csv}"
         return 1
     fi
 
@@ -2404,7 +2532,7 @@ rsr_placer2_process_dataset() {
     done
 
     if [ $cif_col_index -lt 0 ]; then
-        echo "ERROR [${dataset}]: cif_restraints_file column not found in $cluster_reps_csv"
+        log_issue "${dataset}" "ERROR [${dataset}]: cif_restraints_file column not found in $cluster_reps_csv"
         return 1
     fi
 
@@ -2423,7 +2551,7 @@ rsr_placer2_process_dataset() {
     done < "$cluster_reps_csv"
 
     if [ ${#cif_paths[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No data rows found in $cluster_reps_csv"
+        log_issue "${dataset}" "ERROR [${dataset}]: No data rows found in $cluster_reps_csv"
         return 1
     fi
 
@@ -2431,7 +2559,7 @@ rsr_placer2_process_dataset() {
     mapfile -t pdb_files < <(find "$placer2_dir" -maxdepth 1 -name "${dataset}_backbone_refined_*_model.pdb")
 
     if [ ${#pdb_files[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No ${dataset}_backbone_refined_*_model.pdb files found in $placer2_dir"
+        log_issue "${dataset}" "ERROR [${dataset}]: No ${dataset}_backbone_refined_*_model.pdb files found in $placer2_dir"
         return 1
     fi
 
@@ -2443,27 +2571,27 @@ rsr_placer2_process_dataset() {
 
         local model_idx="${basename#${dataset}_backbone_refined_}"
         if ! [[ "$model_idx" =~ ^[0-9]+$ ]]; then
-            echo "ERROR [${dataset}]: Could not parse model index from $(basename "$input_pdb")"
+            log_issue "${dataset}" "ERROR [${dataset}]: Could not parse model index from $(basename "$input_pdb")"
             any_failed=1
             continue
         fi
 
         local row_idx=$((model_idx - 1))
         if [ "$row_idx" -lt 0 ] || [ "$row_idx" -ge ${#cif_paths[@]} ]; then
-            echo "ERROR [${dataset}]: Model index ${model_idx} has no corresponding row in $cluster_reps_csv"
+            log_issue "${dataset}" "ERROR [${dataset}]: Model index ${model_idx} has no corresponding row in $cluster_reps_csv"
             any_failed=1
             continue
         fi
 
         local cif_path="${cif_paths[$row_idx]}"
         if [ -z "$cif_path" ]; then
-            echo "ERROR [${dataset}]: Empty cif_restraints_file for model ${model_idx}"
+            log_issue "${dataset}" "ERROR [${dataset}]: Empty cif_restraints_file for model ${model_idx}"
             any_failed=1
             continue
         fi
 
         if [ ! -f "$cif_path" ]; then
-            echo "ERROR [${dataset}]: CIF not found for model ${model_idx}: ${cif_path}"
+            log_issue "${dataset}" "ERROR [${dataset}]: CIF not found for model ${model_idx}: ${cif_path}"
             any_failed=1
             continue
         fi
@@ -2487,7 +2615,7 @@ rsr_placer2_process_dataset() {
             "${rsr_extra_args[@]}"
         local exit_code=$?
         if [ $exit_code -ne 0 ]; then
-            echo "ERROR [${dataset}]: Refinement failed for $input_pdb with exit code $exit_code"
+            log_issue "${dataset}" "ERROR [${dataset}]: Refinement failed for $input_pdb with exit code $exit_code"
             any_failed=1
         else
             echo "Completed: ${dataset} / $(basename "$input_pdb")"
@@ -2517,12 +2645,14 @@ do_placer_sampling_refined_round2() {
     conda_activate "$CONDA_ENV_EVAL"
 
     local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
+    local filter1_csv="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/lig_vs_reference_rscc.csv"
     echo "Starting run"
     local start_time=$(date +%s)
     python "$CALC_PLACER_SAMPLING_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --filter1-csv "$filter1_csv"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -2543,12 +2673,43 @@ do_placer_sampling_unrefined_round2() {
 
 placer_sampling_round2_outputs_exist() {
     local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
-    files_exist "${out_dir}/placer_sampling.png" "${out_dir}/placer_sampling_unrefined.png"
+    files_exist "${out_dir}/placer_sampling.png" "${out_dir}/placer_sampling_unrefined.png" \
+                "${out_dir}/placer_sampling_restricted.png"
 }
 
 do_placer_sampling_round2() {
     do_placer_sampling_refined_round2
     do_placer_sampling_unrefined_round2
+}
+
+######################################################################
+# Stage 4d: plot_placer2_vs_placer1_rmsd (only runs when -c is given)
+######################################################################
+# Pooled (cross-dataset) scatter under
+# GRAPHS_DIR/<run_name>/<placer_run_name>/<filter_run_name>/<placer2_run_name>/: placer2's
+# best (minimum) ligand RMSD (y) vs placer_1's (x), for every reference ligand present in both
+# rounds' placer_sampling.csv (round-2's own output, written just above by Stage 4c, plus
+# round-1's from Stage 2c). Refined comparison only - placer_sampling_unrefined.csv isn't used
+# here.
+
+do_plot_placer2_vs_placer1_rmsd() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local round1_csv="${GRAPHS_DIR}/${run_name}/${placer_run_name}/placer_sampling.csv"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
+    local round2_csv="${out_dir}/placer_sampling.csv"
+    local filter1_csv="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/lig_vs_reference_rscc.csv"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_PLACER2_VS_PLACER1_RMSD_PY" \
+        "$round1_csv" "$round2_csv" --out-dir "$out_dir" --filter1-csv "$filter1_csv"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+placer2_vs_placer1_rmsd_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}"
+    files_exist "${out_dir}/placer2_vs_placer1_rmsd.png"
 }
 
 ######################################################################
@@ -2569,7 +2730,7 @@ filter2_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
 
@@ -2595,7 +2756,7 @@ filter2_process_dataset() {
 
     local filter_exit=$?
     if [ $filter_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: filter failed with exit code ${filter_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: filter failed with exit code ${filter_exit}"
         return 1
     fi
 
@@ -2613,12 +2774,12 @@ filter2_process_dataset() {
     local filter2_csv="${filter2_dir}/cluster_reps.csv"
 
     if [ ! -f "$filter2_csv" ]; then
-        echo "Warning [${dataset}]: cluster_reps.csv not found at ${filter2_csv}, skipping CIF annotation."
+        log_issue "${dataset}" "Warning [${dataset}]: cluster_reps.csv not found at ${filter2_csv}, skipping CIF annotation."
         return 0
     fi
 
     if [ ! -f "$filter_csv" ]; then
-        echo "ERROR [${dataset}]: filter_run_name cluster_reps.csv not found: ${filter_csv}, cannot annotate CIF restraints."
+        log_issue "${dataset}" "ERROR [${dataset}]: filter_run_name cluster_reps.csv not found: ${filter_csv}, cannot annotate CIF restraints."
         return 1
     fi
 
@@ -2638,7 +2799,7 @@ filter2_process_dataset() {
     done
 
     if [ $filter_cif_col_index -lt 0 ]; then
-        echo "ERROR [${dataset}]: cif_restraints_file column not found in ${filter_csv}, cannot annotate."
+        log_issue "${dataset}" "ERROR [${dataset}]: cif_restraints_file column not found in ${filter_csv}, cannot annotate."
         return 1
     fi
 
@@ -2655,7 +2816,7 @@ filter2_process_dataset() {
     done < "$filter_csv"
 
     if [ ${#filter_cif_paths[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: No data rows found in ${filter_csv}, cannot annotate."
+        log_issue "${dataset}" "ERROR [${dataset}]: No data rows found in ${filter_csv}, cannot annotate."
         return 1
     fi
 
@@ -2679,11 +2840,11 @@ filter2_process_dataset() {
 
             local cif_path="NA"
             if [ -z "$model_idx" ]; then
-                echo "Warning [${dataset}]: Could not parse backbone_refined index from ${placer_file}" >&2
+                log_issue "${dataset}" "Warning [${dataset}]: Could not parse backbone_refined index from ${placer_file}" "err"
             else
                 local row_idx=$((model_idx - 1))
                 if [ "$row_idx" -lt 0 ] || [ "$row_idx" -ge ${#filter_cif_paths[@]} ]; then
-                    echo "Warning [${dataset}]: Model index ${model_idx} has no corresponding row in ${filter_csv}" >&2
+                    log_issue "${dataset}" "Warning [${dataset}]: Model index ${model_idx} has no corresponding row in ${filter_csv}" "err"
                 else
                     cif_path="${filter_cif_paths[$row_idx]}"
                     [ -z "$cif_path" ] && cif_path="NA"
@@ -2754,7 +2915,7 @@ build_final_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
 
@@ -2766,7 +2927,7 @@ build_final_process_dataset() {
     local apo_structure="${dataset_dir}/${dataset}-aligned-structure.pdb"
 
     if [ ! -f "$apo_structure" ]; then
-        echo "ERROR [${dataset}]: apo structure not found: ${apo_structure}"
+        log_issue "${dataset}" "ERROR [${dataset}]: apo structure not found: ${apo_structure}"
         return 1
     fi
 
@@ -2788,7 +2949,7 @@ build_final_process_dataset() {
 
     local build_exit=$?
     if [ $build_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: build_final_model failed with exit code ${build_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: build_final_model failed with exit code ${build_exit}"
         return 1
     fi
 
@@ -2824,16 +2985,16 @@ rsr_final_process_dataset() {
     conda_activate "$CONDA_ENV_RSR"
 
     local map_file
-    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_1*" | head -1)
+    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_*" | head -1)
     if [ -z "$map_file" ]; then
-        echo "ERROR [${dataset}]: No event map found matching ${dataset}-event_1* in ${dataset_dir}"
+        log_issue "${dataset}" "ERROR [${dataset}]: No event map found matching ${dataset}-event_* in ${dataset_dir}"
         return 1
     fi
 
     local cluster_reps_csv="${filter2_dir}/cluster_reps.csv"
 
     if [ ! -f "$cluster_reps_csv" ]; then
-        echo "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
+        log_issue "${dataset}" "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
         return 1
     fi
 
@@ -2845,11 +3006,11 @@ rsr_final_process_dataset() {
     local output_pdb="${final_dir}/final_model_refined.pdb"
 
     if [ ! -f "$final_pdb" ]; then
-        echo "ERROR [${dataset}]: final_pdb not found: ${final_pdb}"
+        log_issue "${dataset}" "ERROR [${dataset}]: final_pdb not found: ${final_pdb}"
         return 1
     fi
     if [ ! -f "$residues_csv" ]; then
-        echo "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
+        log_issue "${dataset}" "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
         return 1
     fi
 
@@ -2870,7 +3031,7 @@ rsr_final_process_dataset() {
         "${rsr_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
+        log_issue "${dataset}" "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
         return 1
     fi
 
@@ -2912,7 +3073,7 @@ calc_final_refined_rscc_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
 
@@ -2922,12 +3083,12 @@ calc_final_refined_rscc_process_dataset() {
 
     local event_maps=("${dataset_dir}/${dataset}-event_"*)
     if [ ${#event_maps[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
         return 1
     fi
 
     if [ ! -f "$structure" ]; then
-        echo "Warning [${dataset}]: final_model_refined.pdb not found: ${structure}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: final_model_refined.pdb not found: ${structure}, skipping."
         return 1
     fi
 
@@ -2938,7 +3099,7 @@ calc_final_refined_rscc_process_dataset() {
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
         return 1
     fi
 
@@ -3035,11 +3196,11 @@ rotamer_optimize_process_dataset() {
     local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
 
     if [ ! -f "$final_pdb" ]; then
-        echo "ERROR [${dataset}]: final_pdb not found: ${final_pdb}"
+        log_issue "${dataset}" "ERROR [${dataset}]: final_pdb not found: ${final_pdb}"
         return 1
     fi
     if [ ! -f "$residues_csv" ]; then
-        echo "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
+        log_issue "${dataset}" "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
         return 1
     fi
 
@@ -3047,7 +3208,7 @@ rotamer_optimize_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
     local resolution=$(echo "$lookup" | awk '{print $3}')
@@ -3070,7 +3231,7 @@ rotamer_optimize_process_dataset() {
         "${rotamer_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo "ERROR [${dataset}]: rotamer_optimize failed with exit code $exit_code"
+        log_issue "${dataset}" "ERROR [${dataset}]: rotamer_optimize failed with exit code $exit_code"
         return 1
     fi
 
@@ -3111,15 +3272,15 @@ rsr_rotamer_process_dataset() {
     conda_activate "$CONDA_ENV_RSR"
 
     local map_file
-    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_1*" | head -1)
+    map_file=$(find "${dataset_dir}" -maxdepth 1 -name "${dataset}-event_*" | head -1)
     if [ -z "$map_file" ]; then
-        echo "ERROR [${dataset}]: No event map found matching ${dataset}-event_1* in ${dataset_dir}"
+        log_issue "${dataset}" "ERROR [${dataset}]: No event map found matching ${dataset}-event_* in ${dataset_dir}"
         return 1
     fi
 
     local cluster_reps_csv="${filter2_dir}/cluster_reps.csv"
     if [ ! -f "$cluster_reps_csv" ]; then
-        echo "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
+        log_issue "${dataset}" "ERROR [${dataset}]: cluster_reps.csv not found: $cluster_reps_csv"
         return 1
     fi
 
@@ -3131,11 +3292,11 @@ rsr_rotamer_process_dataset() {
     local output_pdb="${rotamer_dir}/rotamer_refined.pdb"
 
     if [ ! -f "$input_pdb" ]; then
-        echo "ERROR [${dataset}]: rotamer_optimized.pdb not found: ${input_pdb}"
+        log_issue "${dataset}" "ERROR [${dataset}]: rotamer_optimized.pdb not found: ${input_pdb}"
         return 1
     fi
     if [ ! -f "$residues_csv" ]; then
-        echo "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
+        log_issue "${dataset}" "ERROR [${dataset}]: residues_csv not found: ${residues_csv}"
         return 1
     fi
 
@@ -3156,7 +3317,7 @@ rsr_rotamer_process_dataset() {
         "${rsr_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
+        log_issue "${dataset}" "ERROR [${dataset}]: Refinement failed with exit code $exit_code"
         return 1
     fi
 
@@ -3202,25 +3363,25 @@ calc_rotamer_refined_rscc_process_dataset() {
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning: No match found for dataset ${dataset}, skipping."
+        log_issue "${dataset}" "Warning: No match found for dataset ${dataset}, skipping."
         return 1
     fi
     local resolution=$(echo "$lookup" | awk '{print $3}')
 
     local event_maps=("${dataset_dir}/${dataset}-event_"*)
     if [ ${#event_maps[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*, skipping."
         return 1
     fi
 
     if [ ! -f "$structure" ]; then
-        echo "Warning [${dataset}]: rotamer_refined.pdb not found: ${structure}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: rotamer_refined.pdb not found: ${structure}, skipping."
         return 1
     fi
 
     local residues_csv="${final_dir}/residues_with_placer_conformers.csv"
     if [ ! -f "$residues_csv" ]; then
-        echo "Warning [${dataset}]: residues_csv not found: ${residues_csv}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: residues_csv not found: ${residues_csv}, skipping."
         return 1
     fi
 
@@ -3232,7 +3393,7 @@ calc_rotamer_refined_rscc_process_dataset() {
 
     local calc_exit=$?
     if [ $calc_exit -ne 0 ]; then
-        echo "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
+        log_issue "${dataset}" "ERROR [${dataset}]: calc_rscc failed on ${structure} with exit code ${calc_exit}"
         return 1
     fi
 
@@ -3281,7 +3442,7 @@ select_optimized_residues_process_dataset() {
 
     for f in "$final_model" "$rotamer_model" "$final_rscc_csv" "$rotamer_rscc_csv" "$residues_csv"; do
         if [ ! -f "$f" ]; then
-            echo "Warning [${dataset}]: required file not found: ${f}, skipping."
+            log_issue "${dataset}" "Warning [${dataset}]: required file not found: ${f}, skipping."
             return 1
         fi
     done
@@ -3294,7 +3455,7 @@ select_optimized_residues_process_dataset() {
         "$residues_csv" "$output_pdb" "${select_extra_args[@]}"
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo "ERROR [${dataset}]: select_optimized_residues failed with exit code $exit_code"
+        log_issue "${dataset}" "ERROR [${dataset}]: select_optimized_residues failed with exit code $exit_code"
         return 1
     fi
 
@@ -3393,17 +3554,17 @@ despot_process_dataset() {
     fi
 
     if [ ! -f "$final_model" ]; then
-        echo "Warning [${dataset}]: optimized.pdb not found: ${final_model}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: optimized.pdb not found: ${final_model}, skipping."
         return 1
     fi
     if [ ! -f "$apo_structure" ]; then
-        echo "Warning [${dataset}]: apo structure not found: ${apo_structure}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: apo structure not found: ${apo_structure}, skipping."
         return 1
     fi
 
     local cell_lookup=$(grep "^${dataset} " "$DESPOT_CELL_LOOKUP_FILE")
     if [ -z "$cell_lookup" ]; then
-        echo "Warning [${dataset}]: no crystal cell/space group info found in ${CSV_FILE}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no crystal cell/space group info found in ${CSV_FILE}, skipping."
         return 1
     fi
     local cl_dataset a b c alpha beta gamma space_group
@@ -3412,13 +3573,13 @@ despot_process_dataset() {
     local smiles_lookup=$(grep "^${dataset} " "$LIG_SMILES_LOOKUP_FILE")
     local smiles=$(echo "$smiles_lookup" | awk '{print $2}')
     if [ -z "$smiles" ]; then
-        echo "Warning [${dataset}]: no SMILES found, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no SMILES found, skipping."
         return 1
     fi
 
     local lookup=$(grep "^${dataset} " "$LOOKUP_FILE")
     if [ -z "$lookup" ]; then
-        echo "Warning [${dataset}]: no resolution found in ${LOOKUP_FILE}, skipping."
+        log_issue "${dataset}" "Warning [${dataset}]: no resolution found in ${LOOKUP_FILE}, skipping."
         return 1
     fi
     local resolution=$(echo "$lookup" | awk '{print $3}')
@@ -3447,7 +3608,7 @@ despot_process_dataset() {
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] extract_ligand_conformers"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: extract_ligand_conformers failed with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: extract_ligand_conformers failed with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3462,7 +3623,7 @@ despot_process_dataset() {
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] symmetry_expand"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: symmetry_expand failed with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: symmetry_expand failed with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3471,7 +3632,7 @@ despot_process_dataset() {
         "$ASSIGN_BOND_ORDERS_PY" "$ligs_pdb"
     status=$?
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: pdb_to_mol2.sh failed on ${ligs_pdb} with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3481,7 +3642,7 @@ despot_process_dataset() {
     status=$?
     print_elapsed "$step_start_time" "[${dataset}] pdb2pqr"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: protein_to_mol2.sh failed on ${expanded_pdb} with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: protein_to_mol2.sh failed on ${expanded_pdb} with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3493,7 +3654,7 @@ despot_process_dataset() {
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] despot score_complex.py"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: DESPOT score_complex.py failed with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: DESPOT score_complex.py failed with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3502,7 +3663,7 @@ despot_process_dataset() {
     local event_maps=("${dataset_dir}/${dataset}-event_"*)
     shopt -u nullglob
     if [ ${#event_maps[@]} -eq 0 ]; then
-        echo "ERROR [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*"
+        log_issue "${dataset}" "ERROR [${dataset}]: no event maps found matching ${dataset_dir}/${dataset}-event_*"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3522,7 +3683,7 @@ despot_process_dataset() {
     conda_deactivate
     print_elapsed "$step_start_time" "[${dataset}] despot_filter"
     if [ $status -ne 0 ]; then
-        echo "ERROR [${dataset}]: despot_filter failed with exit code ${status}"
+        log_issue "${dataset}" "ERROR [${dataset}]: despot_filter failed with exit code ${status}"
         print_elapsed "$dataset_start_time" "[${dataset}] despot"
         return 1
     fi
@@ -3987,6 +4148,8 @@ stage4_placer2() {
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 4c: calc_placer_sampling (${placer2_run_name})" \
             placer_sampling_round2_outputs_exist do_placer_sampling_round2
+        run_step_pooled_replot "Stage 4d: plot_placer2_vs_placer1_rmsd (${placer2_run_name})" \
+            placer2_vs_placer1_rmsd_outputs_exist do_plot_placer2_vs_placer1_rmsd
     fi
 }
 

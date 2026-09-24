@@ -6,7 +6,7 @@ Given, per dataset, an apo/ground-state protein model, one or more PanDDA event 
 refines its conformation (and the surrounding protein sidechains) across several rounds, merges
 everything into one composite model, real-space refines it, optionally re-optimizes rotamers near
 the ligand, and finally rescores the surviving ligand pose with an independent statistical
-potential (DESPOT). Every stage is driven by `program.sh`, a single bash script that wires
+potential (DESPOT). Every stage is driven by `program.sh` , a single bash script that wires
 together several console tools from a local `qfit-3.0` checkout, an external PLACER install, and
 an external DESPOT install.
 

@@ -180,6 +180,11 @@ def build_placer_sampling_argparser(description):
                     help="Chain ID of the LIG ligand in sampled model files (default: C)")
     p.add_argument('--model-resi', type=int, default=1,
                     help="Residue number of the LIG ligand in sampled model files (default: 1)")
+    p.add_argument('--filter1-csv', default=None,
+                    help="Path to Stage 3d's pooled lig_vs_reference_rscc.csv (filter_run_name's "
+                         "reference-ligand match set). When given (mode B only), also writes "
+                         "placer_sampling_restricted.png/.csv restricted to reference ligands "
+                         "that found a match there - see restrict_to_filter_matched.")
     return p
 
 
@@ -423,11 +428,23 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
     """For a single dataset, returns one min-RMSD value per reference LIG
     conformation matched: the minimum symmetry-aware RMSD from that
     reference LIG to the closest sampled ligand conformer across every
-    model_dir.rglob(file_pattern) file. Each matched file may contain one or
-    many MODEL/ENDMDL blocks (e.g. PLACER's own multimodel *_model.pdb
-    outputs); every block is scored independently. If a block has no LIG
-    under model_chain/model_resi, falls back to any LIG in that block.
-    Empty list if model_dir/ref_path don't exist or nothing matches.
+    model_dir.glob(file_pattern) file (non-recursive - see below). Each
+    matched file may contain one or many MODEL/ENDMDL blocks (e.g. PLACER's
+    own multimodel *_model.pdb outputs); every block is scored independently.
+    If a block has no LIG under model_chain/model_resi, falls back to any LIG
+    in that block. Empty list if model_dir/ref_path don't exist or nothing
+    matches.
+
+    Deliberately non-recursive: callers' model_dir is a stage's own output
+    directory, which - for round-1 (calc_placer_sampling.py's mode A,
+    model_dir=<placer_run_name>/) - is also the parent of every later stage's
+    nested output directories (filter_run_name/, placer2_run_name/, and so
+    on). Round-2/final/rotamer's own refined outputs also end in
+    '*_refined.pdb'/'*_model.pdb', so an rglob here would silently score
+    round-1 against those later, more-refined structures instead of round-1's
+    own samples - making round-1 look better than it actually is (and any
+    round-1-vs-round-2 comparison meaningless). A plain, non-recursive glob
+    only ever sees files actually written directly into model_dir.
 
     Returns a list of {ref_chain, ref_resi, ref_altloc, rmsd, placer_file,
     model_idx} dicts, one per matched reference LIG conformation.
@@ -438,7 +455,7 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
     if not model_dir.exists() or not ref_path.exists():
         return []
 
-    model_files = sorted(model_dir.rglob(file_pattern))
+    model_files = sorted(model_dir.glob(file_pattern))
     if not model_files:
         return []
 
@@ -935,7 +952,7 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
 
     for pairs, suffix, title_suffix in [
         (all_pairs, '', ''),
-        (restricted_pairs, '_restricted', ' (restricted residues)'),
+        (restricted_pairs, '_restricted', ' (Restricted)'),
     ]:
         xs = [p['ref_rscc'] for p in pairs]
         ys = [p['structure_rscc'] for p in pairs]
@@ -943,7 +960,7 @@ def plot_residues_vs_ref(args, collect_structure_rscc, collect_restrict_labels,
         plot_rscc_scatter(
             xs, ys,
             xlabel='Reference RSCC', ylabel=f'{structure_label} RSCC',
-            title=f'{structure_label} RSCC vs Reference{title_suffix}',
+            title=f'{structure_label} vs Reference RSCC{title_suffix}',
             out_path=graphs_dir / out_name,
             color_by_density=True,
         )
@@ -1009,7 +1026,7 @@ def plot_residues_vs_ref_restricted(args, collect_structure_rscc, collect_restri
     plot_rscc_scatter(
         xs, ys,
         xlabel='Reference RSCC', ylabel=f'{structure_label} RSCC',
-        title=f'{structure_label} RSCC vs Reference (restricted residues)',
+        title=f'{structure_label} vs Reference RSCC',
         out_path=graphs_dir / out_name,
         color_by_density=True,
     )
@@ -1120,10 +1137,9 @@ def run_rotamer_vs_pipeline_pooled(args):
     graphs_dir.mkdir(parents=True, exist_ok=True)
 
     comparisons = [
-        ('final', 'Final-Refined RSCC', 'Rotamer-Refined RSCC vs Final-Refined (restricted residues)',
+        ('final', 'Final RSCC', 'Rotamer vs Final RSCC',
          'rotamer_refined_vs_final_refined_rscc_restricted'),
-        ('backbone', 'Backbone-Refined RSCC',
-         'Rotamer-Refined RSCC vs Backbone-Refined (restricted residues)',
+        ('backbone', 'Backbone RSCC', 'Rotamer vs Backbone RSCC',
          'rotamer_refined_vs_backbone_refined_rscc_restricted'),
     ]
 
@@ -1135,7 +1151,7 @@ def run_rotamer_vs_pipeline_pooled(args):
             continue
         plot_rscc_scatter(
             paired[xcol], paired['rotamer'],
-            xlabel=xlabel, ylabel='Rotamer-Refined RSCC', title=title,
+            xlabel=xlabel, ylabel='Rotamer RSCC', title=title,
             out_path=graphs_dir / out_name,
             color_by_density=True,
         )
@@ -1311,7 +1327,7 @@ def run_despot_energies_single(args):
 
         plot_rscc_histogram(
             df['normalized_score'],
-            title=f'DESPOT Ligand Binding Energies, normalized ({dataset})',
+            title=f'DESPOT Energy ({dataset})',
             xlabel='Normalized DESPOT Score (per heavy atom)', out_path=graphs_dir / out_name,
             value_range=None,
         )
@@ -1356,7 +1372,7 @@ def run_despot_energies_pooled(args):
     out_name = 'ligand_energies.png'
     plot_rscc_histogram(
         pooled_df['normalized_score'],
-        title='DESPOT Ligand Binding Energies, normalized (pooled)',
+        title='DESPOT Energy (Pooled)',
         xlabel='Normalized DESPOT Score (per heavy atom)', out_path=graphs_dir / out_name,
         value_range=None,
     )
@@ -2301,12 +2317,11 @@ def run_rscc_aggregator(args):
     placer-conformer-restricted one and only added noise.
     """
     datasets = read_datasets(args.datasets_file)
-    label = 'Protein'
 
     comparisons = [
-        ('apo', 'backbone', f'{label} RSCC: Backbone-Refined vs Apo', 'backbone_vs_apo'),
-        ('apo', 'final', f'{label} RSCC: Final-Refined vs Apo', 'final_vs_apo'),
-        ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined', 'final_vs_backbone'),
+        ('apo', 'backbone', 'Backbone vs Apo', 'backbone_vs_apo'),
+        ('apo', 'final', 'Final vs Apo', 'final_vs_apo'),
+        ('backbone', 'final', 'Final vs Backbone', 'final_vs_backbone'),
     ]
 
     for dataset in datasets:
@@ -2328,7 +2343,7 @@ def run_rscc_aggregator(args):
             plot_rscc_scatter(
                 paired[xcol], paired[ycol],
                 xlabel=f'{xcol.capitalize()} RSCC', ylabel=f'{ycol.capitalize()} RSCC',
-                title=f'{title} ({dataset}) (placer-conformer residues)',
+                title=f'{title} RSCC ({dataset})',
                 out_path=graphs_dir / out_name,
             )
             write_plot_csv(
@@ -2352,13 +2367,11 @@ def run_rscc_aggregator_pooled(args):
     saved alongside it in that same folder.
     """
     datasets = read_datasets(args.datasets_file)
-    label = 'Protein'
 
     comparisons = [
-        ('apo', 'backbone', f'{label} RSCC: Backbone-Refined vs Apo (pooled)', 'backbone_vs_apo'),
-        ('apo', 'final', f'{label} RSCC: Final-Refined vs Apo (pooled)', 'final_vs_apo'),
-        ('backbone', 'final', f'{label} RSCC: Final-Refined vs Backbone-Refined (pooled)',
-         'final_vs_backbone'),
+        ('apo', 'backbone', 'Backbone vs Apo', 'backbone_vs_apo'),
+        ('apo', 'final', 'Final vs Apo', 'final_vs_apo'),
+        ('backbone', 'final', 'Final vs Backbone', 'final_vs_backbone'),
     ]
 
     pooled_rows = []
@@ -2388,7 +2401,7 @@ def run_rscc_aggregator_pooled(args):
         plot_rscc_scatter(
             paired[xcol], paired[ycol],
             xlabel=f'{xcol.capitalize()} RSCC', ylabel=f'{ycol.capitalize()} RSCC',
-            title=f'{title} (placer-conformer residues)',
+            title=f'{title} RSCC',
             out_path=graphs_dir / out_name,
             color_by_density=True,
         )
@@ -2490,7 +2503,7 @@ def run_cluster_reps_pooled(args):
         pooled_df = pd.concat(rows, ignore_index=True)
         plot_rscc_histogram(
             pooled_df['rscc'],
-            title=f'Cluster-Rep RSCC ({stage_label}) (pooled)',
+            title=f'Cluster-Rep RSCC ({stage_label})',
             xlabel='RSCC',
             out_path=graphs_dir / out_name,
         )
@@ -2603,7 +2616,7 @@ def plot_filter2_vs_filter1_lig_rscc(args):
         plot_rscc_scatter(
             matched_x, matched_y,
             xlabel='Filter_1 RSCC', ylabel='Filter_2 RSCC',
-            title=f'Ligand RSCC: Filter_2 vs Filter_1 ({dataset})',
+            title=f'Filter_2 vs Filter_1 RSCC ({dataset})',
             out_path=graphs_dir / out_name,
             extra_text=f'Lost filter_1 -> filter_2: {n_lost}/{n_total_filter1}',
         )
@@ -2616,3 +2629,98 @@ def plot_filter2_vs_filter1_lig_rscc(args):
                 'filter_2_rscc': matched_y,
             }),
         )
+
+
+def restrict_to_filter_matched(df, filter1_csv, key_cols=('dataset', 'ref_chain', 'ref_resi',
+                                                            'ref_altloc')):
+    """Restricts df (must have key_cols) to the rows whose key also appears in filter1_csv - the
+    pooled lig_vs_reference_rscc.csv written by plot_lig_vs_ref_filter1.py (Stage 3d), one row
+    per reference LIG conformation that found a matching cluster-rep ligand within
+    args.centroid_cutoff after filter's (Stage 3a) spatial clustering. A reference ligand that
+    filter discarded entirely (no surviving cluster anywhere near it) never appears there, so
+    this excludes exactly those - round-2 PLACER samples for such a reference ligand can only
+    ever be refinements of an unrelated surviving cluster, so their nearest-sampled-model RMSD is
+    large and confounds a sampling-quality plot rather than measuring one.
+
+    Returns (restricted_df, filter1_csv_existed). If filter1_csv doesn't exist (e.g. -c wasn't
+    given at filter time), returns (df, False) unchanged - callers should skip/label the
+    restricted output rather than silently plot unrestricted data under a 'restricted' name.
+
+    A blank ref_altloc (the common case - most reference ligands have only one conformer) is
+    normalized to '' on both sides before merging. df may come straight from in-memory ligand
+    parsing (a genuine '' string) or from a round-tripped CSV (pd.read_csv turns a blank field
+    into NaN, not ''); filter1_csv is always the latter. Without this, '' would never equal NaN
+    and every blank-altloc reference ligand - i.e. nearly all of them - would silently fail to
+    match, collapsing the restriction down to just the handful of real (non-blank) altlocs."""
+    filter1_csv = Path(filter1_csv)
+    if not filter1_csv.exists():
+        return df, False
+    key_cols = list(key_cols)
+    matched_keys = pd.read_csv(filter1_csv)[key_cols].drop_duplicates()
+    df = df.copy()
+    df['ref_altloc'] = df['ref_altloc'].fillna('')
+    matched_keys['ref_altloc'] = matched_keys['ref_altloc'].fillna('')
+    return df.merge(matched_keys, on=key_cols, how='inner'), True
+
+
+def plot_placer2_vs_placer1_rmsd(round1_csv, round2_csv, out_dir, filter1_csv=None):
+    """Pooled (cross-dataset) scatter of calc_placer_sampling.py's minimum ligand RMSD
+    ('rmsd' - the best/closest sampled+refined model for that reference LIG conformation),
+    round-2 PLACER samples (y) vs round-1 PLACER samples (x), for every reference ligand -
+    identified by (dataset, ref_chain, ref_resi, ref_altloc), same key convention as every
+    other altloc-aware ligand match in this pipeline - present in BOTH placer_sampling.csv
+    files. A reference ligand fit_ligand/PLACER never sampled in one round (or the other)
+    contributes nothing here, same as any other pooled comparison in this pipeline.
+
+    round1_csv/round2_csv: paths to Stage 2c's and Stage 4c's own placer_sampling.csv (not
+    placer_sampling_unrefined.csv - only the refined comparison is done here, per request).
+    out_dir: written into directly - by convention the caller passes round2's own
+    placer_sampling.csv's directory (GRAPHS_DIR/<run>/<placer_run_name>/<filter_run_name>/
+    <placer2_run_name>/), since this comparison is naturally a round-2/Stage-4c artifact.
+    filter1_csv: optional - Stage 3d's pooled lig_vs_reference_rscc.csv. When given, the merged
+    pairs are further restricted via restrict_to_filter_matched to reference ligands that had a
+    match in filter (Stage 3a) - see that function's docstring for why (unmatched reference
+    ligands otherwise pollute this plot with large, meaningless RMSDs against an unrelated
+    surviving cluster). None (default) keeps the previous unrestricted behavior.
+    """
+    round1_csv, round2_csv = Path(round1_csv), Path(round2_csv)
+    if not round1_csv.exists() or not round2_csv.exists():
+        print(f'  Missing placer_sampling.csv (round1={round1_csv.exists()}, '
+              f'round2={round2_csv.exists()}); skipping placer2_vs_placer1_rmsd.')
+        return
+
+    key_cols = ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc']
+    round1_df = pd.read_csv(round1_csv)[key_cols + ['rmsd']]
+    round2_df = pd.read_csv(round2_csv)[key_cols + ['rmsd']]
+    merged = round1_df.merge(round2_df, on=key_cols, suffixes=('_placer1', '_placer2'))
+
+    if merged.empty:
+        print('  No reference ligand(s) shared between placer_1 and placer2 '
+              'placer_sampling.csv; skipping placer2_vs_placer1_rmsd.')
+        return
+
+    title = 'Placer2 vs Placer_1 RMSD'
+    if filter1_csv is not None:
+        merged, filter1_existed = restrict_to_filter_matched(merged, filter1_csv)
+        if filter1_existed:
+            title += ' (Filter-Matched)'
+        else:
+            print(f'  filter1 lig_vs_reference_rscc.csv not found at {filter1_csv}; '
+                  f'plotting placer2_vs_placer1_rmsd unrestricted.')
+        if merged.empty:
+            print('  No reference ligand(s) remain after restricting to filter (stage 3) '
+                  'matched ligands; skipping placer2_vs_placer1_rmsd.')
+            return
+
+    out_dir = Path(out_dir)
+    out_name = 'placer2_vs_placer1_rmsd.png'
+    x, y = merged['rmsd_placer1'], merged['rmsd_placer2']
+    plot_rscc_scatter(
+        x, y,
+        xlabel='Placer_1 Minimum Ligand RMSD (Å)', ylabel='Placer2 Minimum Ligand RMSD (Å)',
+        title=title,
+        out_path=out_dir / out_name,
+        axis_range=_auto_axis_range(x, y),
+        color_by_density=True,
+    )
+    write_plot_csv(out_dir, out_name, merged)
