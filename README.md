@@ -48,7 +48,7 @@ Point `program.sh`'s `RUN_PLACER_PY` variable at that checkout's `run_PLACER.py`
 Also a separate repository:
 
 ```bash
-git clone https://github.com/KUL-LBMD/DESPOT.git
+git clone https://github.com/nikegupta/DESPOT
 cd DESPOT
 conda env create -f environment.yml
 conda activate DESPOT
