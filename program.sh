@@ -128,6 +128,7 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--f1_halogen_rscc_floor <float>] [--f2_halogen_rscc_floor <float>]
            [--despot_threshold <float>]
            [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
+           [--despot_pareto_margin_std <float>]
            [--fit_ligand_rmsd_cutoff <float>] [--fit_ligand_clash_mode <all-atom|backbone>]
            [--fit_ligand_peak_grouping <symmetry|zscore>] [--fit_ligand_symmetry_tolerance <float>]
            [--fit_ligand_contact_cutoff <float>] [--fit_ligand_contact_fraction <float>]
@@ -245,6 +246,10 @@ Options:
                                     Default: 0.6.
   --despot_rscc_weight <float>     Despot: weight on normalized DESPOT score when picking the
                                     Pareto-front winner. Default: 0.05.
+  --despot_pareto_margin_std <float>  Despot: breathing room (in standard deviations of each
+                                    axis) a candidate must beat another by, in both MSE and
+                                    normalized DESPOT score, to dominate it for the Pareto
+                                    front. Default: 0.05.
 
 Examples:
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1
@@ -481,6 +486,7 @@ rsr_moved_threshold=""
 despot_threshold=""
 despot_rscc_threshold=""
 despot_rscc_weight=""
+despot_pareto_margin_std=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -574,6 +580,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --despot_rscc_weight)
             despot_rscc_weight="$2"
+            shift 2
+            ;;
+        --despot_pareto_margin_std)
+            despot_pareto_margin_std="$2"
             shift 2
             ;;
         --fit_ligand_rmsd_cutoff)
@@ -840,6 +850,7 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--despot_threshold" "${despot_threshold:-<default: -1.0>}"
     printf '  %-38s %s\n' "--despot_rscc_threshold" "${despot_rscc_threshold:-<default: 0.6>}"
     printf '  %-38s %s\n' "--despot_rscc_weight" "${despot_rscc_weight:-<default: 0.05>}"
+    printf '  %-38s %s\n' "--despot_pareto_margin_std" "${despot_pareto_margin_std:-<default: 0.05>}"
     echo "======================="
 }
 print_run_parameters
@@ -915,7 +926,7 @@ export rotamer_rscc_threshold rotamer_rscc_improvement_threshold
 export revert_min_diff
 export bfactor expand_distance_cutoff
 export rsr_n_cycles rsr_map_weight rsr_backbone_cutoff rsr_moved_threshold
-export despot_threshold despot_rscc_threshold despot_rscc_weight
+export despot_threshold despot_rscc_threshold despot_rscc_weight despot_pareto_margin_std
 export BASE_DIR DATASETS_DIR DATASETS_FILE CSV_FILE LIG_PDB_DIR ASSIGN_BOND_ORDERS_PY
 export RSR_SCRIPT_LIGAND RSR_SCRIPT_PROTEIN RSR_SCRIPT_FINAL
 export ANALYSIS_SCRIPTS_DIR PLOT_CLUSTER_REPS_PY AGGREGATE_PROTEIN_RSCC_PY AGGREGATE_LIG_RSCC_PY
@@ -3847,6 +3858,7 @@ despot_process_dataset() {
     [ -n "$despot_threshold" ] && despot_filter_args+=(--despot-threshold "$despot_threshold")
     [ -n "$despot_rscc_threshold" ] && despot_filter_args+=(--rscc-threshold "$despot_rscc_threshold")
     [ -n "$despot_rscc_weight" ] && despot_filter_args+=(--rscc-weight "$despot_rscc_weight")
+    [ -n "$despot_pareto_margin_std" ] && despot_filter_args+=(--pareto-margin-std "$despot_pareto_margin_std")
     [ -n "$bfactor" ] && despot_filter_args+=(--bfactor "$bfactor")
 
     step_start_time=$(date +%s)
