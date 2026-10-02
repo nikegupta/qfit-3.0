@@ -554,11 +554,20 @@ def plot_distance_histogram(values, title, xlabel, out_path, bin_width=1.0, colo
     print(f'  Histogram saved to: {out_path}')
 
 
-def plot_count_histogram(values, title, xlabel, out_path, color='steelblue'):
+def plot_count_histogram(values, title, xlabel, out_path, color='steelblue', show_total=False,
+                          extra_stats=None):
     """Histogram of small non-negative integer counts (one value per
     dataset), with integer-centered bins and a mean/median stats box - no
     RSCC/distance-specific axis range or threshold line, unlike
-    plot_rscc_histogram/plot_distance_histogram."""
+    plot_rscc_histogram/plot_distance_histogram. show_total: also adds the
+    summed total across all datasets to the stats box (e.g. total
+    symmetry-mate matches found, not just the per-dataset mean/median) -
+    default False preserves every existing caller's plot exactly.
+    extra_stats: optional {label: value_str} dict of additional lines
+    appended to the stats box as-is (e.g. {'Percentage': '12.3%'} for a
+    ratio the histogram's own per-dataset values can't express by
+    themselves, such as total matches over total poses checked across
+    every dataset) - default None adds nothing, same as before."""
     values = np.asarray(values, dtype=float)
     values = values[~np.isnan(values)]
     if len(values) == 0:
@@ -576,9 +585,40 @@ def plot_count_histogram(values, title, xlabel, out_path, color='steelblue'):
     plt.grid(True, alpha=0.3)
 
     stats_text = f'Mean:   {values.mean():.2f}\nMedian: {np.median(values):.2f}'
+    if show_total:
+        stats_text += f'\nTotal:  {int(values.sum())}'
+    if extra_stats:
+        for label, value in extra_stats.items():
+            stats_text += f'\n{label}: {value}'
     plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes,
               va='top', ha='right', fontsize=10,
               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f'  Histogram saved to: {out_path}')
+
+
+def plot_percentage_bar_chart(labels, percentages, counts, title, out_path, color='steelblue'):
+    """Categorical bar chart of percentages (e.g. a yes/no outcome's share of some total),
+    each bar labeled with its percentage and underlying count - used for
+    check_excess_symmetry_mates.py's excess_symmetry_mates.png (is each excess ligand a
+    symmetry mate of a reference ligand?). A two-(or few-)category summary, not a numeric
+    distribution, so plot_count_histogram/plot_distance_histogram's binned-value style doesn't
+    apply. labels/percentages/counts are parallel lists, one entry per category; percentages
+    should already be 0-100 and are shown as given (not renormalized)."""
+    total = sum(counts)
+    plt.figure(figsize=(6, 6))
+    bars = plt.bar(labels, percentages, edgecolor='black', alpha=0.7, color=color)
+    for bar, pct, cnt in zip(bars, percentages, counts):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                  f'{pct:.1f}%\n(n={cnt})', ha='center', va='bottom', fontsize=10)
+    plt.ylabel('Percentage', fontsize=12)
+    plt.ylim(0, 100)
+    plt.title(f'{title} (n={total})', fontsize=13)
+    plt.grid(True, alpha=0.3, axis='y')
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()

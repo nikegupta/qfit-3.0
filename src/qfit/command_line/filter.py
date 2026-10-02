@@ -141,13 +141,29 @@ def build_argparser():
              "Interpreted as an all-atom RMSD or a centroid-centroid "
              "distance depending on --clustering_mode. (default: 4.0)",
     )
+    p.add_argument(
+        "--halogen_rscc_floor",
+        default=0.3,
+        metavar="<float>",
+        type=float,
+        help="Halogen RSCC filtering: for a cluster rep whose ligand contains "
+             "a Br or I atom, the RSCC is recomputed with that atom (every "
+             "Br/I atom, if more than one) excluded, against the same event "
+             "map that gave the rep's full-ligand RSCC. If that halogen-less "
+             "RSCC falls below this value, the rep is rejected - a low value "
+             "means the full-ligand RSCC was being propped up by the "
+             "halogen's disproportionately strong density signal rather than "
+             "a good fit of the rest of the ligand. Runs after RSCC filtering "
+             "and before per-placer_file de-duplication. (default: 0.3)",
+    )
     return p
 
 class Filter():
     def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder,
                  resolution, filter_proportion=0.1, min_cluster_proportion=0.1,
                  clash_vdw_scale=0.75, rscc_cutoff=0.6,
-                 clustering_mode='all-atom', clustering_cutoff=4.0):
+                 clustering_mode='all-atom', clustering_cutoff=4.0,
+                 halogen_rscc_floor=0.3):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.fit_ligand_files = fit_ligand_files
@@ -189,6 +205,13 @@ class Filter():
         # interpreted as an all-atom RMSD or a centroid distance depending on
         # self.clustering_mode.
         self.clustering_cutoff = clustering_cutoff
+
+        # Halogen RSCC filtering (_filterHalogenOverfit): a Br/I atom's
+        # disproportionately strong density signal can make a cluster rep's
+        # full-ligand RSCC look good even when the rest of the ligand fits
+        # poorly. A rep is rejected if its RSCC, recomputed with its Br/I
+        # atom(s) excluded against the same event map, falls below this.
+        self.halogen_rscc_floor = halogen_rscc_floor
 
         self._load_event_maps()
 
@@ -365,6 +388,16 @@ class Filter():
 
             print(f'number of reps after rscc filtering: {len(self.cluster_reps)}')
 
+            #halogen RSCC filtering: reject reps whose full-ligand RSCC is
+            #propped up by a disproportionately strong Br/I signal (see
+            #_filterHalogenOverfit). Runs after RSCC filtering and before
+            #per-placer_file de-duplication, so a rejected rep never gets the
+            #chance to win its placer_file's slot below.
+            self._filterHalogenOverfit()
+            passed_halogen_ids = set(self.cluster_reps.keys())
+
+            print(f'number of reps after halogen rscc filtering: {len(self.cluster_reps)}')
+
             #filter down to best structure from each placer_file
             filtered_cluster_reps = {}
             visited = []
@@ -403,6 +436,8 @@ class Filter():
                     cluster_status[cluster_id] = 'failed_count_cutoff'
                 elif cluster_id not in passed_rscc_ids:
                     cluster_status[cluster_id] = 'failed_rscc_cutoff'
+                elif cluster_id not in passed_halogen_ids:
+                    cluster_status[cluster_id] = 'failed_halogen_rscc_floor'
                 elif cluster_id not in accepted_ids:
                     cluster_status[cluster_id] = 'lost_per_placer_file_dedup'
                 elif cluster_id in self.clash_rejected_ids:
@@ -430,7 +465,8 @@ class Filter():
             cluster_members_csv = output_folder + '/cluster_members.csv'
             self._write_cluster_members_csv(
                 self.clusters, self.scores, unfiltered_cluster_reps,
-                unfiltered_cluster_rsccs, cluster_status, cluster_members_csv
+                unfiltered_cluster_rsccs, cluster_status, self.halogen_rscc_without_halogen,
+                cluster_members_csv
             )
             print(f'full cluster membership and rejection reasons written to {cluster_members_csv}')
 
@@ -472,7 +508,8 @@ class Filter():
                 f.write(f'{placer_file},{index},{mse},{cluster_id},{rscc},{num_members}')
                 f.write('\n')
 
-    def _write_cluster_members_csv(self, clusters, scores, cluster_reps, cluster_rsccs, cluster_status, path):
+    def _write_cluster_members_csv(self, clusters, scores, cluster_reps, cluster_rsccs,
+                                    cluster_status, halogen_rscc_without_halogen, path):
         """
         Writes a csv covering every input placer model conformer that was
         scored (every placer_file/index pair in `scores`), with its cluster
@@ -488,8 +525,13 @@ class Filter():
                                       gets carried forward into RSCC scoring
                                       and filtering
           cluster_rscc             : the RSCC computed for that representative
+          halogen_rscc_without_halogen : only populated for a representative
+                                      whose ligand contains Br/I (see
+                                      _filterHalogenOverfit) - its RSCC with
+                                      the halogen excluded; empty otherwise
           cluster_status           : 'accepted', 'failed_count_cutoff',
                                       'failed_rscc_cutoff',
+                                      'failed_halogen_rscc_floor',
                                       'lost_per_placer_file_dedup', or
                                       'failed_clash_filter (vs <placer_file>)'
                                       - why the representative (and therefore
@@ -509,6 +551,9 @@ class Filter():
         index). `cluster_reps`/`cluster_rsccs` should be the *unfiltered*
         snapshots covering every raw cluster_id. `cluster_status` maps every
         raw cluster_id to its final disposition.
+        `halogen_rscc_without_halogen` is self.halogen_rscc_without_halogen
+        (cluster_id -> halogen-less RSCC, only for halogen-containing reps
+        that were actually checked by _filterHalogenOverfit).
         """
         cluster_of = {}
         for cluster_id, members in clusters.items():
@@ -517,7 +562,7 @@ class Filter():
 
         with open(path, 'w+') as f:
             f.write('placer_file,index,mse,cluster,cluster_rep_placer_file,'
-                    'cluster_rep_index,cluster_rscc,cluster_status')
+                    'cluster_rep_index,cluster_rscc,halogen_rscc_without_halogen,cluster_status')
             f.write('\n')
             for placer_file, score_list in scores.items():
                 for index, mse in enumerate(score_list):
@@ -526,49 +571,156 @@ class Filter():
                         rep_placer_file = ''
                         rep_index = ''
                         rscc = ''
+                        halogen_rscc = ''
                         status = 'not_clustered'
                     else:
                         rep_placer_file = cluster_reps[cluster_id][1]
                         rep_index = cluster_reps[cluster_id][2]
                         rscc = cluster_rsccs[cluster_id]
+                        halogen_rscc = halogen_rscc_without_halogen.get(cluster_id, '')
                         status = cluster_status[cluster_id]
 
                     f.write(f'{placer_file},{index},{mse},{cluster_id},{rep_placer_file},'
-                            f'{rep_index},{rscc},{status}')
+                            f'{rep_index},{rscc},{halogen_rscc},{status}')
                     f.write('\n')
+
+    def _rsccForEventMap(self, ligand, ligand_coor, event_map_name):
+        """
+        Computes the RSCC of ligand_coor (matching ligand's atom order)
+        against a single named event map (a key of self.event_maps). Shared
+        by _bestRsccAcrossEventMaps (which picks the best-fitting map) and
+        _filterHalogenOverfit (which must reuse one specific, already-chosen
+        map rather than re-searching for the best one - see there for why).
+        """
+        scaled_bulk_solvent = 0 #from qfit, maybe should be different
+        default_bfactor = 20 #can change
+
+        #make a transformer for this structure
+        transformer = get_transformer("qfit", ligand, self.event_maps_models[event_map_name])
+
+        #convert and score this set of rotamers
+        mask = transformer.get_conformers_mask([ligand_coor], self._rmask)
+        target = self.event_maps[event_map_name].array[mask]
+
+        for density in transformer.get_conformers_densities([ligand_coor],[default_bfactor]):
+            model = density[mask]
+            np.maximum(model, scaled_bulk_solvent, out=model)
+            correlation_matrix = np.corrcoef(model, target)
+            rscc = correlation_matrix[0, 1]
+
+        return rscc
+
+    def _bestRsccAcrossEventMaps(self, ligand, ligand_coor):
+        """
+        Returns (best_rscc, best_event_map_name): the RSCC of ligand_coor
+        against whichever loaded event map it fits best, and that map's name
+        (so a later, separate RSCC computation - see _filterHalogenOverfit -
+        can be pinned to the exact same map instead of independently
+        re-maxing over every map again).
+        """
+        best_rscc = None
+        best_event_map_name = None
+        for event_map_name in list(self.event_maps.keys()):
+            rscc = self._rsccForEventMap(ligand, ligand_coor, event_map_name)
+            if best_rscc is None or rscc > best_rscc:
+                best_rscc = rscc
+                best_event_map_name = event_map_name
+        return best_rscc, best_event_map_name
 
     def _calcRSCCofClusters(self):
         self.cluster_rsccs = {}
+        self.cluster_best_event_map = {}
         for cluster_id in self.cluster_reps:
             placer_file = self.cluster_reps[cluster_id][1]
             ligand_coor = self.cluster_reps[cluster_id][3]
 
-            scaled_bulk_solvent = 0 #from qfit, maybe should be different
-
             #extract ligand from binding site and coor sets
             ligand = self.base_binding_sites[placer_file].extract('resname LIG')
 
-            #make bfactor array
-            default_bfactor = 20 #can change 
+            best_rscc, best_event_map_name = self._bestRsccAcrossEventMaps(ligand, ligand_coor)
+            self.cluster_rsccs[cluster_id] = best_rscc
+            self.cluster_best_event_map[cluster_id] = best_event_map_name
 
-            rsccs = []
-            for event_map_name in  list(self.event_maps.keys()):
-                #make a transformer for this structure
-                transformer = get_transformer("qfit", ligand, self.event_maps_models[event_map_name])
+    def _filterHalogenOverfit(self):
+        """
+        Guards against Br/I's disproportionately large contribution to RSCC:
+        a heavy halogen's strong, highly localized density signal can make a
+        cluster rep's full-ligand RSCC look good even when the rest of the
+        ligand fits the density poorly (e.g. x4158, where an iodine's fit
+        inflated one cluster's RSCC over a visually better-fit competing
+        cluster).
 
-                #convert and score this set of rotamers
-                mask = transformer.get_conformers_mask([ligand_coor], self._rmask)
-                target = self.event_maps[event_map_name].array[mask]
+        For every current cluster rep (i.e. those that already passed count
+        and RSCC filtering) whose ligand contains a Br or I atom, recomputes
+        RSCC with every Br/I atom excluded, against the *same* event map that
+        produced self.cluster_rsccs[cluster_id] (self.cluster_best_event_map,
+        set by _calcRSCCofClusters) - deliberately not re-searching for that
+        sub-ligand's own best-fitting map, since switching maps could make the
+        halogen-less score look arbitrarily good or bad for reasons unrelated
+        to the halogen itself. Rejects the rep if that halogen-less RSCC falls
+        below self.halogen_rscc_floor.
 
-                for density in transformer.get_conformers_densities([ligand_coor],[default_bfactor]):
-                    model = density[mask]         
-                    np.maximum(model, scaled_bulk_solvent, out=model)  
-                    correlation_matrix = np.corrcoef(model, target)
-                    rscc = correlation_matrix[0, 1]
-                    rsccs.append(rscc)
-            
-            best_rscc = max(rsccs)
-            self.cluster_rsccs.update({cluster_id: best_rscc})
+        Note this is an absolute floor on the halogen-less RSCC, not a cap on
+        how much the RSCC is allowed to drop: a rep with a very high
+        full-ligand RSCC can tolerate a large *drop* and still be a perfectly
+        good fit (e.g. 0.96 -> 0.63 is still a real, usable correlation), so
+        thresholding on the drop itself would reject good reps just for
+        starting from a high full-ligand RSCC. Thresholding on the resulting
+        value directly asks the right question: does the rest of the ligand,
+        on its own, fit the density at all?
+
+        Runs after RSCC filtering and before per-placer_file de-duplication,
+        so a rejected rep never gets the chance to win its placer_file's slot
+        there, and a different, non-overfit cluster from that same
+        placer_file can be selected instead.
+
+        Records:
+        self.halogen_rejected_ids       : set of cluster_ids dropped by this filter
+        self.halogen_rscc_without_halogen : cluster_id -> the halogen-less RSCC,
+                                     for every halogen-containing rep that was
+                                     checked (kept or rejected) - empty for
+                                     reps without a Br/I atom.
+        """
+        self.halogen_rejected_ids = set()
+        self.halogen_rscc_without_halogen = {}
+
+        kept_cluster_reps = {}
+        for cluster_id, rep in self.cluster_reps.items():
+            placer_file = rep[1]
+            ligand_coor = rep[3]
+
+            ligand = self.base_binding_sites[placer_file].extract('resname LIG')
+            # Flatten (_selection -> None) before using a boolean mask with
+            # get_selected_structure below - matches the pattern already used
+            # on self.base_structure/_collapse_altlocs: get_selected_structure
+            # applies the given selection directly against the object's raw
+            # _atoms pool, bypassing any selection already on `ligand` (the
+            # one narrowing it down to just the LIG residue), so a mask built
+            # from the current (already-LIG-only) view would be the wrong
+            # length/indexing unless that pending selection is flattened in
+            # first.
+            flat_ligand = ligand.get_selected_structure(None)
+
+            elements = np.array([e.strip().upper() for e in flat_ligand.e])
+            halogen_mask = np.isin(elements, ['BR', 'I'])
+
+            if not halogen_mask.any():
+                kept_cluster_reps[cluster_id] = rep
+                continue
+
+            sub_ligand = flat_ligand.get_selected_structure(~halogen_mask)
+            sub_ligand_coor = ligand_coor[~halogen_mask]
+
+            event_map_name = self.cluster_best_event_map[cluster_id]
+            rscc_without_halogen = self._rsccForEventMap(sub_ligand, sub_ligand_coor, event_map_name)
+            self.halogen_rscc_without_halogen[cluster_id] = rscc_without_halogen
+
+            if rscc_without_halogen < self.halogen_rscc_floor:
+                self.halogen_rejected_ids.add(cluster_id)
+            else:
+                kept_cluster_reps[cluster_id] = rep
+
+        self.cluster_reps = kept_cluster_reps
 
     def _filter_clashes(self):
         """
@@ -1065,7 +1217,8 @@ def main():
     filter = Filter(args.dataset, placer_files, fit_ligand_files, args.output_folder,
                      args.resolution, args.filter_proportion, args.min_cluster_proportion,
                      args.clash_vdw_scale, args.rscc_cutoff,
-                     args.clustering_mode, args.clustering_cutoff)
+                     args.clustering_mode, args.clustering_cutoff,
+                     args.halogen_rscc_floor)
     filter.run()
 
 
