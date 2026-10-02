@@ -18,6 +18,10 @@ from qfit.command_line.sidechain_clash import (
     SidechainClashResolver, CLASH_VDW_SCALE, HBOND_CLASH_VDW_SCALE, MAX_CLASH_GROUP_SIZE,
     MAX_CLASH_GROUP_EXPANSIONS, CLASH_DOMAIN_TOP_K, CLASH_SOLVE_NODE_BUDGET,
 )
+from qfit.command_line.ligand_clash import (
+    ligand_instances_from_multimodel, exclude_ligand_clashing_candidates, write_ligand_clash_csv,
+    LIGAND_CLASH_PREFILTER_MARGIN,
+)
 
 BACKBONE_ATOM_NAMES = {'N', 'CA', 'C', 'O', 'OXT'}
 
@@ -146,6 +150,19 @@ def build_argparser():
              "allowed per clash group before falling back to a heuristic (ICM) "
              f"reassignment (default: {CLASH_SOLVE_NODE_BUDGET})",
     )
+    p.add_argument(
+        "--ligand_clash_prefilter_margin",
+        default=LIGAND_CLASH_PREFILTER_MARGIN,
+        metavar="<float>",
+        type=float,
+        help="Ligand clash detection: a residue's candidate conformers are only checked "
+             "against a given surviving ligand instance (every row of filter2's own "
+             "cluster_reps.csv) when the residue's own bounding sphere (centroid + max reach "
+             "across all its gathered candidates) comes within this many Angstrom of the "
+             f"ligand instance's own bounding sphere (default: {LIGAND_CLASH_PREFILTER_MARGIN}). "
+             "Clashing candidates (--clash_vdw_scale/--hbond_clash_vdw_scale, sidechain atoms "
+             "only) are excluded before MSE scoring ever runs on them.",
+    )
     return p
 
 
@@ -156,7 +173,8 @@ class FinalModelBuilder():
                  max_clash_group_size=MAX_CLASH_GROUP_SIZE,
                  max_clash_group_expansions=MAX_CLASH_GROUP_EXPANSIONS,
                  clash_domain_top_k=CLASH_DOMAIN_TOP_K,
-                 clash_solve_node_budget=CLASH_SOLVE_NODE_BUDGET):
+                 clash_solve_node_budget=CLASH_SOLVE_NODE_BUDGET,
+                 ligand_clash_prefilter_margin=LIGAND_CLASH_PREFILTER_MARGIN):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.multimodel_pdb = multimodel_pdb
@@ -169,6 +187,7 @@ class FinalModelBuilder():
         self.max_clash_group_expansions = max_clash_group_expansions
         self.clash_domain_top_k = clash_domain_top_k
         self.clash_solve_node_budget = clash_solve_node_budget
+        self.ligand_clash_prefilter_margin = ligand_clash_prefilter_margin
 
         self._rmask = 0.5 + self.resolution / 3.0 #from qfit
 
@@ -235,12 +254,11 @@ class FinalModelBuilder():
         each residue (falling back to the apo conformation when needed), plus
         every ligand pose from the multimodel pdb - to output_folder/final_model.pdb.
 
-        No clash checking is done against the ligand poses at all - a ligand
-        pose that badly clashes with the surrounding protein gets reselected
-        downstream (DESPOT), and a genuinely correct sidechain rotamer that
-        happens to sit close to the true ligand density is expected to be far
-        more common than the reverse, so filtering candidate rotamers by
-        ligand clash would systematically reject good conformers. Independently
+        Candidate conformers that clash with a surviving ligand instance (every row of
+        filter2's own cluster_reps.csv - see ligand_clash.py) are excluded before MSE scoring
+        ever runs on them - _filterLigandClashingConformers, called below. A residue whose
+        every candidate gets excluded this way falls back to its apo conformation via
+        _scoreAndSelectBest's own pre-existing "if not conformers" path. Independently
         best-scoring residues can still clash with EACH OTHER though - see
         _resolveSidechainClashes, called from _scoreAndSelectBest.
 
@@ -280,6 +298,10 @@ class FinalModelBuilder():
             print(self.multimodel_pdb)
             self.multimodel_models = Structure.fromfile(str(self.multimodel_pdb)).split_models()
             print(f'{len(self.multimodel_models)} model(s) in multimodel pdb')
+
+            self._ligand_instances = ligand_instances_from_multimodel(self.multimodel_models)
+            print(f'{len(self._ligand_instances)} surviving ligand instance(s) for clash '
+                  f'checking')
 
             #find every protein residue in the apo structure. A residue only
             #actually goes through scoring/clash-checking below if PLACER
@@ -326,6 +348,13 @@ class FinalModelBuilder():
                 missing_str = ', '.join(f'{chain_id}{res_num}' for chain_id, res_num in missing_residues)
                 print(f'FLAG: {len(missing_residues)} residue(s) had no conformers in '
                       f'any placer file (not a dealbreaker, just flagging for awareness): {missing_str}')
+
+            #drop any gathered conformer that clashes with a surviving ligand instance,
+            #before MSE scoring below ever runs on it - see ligand_clash.py and this
+            #method's own docstring
+            time0 = time.time()
+            self._filterLigandClashingConformers(output_folder)
+            print(f'filtered ligand-clashing conformers in {time.time() - time0:.2f}s')
 
             #score every conformer of every residue (pooled mask per residue, MSE
             #against the first event map only - see _scoreResidueConformers) and
@@ -489,6 +518,58 @@ class FinalModelBuilder():
                   f'{", ".join(collapsed)}')
 
         return residue_templates, residue_conformers
+
+    def _filterLigandClashingConformers(self, output_folder):
+        """Drops any gathered PLACER conformer (self.residue_conformers) that clashes with a
+        surviving ligand instance (self._ligand_instances - every row of filter2's own
+        cluster_reps.csv, see ligand_instances_from_multimodel), before _scoreAndSelectBest
+        ever scores it against the map. Only sidechain atoms are checked (backbone atoms are
+        exempt, same as every other clash check in this project); a residue with no sidechain
+        atoms (e.g. glycine) is left untouched.
+
+        A residue whose every gathered conformer ends up excluded here is left with an empty
+        self.residue_conformers[key] list - handled by _scoreAndSelectBest's own pre-existing
+        "if not conformers" path (falls back to the apo conformation), no special-casing needed
+        here.
+
+        Writes ligand_clash_filtered.csv to output_folder: chain_id, residue_number,
+        n_candidates_sampled, n_excluded_for_ligand_clash, reset_to_apo_due_to_clash - one row
+        per residue that had >=1 gathered conformer before this filtering step.
+        """
+        rows = []
+        for key, conformers in self.residue_conformers.items():
+            if not conformers:
+                continue
+            template = self.residue_templates[key]
+            if template is None:
+                continue
+
+            sidechain_mask = ~np.isin(np.asarray(template.name), list(BACKBONE_ATOM_NAMES))
+            n_sampled = len(conformers)
+            if not sidechain_mask.any():
+                rows.append((key[0], key[1], n_sampled, 0))
+                continue
+
+            coor_arr = np.stack([c[0][sidechain_mask] for c in conformers], axis=0)
+            vdw = np.asarray(template.vdw_radius)[sidechain_mask]
+            e = np.asarray(template.e)[sidechain_mask]
+
+            keep_mask, n_excluded = exclude_ligand_clashing_candidates(
+                coor_arr, vdw, e, self._ligand_instances,
+                clash_vdw_scale=self.clash_vdw_scale,
+                hbond_clash_vdw_scale=self.hbond_clash_vdw_scale,
+                margin=self.ligand_clash_prefilter_margin,
+            )
+            if n_excluded:
+                self.residue_conformers[key] = [c for c, keep in zip(conformers, keep_mask) if keep]
+            rows.append((key[0], key[1], n_sampled, n_excluded))
+
+        csv_path = output_folder + '/ligand_clash_filtered.csv'
+        n_reset = write_ligand_clash_csv(csv_path, rows)
+        if n_reset:
+            print(f'WARNING: {n_reset} residue(s) had every sampled conformer excluded for '
+                  f'ligand clash - reset to apo.')
+        print(f'ligand clash filtering written to {csv_path}')
 
     def _scoreResidueConformers(self, template, coor_list):
         """Scores every conformer coordinate set of one protein residue against
@@ -767,7 +848,8 @@ def main():
                                  args.apo_structure, args.output_folder, args.resolution,
                                  args.clash_vdw_scale, args.hbond_clash_vdw_scale,
                                  args.max_clash_group_size, args.max_clash_group_expansions,
-                                 args.clash_domain_top_k, args.clash_solve_node_budget)
+                                 args.clash_domain_top_k, args.clash_solve_node_budget,
+                                 args.ligand_clash_prefilter_margin)
     builder.run()
 
 

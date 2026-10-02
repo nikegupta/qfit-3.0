@@ -125,12 +125,16 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--f2_filter_proportion <float>] [--f2_min_cluster_proportion <float>]
            [--f2_rscc_cutoff <float>] [--f2_clustering_mode <all-atom|centroid>]
            [--f2_clustering_cutoff <float>] [--f1_clash_vdw_scale <float>] [--f2_clash_vdw_scale <float>]
+           [--f1_halogen_rscc_floor <float>] [--f2_halogen_rscc_floor <float>]
            [--despot_threshold <float>]
            [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
-           [--fit_ligand_rmsd_cutoff <float>]
+           [--fit_ligand_rmsd_cutoff <float>] [--fit_ligand_clash_mode <all-atom|backbone>]
+           [--fit_ligand_peak_grouping <symmetry|zscore>] [--fit_ligand_symmetry_tolerance <float>]
+           [--fit_ligand_contact_cutoff <float>] [--fit_ligand_contact_fraction <float>]
            [--clash_vdw_scale <float>] [--hbond_clash_vdw_scale <float>]
            [--max_clash_group_size <int>] [--max_clash_group_expansions <int>]
            [--clash_domain_top_k <int>] [--clash_solve_node_budget <int>]
+           [--ligand_clash_prefilter_margin <float>]
            [--rotamer_rscc_threshold <float>] [--rotamer_rscc_improvement_threshold <float>]
            [--revert_min_diff <float>] [--bfactor <float>] [--expand_distance_cutoff <float>]
            [--rsr_n_cycles <int>] [--rsr_map_weight <float>]
@@ -140,8 +144,15 @@ Only <run_name> is required. Supplying fewer than all eight names runs only
 that many stages of the pipeline (see header comment for the stage list).
 
 Options:
-  -n <num_placer_confs>    Number of PLACER conformers for round 1 (placer -n). Default: 1000
-  -n2 <num_placer2_confs>  Number of PLACER conformers for round 2 (placer2 -n). Default: 1000
+  -n <num_placer_confs>    Number of PLACER conformers for round 1 (placer -n). Default: 100
+  -n2 <num_placer2_confs>  Number of PLACER conformers for round 2 (placer2 -n). Default: 251
+                           (251, not a round number: DESPOT's score_complex.py has an
+                           off-by-one chunking bug that crashes with "ValueError: No
+                           objects to concatenate" whenever the total number of placer2
+                           conformers sent to it - num_placer2_confs * (number of
+                           surviving filter_1 cluster_reps) - lands exactly on a multiple
+                           of its CHUNK_SIZE (2000, 4000, ...); 251 avoids landing on
+                           those multiples for any plausible cluster_reps count.
   -g <gpu_ids>             Comma-separated GPU ids for both PLACER rounds. Default: 0
   -p <num_parallel>        CPU parallelism for every non-PLACER stage 
   -c                       Also compare results to the reference set (REF_SET). 
@@ -159,6 +170,23 @@ Options:
   --num_peaks <int>                Fit_ligand: number of peaks to find. Default: 100.
   --fit_ligand_rmsd_cutoff <float> Fit_ligand: RMSD below which two candidate peaks are treated
                                     as the same peak. Default: 2.
+  --fit_ligand_clash_mode <all-atom|backbone>  Fit_ligand: Exlcude candidate ligand positions if
+                                    they clash with any protein atom or just backbone atoms
+                                    default: all-atom
+  --fit_ligand_peak_grouping <symmetry|zscore>  Fit_ligand: how symmetry copies of z-map
+                                    peaks are handled. symmetry: pool copies with the
+                                    space-group operators, flood-fill every copy, place at
+                                    the event centroid(s) with the most protein atoms within
+                                    --fit_ligand_contact_cutoff. zscore: original same-Z-score
+                                    grouping. Default: symmetry.
+  --fit_ligand_symmetry_tolerance <float>  Fit_ligand (symmetry): max distance (A) between a
+                                    peak's symmetry image and another peak for them to be
+                                    pooled. Default: 2.0.
+  --fit_ligand_contact_cutoff <float>  Fit_ligand (symmetry): radius (A) for counting protein
+                                    atoms around an event centroid; features with none are
+                                    rejected. Default: 8.0.
+  --fit_ligand_contact_fraction <float>  Fit_ligand (symmetry): place every copy with at least
+                                    this fraction of the best protein-atom count. Default: 0.9.
   --rsr_n_cycles <int>              Real-space refinement cycles. PLACER, Filter, PLACER2,
                                     Build final, Rotamer_optimize. Default: 1000.
   --rsr_map_weight <float>         Real-space refinement map-vs-geometry weight. PLACER, Filter,
@@ -169,6 +197,10 @@ Options:
   --f1_clustering_mode <all-atom|centroid>  Filter: clustering distance metric. Default: centroid.
   --f1_clustering_cutoff <float>       Filter: clustering distance cutoff. Default: 2.0.
   --f1_clash_vdw_scale <float>         Filter: VDW-radius scale for cluster-rep clash detection.
+  --f1_halogen_rscc_floor <float>      Filter: minimum RSCC a Br/I-containing cluster rep must
+                                        retain once the halogen is excluded (same event map).
+                                        Below this, the rep is rejected as halogen-overfit.
+                                        Default: 0.3.
                                     Default: 0.75.
   --rsr_backbone_cutoff <float>    Filter: distance from LIG used to pick residues to
                                     real-space refine. Default: 10.0.
@@ -180,6 +212,7 @@ Options:
   --f2_clustering_mode <all-atom|centroid>  Filter2: clustering distance metric. Default: centroid.
   --f2_clustering_cutoff <float>       Filter2: clustering distance cutoff. Default: 2.0.
   --f2_clash_vdw_scale <float>         Filter2: VDW-radius scale for cluster-rep clash detection.
+  --f2_halogen_rscc_floor <float>      Filter2: same as --f1_halogen_rscc_floor. Default: 0.3.
                                     Default: 0.75.
   --clash_vdw_scale <float>        Sidechain clash VDW-radius scale, shared by Build final and
                                     Rotamer_optimize. Default: 0.75.
@@ -193,6 +226,9 @@ Options:
                                     Build final, Rotamer_optimize. Default: 25.
   --clash_solve_node_budget <int>  Branch-and-bound search nodes before falling back to ICM.
                                     Build final, Rotamer_optimize. Default: 200000.
+  --ligand_clash_prefilter_margin <float>  Ligand clash detection: centroid+reach bounding-sphere
+                                    prefilter margin (A) before the exact per-atom check runs.
+                                    Build final, Rotamer_optimize. Default: 4.0.
   --rotamer_rscc_threshold <float> Rotamer_optimize: RSCC below which a residue is resampled.
                                     Default: 0.5.
   --rotamer_rscc_improvement_threshold <float>  Rotamer_optimize: minimum RSCC gain to accept a
@@ -268,6 +304,7 @@ PLOT_ROTAMER_VS_PIPELINE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_rotamer_vs_pipeline.py
 AGGREGATE_ROTAMER_WORSE_RESIDUES_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_rotamer_worse_residues.py"
 AGGREGATE_CLASH_GROUPS_PY="${ANALYSIS_SCRIPTS_DIR}/aggregate_clash_groups.py"
 CENTROID_RMSD_ALL_PY="${ANALYSIS_SCRIPTS_DIR}/centroid_rmsd_all.py"
+CHECK_FIT_LIGAND_SYMMETRY_MATES_PY="${ANALYSIS_SCRIPTS_DIR}/check_fit_ligand_symmetry_mates.py"
 CALC_PLACER_SAMPLING_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling.py"
 CALC_PLACER_SAMPLING_UNREFINED_PY="${ANALYSIS_SCRIPTS_DIR}/calc_placer_sampling_unrefined.py"
 PLOT_PLACER2_VS_PLACER1_RMSD_PY="${ANALYSIS_SCRIPTS_DIR}/plot_placer2_vs_placer1_rmsd.py"
@@ -282,6 +319,8 @@ PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_ligand
 PLOT_DESPOT_VS_REF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_vs_ref.py"
 PLOT_RSCC_DESPOT_TRADEOFF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_rscc_despot_tradeoff.py"
 PLOT_RESIDUES_VS_REF_DESPOT_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_despot.py"
+CHECK_EXCESS_SYMMETRY_MATES_PY="${ANALYSIS_SCRIPTS_DIR}/check_excess_symmetry_mates.py"
+PLOT_LIGAND_CLASH_FILTERED_PY="${ANALYSIS_SCRIPTS_DIR}/plot_ligand_clash_filtered.py"
 ASSIGN_BOND_ORDERS_PY="${LIG_SCRIPTS_DIR}/assign_bond_orders.py"
 PDB_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/pdb_to_mol2.sh"
 PROTEIN_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/protein_to_mol2.sh"
@@ -291,13 +330,16 @@ for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN"
          "$PLOT_LIG_VS_REF_FILTER1_PY" "$PLOT_LIG_VS_REF_FILTER2_PY" \
          "$PLOT_RESIDUES_VS_REF_BACKBONE_PY" "$PLOT_RESIDUES_VS_REF_FINAL_PY" "$PLOT_RESIDUES_VS_REF_ROTAMER_PY" \
          "$PLOT_ROTAMER_VS_PIPELINE_PY" "$AGGREGATE_ROTAMER_WORSE_RESIDUES_PY" \
-         "$CENTROID_RMSD_ALL_PY" "$CALC_PLACER_SAMPLING_PY" "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
+         "$CENTROID_RMSD_ALL_PY" "$CHECK_FIT_LIGAND_SYMMETRY_MATES_PY" \
+         "$PLOT_LIGAND_CLASH_FILTERED_PY" \
+         "$CALC_PLACER_SAMPLING_PY" "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
          "$PLOT_PLACER2_VS_PLACER1_RMSD_PY" \
          "$PLOT_FIT_LIGAND_COUNTS_PY" "$ASSIGN_BOND_ORDERS_PY" "$PLOT_CLUSTER_REPS_POOLED_PY" \
          "$PLOT_PROTEIN_RSCC_POOLED_PY" \
          "$PLOT_DESPOT_ENERGIES_PY" "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
          "$PLOT_LIG_VS_REF_DESPOT_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
          "$PLOT_DESPOT_VS_REF_PY" "$PLOT_RSCC_DESPOT_TRADEOFF_PY" "$PLOT_RESIDUES_VS_REF_DESPOT_PY" \
+         "$CHECK_EXCESS_SYMMETRY_MATES_PY" \
          "$PDB_TO_MOL2_SH" "$PROTEIN_TO_MOL2_SH" "$DESPOT_SCRIPT"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
@@ -330,7 +372,12 @@ rotamer_run_name=""
 despot_run_name=""
 
 num_placer_confs=100
-num_placer2_confs=100
+# 251, not 250: DESPOT's score_complex.py (CHUNK_SIZE=2000) crashes with "ValueError: No
+# objects to concatenate" whenever num_placer2_confs * (surviving filter_1 cluster_reps
+# count) lands exactly on a multiple of 2000 (e.g. 500*4, 250*8). 251 avoids that for any
+# plausible cluster_reps count. num_placer_confs (round 1, above) doesn't need this - those
+# conformers never reach DESPOT, only round-2 (placer2) conformers do.
+num_placer2_confs=251
 gpu_ids="0"
 num_parallel=""
 compare_ref_set=0
@@ -345,11 +392,16 @@ dataset_arg=""
 DATASET_OVERRIDE_FILE=""
 
 # fit_ligand tunables (stage 1a). Left empty by default so fit_ligand's own
-# argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100, --rmsd_cutoff=2) apply; only
-# passed through when explicitly set here.
+# argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100, --rmsd_cutoff=2,
+# --clash_mode=all-atom) apply; only passed through when explicitly set here.
 z_threshold=""
 num_peaks=""
 fit_ligand_rmsd_cutoff=""
+fit_ligand_peak_grouping=""
+fit_ligand_symmetry_tolerance=""
+fit_ligand_contact_cutoff=""
+fit_ligand_contact_fraction=""
+fit_ligand_clash_mode=""
 
 # filter tunables (stage 3a, filter_run_name), left empty by default so
 # filter's own argparse defaults apply.
@@ -359,6 +411,12 @@ f1_rscc_cutoff=""
 f1_clustering_mode=""
 f1_clustering_cutoff=""
 f1_clash_vdw_scale=""
+# Halogen RSCC filtering (qfit.command_line.filter) - minimum RSCC a Br/I-containing
+# cluster rep must retain once the halogen is excluded, against the same event map as its
+# full-ligand RSCC; below this, the rep is rejected as halogen-overfit (e.g. an iodine's
+# strong signal propping up an otherwise poorly-fit ligand pose). Left empty by default so
+# filter.py's own argparse default applies (halogen_rscc_floor=0.3).
+f1_halogen_rscc_floor=""
 
 # filter tunables (stage 5a, filter2_run_name) - same underlying `filter`
 # script as f1_*, set independently.
@@ -368,6 +426,7 @@ f2_rscc_cutoff=""
 f2_clustering_mode=""
 f2_clustering_cutoff=""
 f2_clash_vdw_scale=""
+f2_halogen_rscc_floor=""
 
 # Sidechain-sidechain clash resolution tunables, shared identically by build_final_model.py
 # (stage 6a) and rotamer_optimize.py (stage 7a) - both now use the same
@@ -381,6 +440,11 @@ max_clash_group_size=""
 max_clash_group_expansions=""
 clash_domain_top_k=""
 clash_solve_node_budget=""
+# Ligand clash detection (qfit.command_line.ligand_clash) - centroid+reach bounding-sphere
+# prefilter margin (Angstrom), shared identically by build_final_model.py and
+# rotamer_optimize.py, same as the sidechain clash tunables above. Left empty by default so
+# each script's own argparse default applies (ligand_clash_prefilter_margin=4.0).
+ligand_clash_prefilter_margin=""
 
 # rotamer_optimize tunables (stage 7a), left empty by default so rotamer_optimize's own
 # argparse defaults apply (--rscc_threshold=0.5, --rscc_improvement_threshold=0.1).
@@ -516,12 +580,40 @@ while [[ $# -gt 0 ]]; do
             fit_ligand_rmsd_cutoff="$2"
             shift 2
             ;;
+        --fit_ligand_peak_grouping)
+            fit_ligand_peak_grouping="$2"
+            shift 2
+            ;;
+        --fit_ligand_symmetry_tolerance)
+            fit_ligand_symmetry_tolerance="$2"
+            shift 2
+            ;;
+        --fit_ligand_contact_cutoff)
+            fit_ligand_contact_cutoff="$2"
+            shift 2
+            ;;
+        --fit_ligand_contact_fraction)
+            fit_ligand_contact_fraction="$2"
+            shift 2
+            ;;
+        --fit_ligand_clash_mode)
+            fit_ligand_clash_mode="$2"
+            shift 2
+            ;;
         --f1_clash_vdw_scale)
             f1_clash_vdw_scale="$2"
             shift 2
             ;;
+        --f1_halogen_rscc_floor)
+            f1_halogen_rscc_floor="$2"
+            shift 2
+            ;;
         --f2_clash_vdw_scale)
             f2_clash_vdw_scale="$2"
+            shift 2
+            ;;
+        --f2_halogen_rscc_floor)
+            f2_halogen_rscc_floor="$2"
             shift 2
             ;;
         --clash_vdw_scale)
@@ -546,6 +638,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --clash_solve_node_budget)
             clash_solve_node_budget="$2"
+            shift 2
+            ;;
+        --ligand_clash_prefilter_margin)
+            ligand_clash_prefilter_margin="$2"
             shift 2
             ;;
         --rotamer_rscc_threshold)
@@ -692,6 +788,11 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--z_threshold" "${z_threshold:-<default: 4>}"
     printf '  %-38s %s\n' "--num_peaks" "${num_peaks:-<default: 100>}"
     printf '  %-38s %s\n' "--fit_ligand_rmsd_cutoff" "${fit_ligand_rmsd_cutoff:-<default: 2>}"
+    printf '  %-38s %s\n' "--fit_ligand_peak_grouping" "${fit_ligand_peak_grouping:-<default: symmetry>}"
+    printf '  %-38s %s\n' "--fit_ligand_symmetry_tolerance" "${fit_ligand_symmetry_tolerance:-<default: 2.0>}"
+    printf '  %-38s %s\n' "--fit_ligand_contact_cutoff" "${fit_ligand_contact_cutoff:-<default: 8.0>}"
+    printf '  %-38s %s\n' "--fit_ligand_contact_fraction" "${fit_ligand_contact_fraction:-<default: 0.9>}"
+    printf '  %-38s %s\n' "--fit_ligand_clash_mode" "${fit_ligand_clash_mode:-<default: all-atom>}"
     echo
     echo "-- Real-space refinement (PLACER, Filter, PLACER2, Build final, Rotamer_optimize) --"
     printf '  %-38s %s\n' "--rsr_n_cycles" "${rsr_n_cycles:-<default: 1000>}"
@@ -706,6 +807,7 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--f1_clustering_mode" "${f1_clustering_mode:-<default: centroid>}"
     printf '  %-38s %s\n' "--f1_clustering_cutoff" "${f1_clustering_cutoff:-<default: 2.0>}"
     printf '  %-38s %s\n' "--f1_clash_vdw_scale" "${f1_clash_vdw_scale:-<default: 0.75>}"
+    printf '  %-38s %s\n' "--f1_halogen_rscc_floor" "${f1_halogen_rscc_floor:-<default: 0.3>}"
     echo
     echo "-- Filter2 --"
     printf '  %-38s %s\n' "--f2_filter_proportion" "${f2_filter_proportion:-<default: 0.25>}"
@@ -714,6 +816,7 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--f2_clustering_mode" "${f2_clustering_mode:-<default: centroid>}"
     printf '  %-38s %s\n' "--f2_clustering_cutoff" "${f2_clustering_cutoff:-<default: 2.0>}"
     printf '  %-38s %s\n' "--f2_clash_vdw_scale" "${f2_clash_vdw_scale:-<default: 0.75>}"
+    printf '  %-38s %s\n' "--f2_halogen_rscc_floor" "${f2_halogen_rscc_floor:-<default: 0.3>}"
     echo
     echo "-- Build final / Rotamer_optimize sidechain clash resolution --"
     printf '  %-38s %s\n' "--clash_vdw_scale" "${clash_vdw_scale:-<default: 0.75>}"
@@ -722,6 +825,7 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--max_clash_group_expansions" "${max_clash_group_expansions:-<default: 10>}"
     printf '  %-38s %s\n' "--clash_domain_top_k" "${clash_domain_top_k:-<default: 25>}"
     printf '  %-38s %s\n' "--clash_solve_node_budget" "${clash_solve_node_budget:-<default: 200000>}"
+    printf '  %-38s %s\n' "--ligand_clash_prefilter_margin" "${ligand_clash_prefilter_margin:-<default: 4.0>}"
     echo
     echo "-- Rotamer_optimize --"
     printf '  %-38s %s\n' "--rotamer_rscc_threshold" "${rotamer_rscc_threshold:-<default: 0.5>}"
@@ -798,13 +902,15 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # when GNU parallel forks them into new subshells, so it all gets exported.
 export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name rotamer_run_name despot_run_name
 export num_placer_confs num_placer2_confs compare_ref_set overwrite replot
-export z_threshold num_peaks fit_ligand_rmsd_cutoff
+export z_threshold num_peaks fit_ligand_rmsd_cutoff fit_ligand_clash_mode \
+       fit_ligand_peak_grouping fit_ligand_symmetry_tolerance fit_ligand_contact_cutoff fit_ligand_contact_fraction
 export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
-       f1_clustering_mode f1_clustering_cutoff f1_clash_vdw_scale
+       f1_clustering_mode f1_clustering_cutoff f1_clash_vdw_scale f1_halogen_rscc_floor
 export f2_filter_proportion f2_min_cluster_proportion f2_rscc_cutoff \
-       f2_clustering_mode f2_clustering_cutoff f2_clash_vdw_scale
+       f2_clustering_mode f2_clustering_cutoff f2_clash_vdw_scale f2_halogen_rscc_floor
 export clash_vdw_scale hbond_clash_vdw_scale max_clash_group_size \
-       max_clash_group_expansions clash_domain_top_k clash_solve_node_budget
+       max_clash_group_expansions clash_domain_top_k clash_solve_node_budget \
+       ligand_clash_prefilter_margin
 export rotamer_rscc_threshold rotamer_rscc_improvement_threshold
 export revert_min_diff
 export bfactor expand_distance_cutoff
@@ -817,7 +923,8 @@ export PLOT_LIG_VS_REF_FILTER1_PY PLOT_LIG_VS_REF_FILTER2_PY
 export PLOT_RESIDUES_VS_REF_BACKBONE_PY PLOT_RESIDUES_VS_REF_FINAL_PY PLOT_RESIDUES_VS_REF_ROTAMER_PY GRAPHS_DIR
 export PLOT_ROTAMER_VS_PIPELINE_PY AGGREGATE_ROTAMER_WORSE_RESIDUES_PY
 export AGGREGATE_CLASH_GROUPS_PY
-export CENTROID_RMSD_ALL_PY CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
+export CENTROID_RMSD_ALL_PY CHECK_FIT_LIGAND_SYMMETRY_MATES_PY
+export CALC_PLACER_SAMPLING_PY CALC_PLACER_SAMPLING_UNREFINED_PY
 export PLOT_PLACER2_VS_PLACER1_RMSD_PY
 export PLOT_FIT_LIGAND_COUNTS_PY
 export PLOT_CLUSTER_REPS_POOLED_PY PLOT_PROTEIN_RSCC_POOLED_PY
@@ -826,6 +933,8 @@ export PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY
 export PLOT_DESPOT_VS_REF_PY
 export PLOT_RSCC_DESPOT_TRADEOFF_PY
 export PLOT_RESIDUES_VS_REF_DESPOT_PY
+export CHECK_EXCESS_SYMMETRY_MATES_PY
+export PLOT_LIGAND_CLASH_FILTERED_PY
 export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE
 export REF_SET REF_SET_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_DESPOT
@@ -1600,7 +1709,12 @@ fit_ligand_process_dataset() {
     mkdir -p "${run_out_dir}"
     write_params_txt "${run_out_dir}/fit_ligand_params.txt" \
         "z_threshold=${z_threshold}" \
-        "num_peaks=${num_peaks}"
+        "num_peaks=${num_peaks}" \
+        "clash_mode=${fit_ligand_clash_mode}" \
+        "peak_grouping=${fit_ligand_peak_grouping}" \
+        "symmetry_tolerance=${fit_ligand_symmetry_tolerance}" \
+        "contact_cutoff=${fit_ligand_contact_cutoff}" \
+        "contact_fraction=${fit_ligand_contact_fraction}"
 
     for pdb_dir in "${pdb_dirs[@]}"; do
         local dir_name=$(basename "$pdb_dir")
@@ -1620,6 +1734,11 @@ fit_ligand_process_dataset() {
         [ -n "$z_threshold" ] && fit_ligand_extra_args+=(-z "$z_threshold")
         [ -n "$num_peaks" ] && fit_ligand_extra_args+=(-n "$num_peaks")
         [ -n "$fit_ligand_rmsd_cutoff" ] && fit_ligand_extra_args+=(--rmsd_cutoff "$fit_ligand_rmsd_cutoff")
+        [ -n "$fit_ligand_peak_grouping" ] && fit_ligand_extra_args+=(--peak_grouping "$fit_ligand_peak_grouping")
+        [ -n "$fit_ligand_symmetry_tolerance" ] && fit_ligand_extra_args+=(--symmetry_tolerance "$fit_ligand_symmetry_tolerance")
+        [ -n "$fit_ligand_contact_cutoff" ] && fit_ligand_extra_args+=(--contact_cutoff "$fit_ligand_contact_cutoff")
+        [ -n "$fit_ligand_contact_fraction" ] && fit_ligand_extra_args+=(--contact_fraction "$fit_ligand_contact_fraction")
+        [ -n "$fit_ligand_clash_mode" ] && fit_ligand_extra_args+=(--clash_mode "$fit_ligand_clash_mode")
 
         fit_ligand "${DATASETS_DIR}/${dataset}" \
             "${pdb_file}" \
@@ -1663,6 +1782,33 @@ do_centroid_rmsd_all() {
         "$run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
         --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+######################################################################
+# Stage 1d: check_fit_ligand_symmetry_mates (only with -c)
+######################################################################
+# How many of fit_ligand's own output poses are crystallographic symmetry mates of a
+# reference ligand (centroid_cutoff, same 2.0 A default as everywhere else) - fit_ligand's
+# poses aren't guaranteed to share the reference's frame yet, so each is first CA-superimposed
+# onto the reference, same as centroid_rmsd_all.py.
+
+fit_ligand_symmetry_mates_outputs_exist() {
+    files_exist "${GRAPHS_DIR}/${run_name}/fit_ligand_symmetry_mates.png"
+}
+
+do_check_fit_ligand_symmetry_mates() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CHECK_FIT_LIGAND_SYMMETRY_MATES_PY" \
+        "$run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1977,6 +2123,7 @@ filter_process_dataset() {
     [ -n "$f1_clustering_mode" ] && f1_extra_args+=(--clustering_mode "$f1_clustering_mode")
     [ -n "$f1_clustering_cutoff" ] && f1_extra_args+=(--clustering_cutoff "$f1_clustering_cutoff")
     [ -n "$f1_clash_vdw_scale" ] && f1_extra_args+=(--clash_vdw_scale "$f1_clash_vdw_scale")
+    [ -n "$f1_halogen_rscc_floor" ] && f1_extra_args+=(--halogen_rscc_floor "$f1_halogen_rscc_floor")
 
     filter ${dataset_dir} \
         "${dataset_dir}/${run_name}/${placer_run_name}/*_refined.pdb" \
@@ -2746,6 +2893,7 @@ filter2_process_dataset() {
     [ -n "$f2_clustering_mode" ] && f2_extra_args+=(--clustering_mode "$f2_clustering_mode")
     [ -n "$f2_clustering_cutoff" ] && f2_extra_args+=(--clustering_cutoff "$f2_clustering_cutoff")
     [ -n "$f2_clash_vdw_scale" ] && f2_extra_args+=(--clash_vdw_scale "$f2_clash_vdw_scale")
+    [ -n "$f2_halogen_rscc_floor" ] && f2_extra_args+=(--halogen_rscc_floor "$f2_halogen_rscc_floor")
 
     filter "${dataset_dir}" \
         "${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/*_refined.pdb" \
@@ -2938,6 +3086,7 @@ build_final_process_dataset() {
     [ -n "$max_clash_group_expansions" ] && clash_extra_args+=(--max_clash_group_expansions "$max_clash_group_expansions")
     [ -n "$clash_domain_top_k" ] && clash_extra_args+=(--clash_domain_top_k "$clash_domain_top_k")
     [ -n "$clash_solve_node_budget" ] && clash_extra_args+=(--clash_solve_node_budget "$clash_solve_node_budget")
+    [ -n "$ligand_clash_prefilter_margin" ] && clash_extra_args+=(--ligand_clash_prefilter_margin "$ligand_clash_prefilter_margin")
 
     build_final_model "${dataset_dir}" \
         "${placer2_dir}/*_refined.pdb" \
@@ -3170,6 +3319,30 @@ clash_groups_aggregate_outputs_exist() {
 }
 
 ######################################################################
+# Stage 6f: plot_ligand_clash_filtered (no -c needed - pools each dataset's own
+# ligand_clash_filtered.csv, already written by build_final in Stage 6a; no reference set
+# involved)
+######################################################################
+do_plot_ligand_clash_filtered_final() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local run_subpath="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_subpath}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_LIGAND_CLASH_FILTERED_PY" \
+        --run-subpath "$run_subpath" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+ligand_clash_filtered_final_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}"
+    files_exist "${out_dir}/ligand_clash_filtered.png"
+}
+
+######################################################################
 # Stage 7a: rotamer_optimize
 ######################################################################
 # For each dataset (only runs when rotamer_run_name is given), re-samples chi/aromatic-angle
@@ -3226,6 +3399,7 @@ rotamer_optimize_process_dataset() {
     [ -n "$max_clash_group_expansions" ] && rotamer_extra_args+=(--max_clash_group_expansions "$max_clash_group_expansions")
     [ -n "$clash_domain_top_k" ] && rotamer_extra_args+=(--clash_domain_top_k "$clash_domain_top_k")
     [ -n "$clash_solve_node_budget" ] && rotamer_extra_args+=(--clash_solve_node_budget "$clash_solve_node_budget")
+    [ -n "$ligand_clash_prefilter_margin" ] && rotamer_extra_args+=(--ligand_clash_prefilter_margin "$ligand_clash_prefilter_margin")
 
     rotamer_optimize "$dataset_dir" "$final_pdb" "$rotamer_output_folder" -r "$resolution" \
         "${rotamer_extra_args[@]}"
@@ -3808,6 +3982,35 @@ despot_residues_vs_ref_outputs_exist() {
 }
 
 ######################################################################
+# Stage 8f: check_excess_symmetry_mates (only with -c)
+######################################################################
+# For every "excess" despot_filtered ligand (8b's lig_vs_reference_rscc_excess_pipeline.csv -
+# a pose that survived despot_filter.py but matched no reference ligand within
+# centroid_cutoff), checks whether it's actually a crystallographic symmetry mate of some
+# reference ligand rather than a genuinely spurious pose. Depends on 8b's output csv, so must
+# run after it.
+
+do_check_excess_symmetry_mates() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CHECK_EXCESS_SYMMETRY_MATES_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" \
+        "$final_run_name" "$rotamer_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+excess_symmetry_mates_outputs_exist() {
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/excess_symmetry_mates.png"
+}
+
+######################################################################
 # Stage 9: analysis plots (collapsed into one idempotent unit)
 ######################################################################
 # Every plot below (per-dataset and pooled) is checked/skipped together - see
@@ -4121,6 +4324,10 @@ stage1_run() {
         run_step_pooled_replot "Stage 1c: centroid_rmsd_all (${run_name})" \
             centroid_rmsd_all_outputs_exist do_centroid_rmsd_all
     fi
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 1d: check_fit_ligand_symmetry_mates (${run_name})" \
+            fit_ligand_symmetry_mates_outputs_exist do_check_fit_ligand_symmetry_mates
+    fi
 }
 
 stage2_placer() {
@@ -4171,6 +4378,8 @@ stage6_final() {
     fi
     run_step_pooled_replot "Stage 6e: aggregate_clash_groups (${final_run_name})" \
         clash_groups_aggregate_outputs_exist do_aggregate_clash_groups
+    run_step_pooled_replot "Stage 6f: plot_ligand_clash_filtered (${final_run_name})" \
+        ligand_clash_filtered_final_outputs_exist do_plot_ligand_clash_filtered_final
 }
 
 stage7_rotamer() {
@@ -4184,6 +4393,32 @@ stage7_rotamer() {
         run_step_pooled_replot "Stage 7f: aggregate_rotamer_worse_residues (${rotamer_run_name})" \
             rotamer_worse_residues_outputs_exist do_aggregate_rotamer_worse_residues
     fi
+    run_step_pooled_replot "Stage 7g: plot_ligand_clash_filtered (${rotamer_run_name})" \
+        ligand_clash_filtered_rotamer_outputs_exist do_plot_ligand_clash_filtered_rotamer
+}
+
+######################################################################
+# Stage 7g: plot_ligand_clash_filtered (no -c needed - pools each dataset's own
+# ligand_clash_filtered.csv, already written by rotamer_optimize in Stage 7a; no reference set
+# involved)
+######################################################################
+do_plot_ligand_clash_filtered_rotamer() {
+    conda_activate "$CONDA_ENV_EVAL"
+
+    local run_subpath="${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    local out_dir="${GRAPHS_DIR}/${run_subpath}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$PLOT_LIGAND_CLASH_FILTERED_PY" \
+        --run-subpath "$run_subpath" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" --graphs-dir "$out_dir"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+ligand_clash_filtered_rotamer_outputs_exist() {
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}"
+    files_exist "${out_dir}/ligand_clash_filtered.png"
 }
 
 stage8_despot() {
@@ -4203,6 +4438,10 @@ stage8_despot() {
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 8e: plot_residues_vs_ref_despot (${despot_run_name})" \
             despot_residues_vs_ref_outputs_exist do_plot_residues_vs_ref_despot
+    fi
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 8f: check_excess_symmetry_mates (${despot_run_name})" \
+            excess_symmetry_mates_outputs_exist do_check_excess_symmetry_mates
     fi
 }
 

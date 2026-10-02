@@ -15,6 +15,10 @@ from qfit.command_line.sidechain_clash import (
     SidechainClashResolver, CLASH_VDW_SCALE, HBOND_CLASH_VDW_SCALE, MAX_CLASH_GROUP_SIZE,
     MAX_CLASH_GROUP_EXPANSIONS, CLASH_DOMAIN_TOP_K, CLASH_SOLVE_NODE_BUDGET,
 )
+from qfit.command_line.ligand_clash import (
+    ligand_instances_from_structure, exclude_ligand_clashing_candidates, write_ligand_clash_csv,
+    LIGAND_CLASH_PREFILTER_MARGIN,
+)
 
 # Sidechain-sidechain clash resolution, using the same shared engine (qfit.command_line.
 # sidechain_clash) and the same clash variables as build_final_model.py - see
@@ -188,6 +192,21 @@ def build_argparser():
              "allowed per clash group before falling back to a heuristic (ICM) "
              f"reassignment (default: {CLASH_SOLVE_NODE_BUDGET})",
     )
+    p.add_argument(
+        "--ligand_clash_prefilter_margin",
+        default=LIGAND_CLASH_PREFILTER_MARGIN,
+        metavar="<float>",
+        type=float,
+        help="Ligand clash detection: a residue's sampled candidate conformers are only "
+             "checked against a given surviving ligand instance (every distinct LIG residue "
+             "already merged into model_file) when the residue's own bounding sphere "
+             "(centroid + max reach across all its sampled candidates) comes within this many "
+             f"Angstrom of the ligand instance's own bounding sphere (default: "
+             f"{LIGAND_CLASH_PREFILTER_MARGIN}). Clashing candidates (--clash_vdw_scale/"
+             "--hbond_clash_vdw_scale, sidechain atoms only) are excluded before map scoring "
+             "ever runs on them; same mechanism/variable as build_final_model.py's own flag of "
+             "the same name.",
+    )
     return p
 
 class QFitOptions: #copypasted from qfit.py
@@ -229,7 +248,8 @@ class Rotamer_Optimizer():
                  max_clash_group_size=MAX_CLASH_GROUP_SIZE,
                  max_clash_group_expansions=MAX_CLASH_GROUP_EXPANSIONS,
                  clash_domain_top_k=CLASH_DOMAIN_TOP_K,
-                 clash_solve_node_budget=CLASH_SOLVE_NODE_BUDGET):
+                 clash_solve_node_budget=CLASH_SOLVE_NODE_BUDGET,
+                 ligand_clash_prefilter_margin=LIGAND_CLASH_PREFILTER_MARGIN):
         self.dir = dataset_dir
         self.model_file = model_file
         self.output_path = f"{dataset_dir}/{output_folder}"
@@ -241,6 +261,13 @@ class Rotamer_Optimizer():
 
         self.base_structure = Structure.fromfile(self.model_file)
         self.base_structure = self.base_structure.extract("e", "H", "!=")
+
+        # Every surviving ligand instance already merged into model_file (build_final_model.py
+        # gives each one its own distinct residue number - see ligand_clash.py's module
+        # docstring) - gathered once here, reused for every residue's clash filtering below.
+        self.ligand_clash_prefilter_margin = ligand_clash_prefilter_margin
+        self._ligand_instances = ligand_instances_from_structure(self.base_structure)
+        print(f'{len(self._ligand_instances)} surviving ligand instance(s) for clash checking')
 
         self.trim = 20
 
@@ -316,6 +343,7 @@ class Rotamer_Optimizer():
         self._candidates = {}
         top_pick_idx = {}
         step1_accepted = {}
+        ligand_clash_rows = []
         for chain_id, resi in residues:
             resi_selstr = f"chain {chain_id} and resi {resi}"
             structure_new = self.base_structure.copy()
@@ -359,19 +387,36 @@ class Rotamer_Optimizer():
                 step1_accepted[key] = False
                 continue
 
-            #sample ca-b-y for aromatics
+            #sample ca-b-y for aromatics and chi angles, filtering out any candidate that
+            #clashes with a surviving ligand instance as it's generated (before map scoring
+            #ever runs on it - see _filter_ligand_clashes). Counters reset per-residue, summed
+            #across every sampling step (both _sample_angle's one call and every chi index in
+            #_sample_sidechains' own loop).
+            self._clash_n_sampled = 0
+            self._clash_n_excluded = 0
             self._sample_angle()
 
             #sample sidechains chi - self._coor_set is left holding the last chi angle's own
             #candidate pool (up to self.trim conformers), not collapsed to a single best one
             self._sample_sidechains()
 
-            pool_coor = self._coor_set
-            pool_rscc = self._calc_rscc_per_conformer(pool_coor)
+            ligand_clash_rows.append((chain_id, resi, self._clash_n_sampled, self._clash_n_excluded))
 
-            coor = np.concatenate([original_coor[None, :, :], np.stack(pool_coor, axis=0)], axis=0)
-            rscc = np.concatenate([[base_rscc], pool_rscc])
-            top_idx = int(np.argmax(rscc))
+            # Every sampled candidate clashed with a ligand - self._coor_set is empty. Can't
+            # call _calc_rscc_per_conformer/np.stack on an empty pool (both error), so this
+            # residue is handled the same as "sampled but nothing improved": falls back to its
+            # input conformation (original_coor, candidate index 0) via accepted=False below -
+            # see run()'s own defensive reset at the end for why that's always safe.
+            pool_coor = self._coor_set
+            if not pool_coor:
+                coor = original_coor[None, :, :]
+                rscc = np.array([base_rscc])
+                top_idx = 0
+            else:
+                pool_rscc = self._calc_rscc_per_conformer(pool_coor)
+                coor = np.concatenate([original_coor[None, :, :], np.stack(pool_coor, axis=0)], axis=0)
+                rscc = np.concatenate([[base_rscc], pool_rscc])
+                top_idx = int(np.argmax(rscc))
             top_rscc = float(rscc[top_idx])
             accepted = top_idx != 0 and (top_rscc - base_rscc >= self.rscc_improvement_threshold)
 
@@ -470,6 +515,13 @@ class Rotamer_Optimizer():
                 f.write(f'{chain_id}{resi},{base_rscc},{improved_rscc_str},{"yes" if accepted else "no"}\n')
         print(f'{num_improved}/{len(all_rows)} residue(s) improved; written to {residue_rscc_output}')
 
+        ligand_clash_output = self.output_path + '/ligand_clash_filtered.csv'
+        n_reset = write_ligand_clash_csv(ligand_clash_output, ligand_clash_rows)
+        if n_reset:
+            print(f'WARNING: {n_reset} residue(s) had every sampled conformer excluded for '
+                  f'ligand clash - reset to input conformation.')
+        print(f'ligand clash filtering written to {ligand_clash_output}')
+
     def _update_coords(self, structure, coords_by_residue):
         new_coor = structure.coor.copy()
         atom_index = 0
@@ -492,6 +544,42 @@ class Rotamer_Optimizer():
                 atom_labels = atom.fetch_labels()
                 out.write("{}\n".format(atom_labels.format_atom_record_group()))
             out.write("END\n")
+
+    def _filter_ligand_clashes(self, coor_set):
+        """Drops any candidate conformer in coor_set (full-atom coordinates, same atom order as
+        self.current_residue) that clashes with a surviving ligand instance
+        (self._ligand_instances), before _convert_and_score_rotamer ever scores it against the
+        map - see ligand_clash.py's module docstring for why filtering first (rather than
+        scoring then penalizing/reverting) is both a correctness fix and a compute saving.
+        Called from both _sample_angle and _sample_sidechains' own per-chi-index loop, right
+        before each one's own _convert_and_score_rotamer(self.trim) call.
+
+        Only sidechain atoms are checked (backbone atoms are exempt, same as every other clash
+        check in this project) - a residue with no sidechain atoms (e.g. glycine) is returned
+        unfiltered. Accumulates onto self._clash_n_sampled/self._clash_n_excluded (reset per
+        residue in run()'s own Pass 1 loop, before _sample_angle is called) for this residue's
+        ligand_clash_filtered.csv row.
+        """
+        self._clash_n_sampled += len(coor_set)
+        if not coor_set or not self._ligand_instances:
+            return coor_set
+
+        sidechain_mask = ~np.isin(np.asarray(self.current_residue.name), list(BACKBONE_ATOM_NAMES))
+        if not sidechain_mask.any():
+            return coor_set
+
+        coor_arr = np.stack(coor_set, axis=0)
+        vdw = np.asarray(self.current_residue.vdw_radius)[sidechain_mask]
+        e = np.asarray(self.current_residue.e)[sidechain_mask]
+
+        keep_mask, n_excluded = exclude_ligand_clashing_candidates(
+            coor_arr[:, sidechain_mask, :], vdw, e, self._ligand_instances,
+            clash_vdw_scale=self.clash_vdw_scale,
+            hbond_clash_vdw_scale=self.hbond_clash_vdw_scale,
+            margin=self.ligand_clash_prefilter_margin,
+        )
+        self._clash_n_excluded += n_excluded
+        return [c for c, keep in zip(coor_set, keep_mask) if keep]
 
     #this function is an editted version of the code from QfitRotamer
     def _sample_sidechains(self):
@@ -534,6 +622,7 @@ class Rotamer_Optimizer():
                             new_coor_set.append(self.current_residue.coor.copy())
 
             print(f'number of conformers to score: {len(new_coor_set)}')
+            new_coor_set = self._filter_ligand_clashes(new_coor_set)
             self._coor_set = new_coor_set
             self._convert_and_score_rotamer(self.trim)
 
@@ -572,6 +661,7 @@ class Rotamer_Optimizer():
                     new_coor_set.append(self.current_residue.coor)
 
         # Update sampled coords
+        new_coor_set = self._filter_ligand_clashes(new_coor_set)
         self._coor_set = new_coor_set
         self._convert_and_score_rotamer(self.trim)
 
@@ -701,7 +791,8 @@ def main():
                             args.rscc_threshold, args.rscc_improvement_threshold,
                             args.clash_vdw_scale, args.hbond_clash_vdw_scale,
                             args.max_clash_group_size, args.max_clash_group_expansions,
-                            args.clash_domain_top_k, args.clash_solve_node_budget)
+                            args.clash_domain_top_k, args.clash_solve_node_budget,
+                            args.ligand_clash_prefilter_margin)
     ro.run()
 
 if __name__ == '__main__':
