@@ -61,11 +61,58 @@ def build_argparser():
         help="Peak de-duplication: two candidate peaks whose placed-ligand RMSD is below this "
              "are treated as the same peak (default: 2).",
     )
+    p.add_argument(
+        "--clash_mode",
+        default="all-atom",
+        choices=["all-atom", "backbone"],
+        help="Atoms a peak is checked against before it is kept: 'all-atom' rejects a peak that "
+             "overlaps any apo-structure atom (side chains included); 'backbone' rejects only peaks "
+             "overlapping backbone N/CA/C/O atoms, so peaks on apo side chains that may move on "
+             "binding are kept (default: all-atom).",
+    )
+    p.add_argument(
+        "--peak_grouping",
+        default="symmetry",
+        choices=["symmetry", "zscore"],
+        help="How crystal-symmetry copies of a z-map peak are recognised and placed. 'symmetry': "
+             "peaks are pooled with the space-group operators, every copy is flood-filled, and the "
+             "feature is placed at the event centroid(s) with the most protein atoms within "
+             "--contact_cutoff (see _find_symmetry_pooled_centroids). 'zscore': the original "
+             "behaviour - copies are peaks with the same Z-score to 3 decimals, one placement per "
+             "Z-score, moved to the protein by lattice translation only (default: symmetry).",
+    )
+    p.add_argument(
+        "--symmetry_tolerance",
+        default=2.0,
+        metavar="<float>",
+        type=float,
+        help="--peak_grouping symmetry: two peaks are copies of the same feature if a space-group "
+             "operator maps one to within this distance (Å) of the other (default: 2.0).",
+    )
+    p.add_argument(
+        "--contact_cutoff",
+        default=8.0,
+        metavar="<float>",
+        type=float,
+        help="--peak_grouping symmetry: radius (Å) around an event centroid in which protein atoms "
+             "are counted; a feature with no protein atom this close to any copy is rejected "
+             "(default: 8.0).",
+    )
+    p.add_argument(
+        "--contact_fraction",
+        default=0.9,
+        metavar="<float>",
+        type=float,
+        help="--peak_grouping symmetry: every copy whose protein-atom count is at least this "
+             "fraction of the best copy's is placed, so sites at crystal contacts (lined by two "
+             "protein copies with near-equal counts) keep both candidates (default: 0.9).",
+    )
     return p
 
 class LigandPlacer():
     def __init__(self, dataset, ligand_file, resolution, run_name, num_peaks=5, z_threshold=5,
-                 rmsd_cutoff=2):
+                 rmsd_cutoff=2, clash_mode="all-atom", peak_grouping="symmetry",
+                 symmetry_tolerance=2.0, contact_cutoff=8.0, contact_fraction=0.9):
         # Read in args
         self.dataset = dataset
         self.dataset_name = str(dataset).split('/')[-1]
@@ -77,6 +124,15 @@ class LigandPlacer():
         self.run_name = run_name
         self._rmask = 0.5 + self.resolution / 3.0
         self.rmsd_cutoff = rmsd_cutoff
+        if clash_mode not in ("all-atom", "backbone"):
+            raise ValueError(f"clash_mode must be 'all-atom' or 'backbone', got {clash_mode!r}")
+        self.clash_mode = clash_mode
+        if peak_grouping not in ("symmetry", "zscore"):
+            raise ValueError(f"peak_grouping must be 'symmetry' or 'zscore', got {peak_grouping!r}")
+        self.peak_grouping = peak_grouping
+        self.symmetry_tolerance = symmetry_tolerance
+        self.contact_cutoff = contact_cutoff
+        self.contact_fraction = contact_fraction
 
         #make output folder
         self.output_dir = self.dataset / self.run_name
@@ -189,8 +245,12 @@ class LigandPlacer():
 
     def run(self):
         """Fits a ligand to event maps guided by the zmap."""
-        self.peaks = self._find_peaks()
-        self.centroid_peaks = self._find_event_centroid()
+        print(f'peak_grouping: {self.peak_grouping}')
+        if self.peak_grouping == "symmetry":
+            self.centroid_peaks = self._find_symmetry_pooled_centroids()
+        else:
+            self.peaks = self._find_peaks()
+            self.centroid_peaks = self._find_event_centroid()
         
         # Get ligand center (calculate once)
         ligand_center = self.ligand_structure.coor.mean(axis=0)
@@ -331,15 +391,22 @@ class LigandPlacer():
         protein_mask = self.transformer.get_conformers_mask(
             [self.apo_structure.coor], self._rmask)
 
-        # Backbone-only mask (see self.backbone_transformer in __init__) --
-        # used only to decide whether a peak clashes with the protein
-        # badly enough to discard it outright. Sidechains commonly
-        # reposition upon ligand binding, so a peak whose seed happens to
-        # coincide with a *sidechain* atom in the apo model isn't a real
-        # clash and shouldn't disqualify the peak before flood-fill even
-        # gets a chance to explore around it.
-        backbone_mask = self.backbone_transformer.get_conformers_mask(
-            [self.backbone_structure.coor], self._rmask)
+        # Mask used only to decide whether a peak clashes with the protein
+        # badly enough to discard it outright, chosen by --clash_mode:
+        #   all-atom: every apo-structure atom (side chains included).
+        #   backbone: backbone N/CA/C/O only (see self.backbone_transformer in
+        #     __init__). Sidechains commonly reposition upon ligand binding, so
+        #     a peak whose seed coincides with a *sidechain* atom in the apo
+        #     model isn't necessarily a real clash.
+        # Both masks cover every crystal-symmetry copy of the apo model.
+        if self.clash_mode == "backbone":
+            clash_mask = self.backbone_transformer.get_conformers_mask(
+                [self.backbone_structure.coor], self._rmask)
+            clash_label = "protein backbone"
+        else:
+            clash_mask = protein_mask
+            clash_label = "protein (all-atom)"
+        print(f'clash_mode: {self.clash_mode}')
 
         threshold = event_map.array.mean() + 2 * event_map.array.std() #threhsold is currently at 1 sigma
         print(f'threshold: {threshold}')
@@ -347,11 +414,9 @@ class LigandPlacer():
         for i, peak in enumerate(self.peaks):
             peak_coords = tuple(peak[0][::-1])  # xyz -> zyx for numpy indexing
 
-            # Clash detection: only reject the peak outright for clashing
-            # with the immovable backbone, not for merely sitting near a
-            # sidechain (which may not be there once the ligand binds).
-            if protein_mask[peak_coords] == True:
-                print(f"peak {i} failed centroid check. Reason: peak clashes with protein backbone")
+            # Clash detection against clash_mask (see --clash_mode above).
+            if clash_mask[peak_coords] == True:
+                print(f"peak {i} failed centroid check. Reason: peak clashes with {clash_label}")
                 continue
             if event_map.array[peak_coords] < threshold:
                 print(f"peak {i} failed centroid check. Reason: Peak is below threshold")
@@ -399,6 +464,174 @@ class LigandPlacer():
 
         return centroid_peaks
 
+
+    # Protein residue names counted by --peak_grouping symmetry's contact score (HETATM residues
+    # such as modelled cofactors are not protein surface a ligand pocket is judged by).
+    PROTEIN_RESNAMES = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+                        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "MSE"}
+
+    def _lattice_distances(self, frac_point, frac_points):
+        """Distances (Å) from one fractional point to each of frac_points, minimised over lattice
+        translations. Rounding the fractional difference gives the nearest image for rectangular
+        cells; the +/-1 search around it keeps this exact for oblique cells too."""
+        unit_cell = self.zmap.unit_cell
+        diff = frac_points - frac_point
+        diff -= np.round(diff)
+        offsets = np.array(list(product(range(-1, 2), repeat=3)), dtype=float)
+        cart = (diff[:, None, :] + offsets[None, :, :]) @ unit_cell.frac_to_orth.T
+        return np.linalg.norm(cart, axis=-1).min(axis=1)
+
+    def _find_symmetry_pooled_centroids(self):
+        """
+        --peak_grouping symmetry: find z-map peaks, pool crystal-symmetry copies of each feature
+        with the space-group operators, flood-fill every copy in the event map, and place the
+        feature at the event centroid(s) best surrounded by the modelled protein.
+
+        PanDDA's native maps hold every symmetry copy of a feature, but the copies' Z-scores are
+        not reliably identical (orf9b: most copy pairs differ; mac1/pxr: a sizeable minority), so
+        grouping by rounded Z-score splits one feature into several "features" and places ligands
+        at symmetry-mate sites. Here:
+          1. Peaks: local maxima above z_threshold, as in _find_peaks.
+          2. Pooling: peak j is a copy of peak i if some space-group operator (R, t) maps i's
+             fractional position to within symmetry_tolerance of j (lattice translations
+             included); copies are chained (union-find) into groups, ordered by their highest Z.
+             Only the first num_peaks groups are used.
+          3. Flood fill: every member's voxel is a seed, with the same checks and walls as
+             _find_event_centroid (clash_mask per --clash_mode, event map >= mean + 2 sd, 6-
+             connected growth outside the all-atom protein mask, not wrapped at the box edge).
+             Flood-filling every copy means a copy truncated by the box edge simply loses to a
+             complete one.
+          4. Protein frame: each member's centroid is tried at every lattice translation in
+             _translate_to_nearest_protein_copy's window and scored by the number of protein
+             atoms within contact_cutoff. The feature is placed at every candidate whose count is
+             >= contact_fraction x the best count (a site at a crystal contact is lined by two
+             protein copies and keeps both). A group with no protein atom within contact_cutoff
+             of any candidate, or no member passing the seed checks, is rejected.
+
+        Returns [(centroid_xyz_grid, cartesian), ...] in the same form as _find_event_centroid,
+        for run() (which still applies the rmsd_cutoff de-duplication).
+        """
+        from scipy.ndimage import maximum_filter, label
+
+        # 1. peaks, highest Z first
+        zarr = self.zmap.array
+        peak_mask = (maximum_filter(zarr, size=3) == zarr) & (zarr > self.z_threshold)
+        peak_zyx = np.argwhere(peak_mask)
+        peak_z = zarr[peak_mask]
+        order = np.argsort(-peak_z, kind="stable")
+        peak_zyx, peak_z = peak_zyx[order], peak_z[order]
+        n_peaks = len(peak_z)
+        unit_cell = self.zmap.unit_cell
+        peak_frac = np.array([unit_cell.orth_to_frac @ self._grid_to_cartesian(tuple(zyx[::-1]))
+                              for zyx in peak_zyx]).reshape(-1, 3)
+
+        # 2. pool symmetry copies (union-find over operator images)
+        parent = list(range(n_peaks))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        symops = [op for op in unit_cell.space_group.iter_symops()
+                  if not (np.allclose(op.R, np.eye(3)) and np.allclose(op.t, 0))]
+        for i in range(n_peaks):
+            for op in symops:
+                dist = self._lattice_distances(op.R @ peak_frac[i] + op.t, peak_frac)
+                dist[i] = np.inf
+                j = int(np.argmin(dist))
+                if dist[j] <= self.symmetry_tolerance:
+                    parent[find(i)] = find(j)
+        groups = {}
+        for i in range(n_peaks):  # members stay in descending-Z order
+            groups.setdefault(find(i), []).append(i)
+        groups = sorted(groups.values(), key=lambda members: -peak_z[members[0]])
+        print(f"Found {n_peaks} total peaks above threshold {self.z_threshold}, pooled into "
+              f"{len(groups)} symmetry-unique features (tolerance {self.symmetry_tolerance} A)")
+        groups = groups[:self.num_peaks]
+
+        # 3. event-map flood fill, as in _find_event_centroid
+        event_map = self.event_maps[list(self.event_maps.keys())[0]]
+        protein_mask = self.transformer.get_conformers_mask(
+            [self.apo_structure.coor], self._rmask)
+        if self.clash_mode == "backbone":
+            clash_mask = self.backbone_transformer.get_conformers_mask(
+                [self.backbone_structure.coor], self._rmask)
+            clash_label = "protein backbone"
+        else:
+            clash_mask = protein_mask
+            clash_label = "protein (all-atom)"
+        print(f'clash_mode: {self.clash_mode}')
+        threshold = event_map.array.mean() + 2 * event_map.array.std()
+        print(f'threshold: {threshold}')
+        # Connected components of above-threshold, non-protein voxels (6-connectivity, no wrap):
+        # the component containing a seed is exactly the voxel set _find_event_centroid's BFS
+        # grows from it. A backbone-mode seed may sit inside the all-atom mask; it is then its
+        # own component plus whatever the BFS would reach from its neighbours.
+        region = (event_map.array >= threshold) & ~protein_mask
+        components, _ = label(region)
+
+        def blob_centroid(zyx):
+            seed = tuple(zyx)
+            if clash_mask[seed]:
+                return None, f"clashes with {clash_label}"
+            if event_map.array[seed] < threshold:
+                return None, "below threshold"
+            if components[seed]:
+                voxels = np.argwhere(components == components[seed])
+            else:
+                # seed inside the all-atom mask (backbone clash_mode): grow from its neighbours
+                neighbour_ids = {components[tuple(np.add(seed, d))]
+                                 for d in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+                                 if all(0 <= seed[k] + d[k] < components.shape[k] for k in range(3))}
+                neighbour_ids.discard(0)
+                voxels = np.concatenate([np.argwhere(components == c) for c in neighbour_ids]
+                                        + [np.array([seed])])
+            return voxels.mean(axis=0)[::-1], None  # zyx -> xyz
+
+        # 4. protein-frame candidates scored by protein atoms within contact_cutoff
+        protein_sel = np.isin(self.apo_structure.resn, list(self.PROTEIN_RESNAMES))
+        protein_tree = cKDTree(self.apo_structure.coor[protein_sel])
+        protein_center_frac = unit_cell.orth_to_frac @ self._protein_center
+
+        centroid_peaks = []
+        for g, members in enumerate(groups):
+            candidates = []  # (n_atoms, -nearest_distance, centroid_xyz_grid, cartesian)
+            reasons = []
+            for i in members:
+                centroid_xyz, reason = blob_centroid(peak_zyx[i])
+                if centroid_xyz is None:
+                    reasons.append(reason)
+                    continue
+                frac = unit_cell.orth_to_frac @ self._grid_to_cartesian(centroid_xyz)
+                center_shift = np.round(protein_center_frac - frac)
+                for offset in product(range(-1, 2), repeat=3):
+                    cart = unit_cell.frac_to_orth @ (frac + center_shift + np.array(offset, dtype=float))
+                    n_atoms = len(protein_tree.query_ball_point(cart, self.contact_cutoff))
+                    nearest, _ = protein_tree.query(cart)
+                    candidates.append((n_atoms, -nearest, centroid_xyz, cart))
+            header = (f"feature {g} (z={peak_z[members[0]]:.2f}, {len(members)} symmetry-copy "
+                      f"peak(s))")
+            if not candidates:
+                print(f"{header} rejected: every copy failed the seed checks ({', '.join(sorted(set(reasons)))})")
+                continue
+            best = max(candidates, key=lambda c: (c[0], c[1]))
+            if best[0] == 0:
+                print(f"{header} rejected: no protein atom within {self.contact_cutoff} A of any event centroid")
+                continue
+            kept = []
+            for n_atoms, neg_nearest, centroid_xyz, cart in sorted(candidates, key=lambda c: (-c[0], -c[1])):
+                if n_atoms < self.contact_fraction * best[0]:
+                    break
+                if any(np.linalg.norm(cart - k) < self.rmsd_cutoff for _, k in kept):
+                    continue
+                kept.append((centroid_xyz, cart))
+                print(f"{header} accepted: event centroid with {n_atoms} protein atoms within "
+                      f"{self.contact_cutoff} A (best {best[0]}), nearest protein atom {-neg_nearest:.2f} A")
+            centroid_peaks.extend(kept)
+
+        return centroid_peaks
 
     def _find_peaks(self):
         """
@@ -484,7 +717,9 @@ def main():
     p = build_argparser()
     args = p.parse_args()
     placer = LigandPlacer(args.dataset, args.ligand, args.resolution,
-                          args.run_name, args.num_peaks, args.z_threshold, args.rmsd_cutoff)
+                          args.run_name, args.num_peaks, args.z_threshold, args.rmsd_cutoff,
+                          args.clash_mode, args.peak_grouping, args.symmetry_tolerance,
+                          args.contact_cutoff, args.contact_fraction)
     placer.run()
 
 if __name__ == '__main__':
