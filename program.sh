@@ -118,7 +118,7 @@ usage() {
 Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name [rotamer_run_name [despot_run_name]]]]]]]
            [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>] [-c] [--overwrite] [--replot]
            [--dataset <id[,id...]>]
-           [--z_threshold <float>] [--num_peaks <int>]
+           [--z_threshold <float>] [--fit_ligand_blob_contour <float>] [--fit_ligand_min_blob_volume <float>]
            [--f1_filter_proportion <float>] [--f1_min_cluster_proportion <float>]
            [--f1_rscc_cutoff <float>] [--f1_clustering_mode <all-atom|centroid>]
            [--f1_clustering_cutoff <float>]
@@ -129,9 +129,9 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--despot_threshold <float>]
            [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
            [--despot_pareto_margin_std <float>]
-           [--fit_ligand_rmsd_cutoff <float>] [--fit_ligand_clash_mode <all-atom|backbone>]
-           [--fit_ligand_peak_grouping <symmetry|zscore>] [--fit_ligand_symmetry_tolerance <float>]
-           [--fit_ligand_contact_cutoff <float>] [--fit_ligand_contact_fraction <float>]
+           [--fit_ligand_merge_distance <float>] [--fit_ligand_outer_mask <float>]
+           [--fit_ligand_symmetry_mask <float>] [--fit_ligand_symmetry_tolerance <float>]
+           [--fit_ligand_contact_cutoff <float>]
            [--clash_vdw_scale <float>] [--hbond_clash_vdw_scale <float>]
            [--max_clash_group_size <int>] [--max_clash_group_expansions <int>]
            [--clash_domain_top_k <int>] [--clash_solve_node_budget <int>]
@@ -167,27 +167,39 @@ Options:
   --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
                             (e.g. x00001-1 or x00001-1,x00002-1), instead of every dataset
                             listed in DATASETS_FILE (datasets.txt). 
-  --z_threshold <float>            Fit_ligand: Z-score threshold for peak detection. Default: 4.
-  --num_peaks <int>                Fit_ligand: number of peaks to find. Default: 100.
-  --fit_ligand_rmsd_cutoff <float> Fit_ligand: RMSD below which two candidate peaks are treated
-                                    as the same peak. Default: 2.
-  --fit_ligand_clash_mode <all-atom|backbone>  Fit_ligand: Exlcude candidate ligand positions if
-                                    they clash with any protein atom or just backbone atoms
-                                    default: all-atom
-  --fit_ligand_peak_grouping <symmetry|zscore>  Fit_ligand: how symmetry copies of z-map
-                                    peaks are handled. symmetry: pool copies with the
-                                    space-group operators, flood-fill every copy, place at
-                                    the event centroid(s) with the most protein atoms within
-                                    --fit_ligand_contact_cutoff. zscore: original same-Z-score
-                                    grouping. Default: symmetry.
-  --fit_ligand_symmetry_tolerance <float>  Fit_ligand (symmetry): max distance (A) between a
-                                    peak's symmetry image and another peak for them to be
-                                    pooled. Default: 2.0.
-  --fit_ligand_contact_cutoff <float>  Fit_ligand (symmetry): radius (A) for counting protein
-                                    atoms around an event centroid; features with none are
-                                    rejected. Default: 8.0.
-  --fit_ligand_contact_fraction <float>  Fit_ligand (symmetry): place every copy with at least
-                                    this fraction of the best protein-atom count. Default: 0.9.
+  Fit_ligand searches z-map voxels around the deposited protein (PanDDA style), clusters
+  them, merges nearby clusters, drops symmetry copies, then flood-fills the first event map
+  from each cluster's highest-z point and places the ligand at that blob's centroid. The z-map
+  search always excludes the backbone (N/CA/C/O) mask; the event-map fill always excludes the
+  all-atom protein mask.
+  --z_threshold <float>            Fit_ligand: minimum peak Z-score of a z-map cluster
+                                    (PanDDA's min_blob_z_peak). Default: 3.
+  --fit_ligand_blob_contour <float>  Fit_ligand: Z-score contour defining z-map clusters -
+                                    26-connected regions of searched voxels at or above this
+                                    level (PanDDA's contour_level). Default: 2.5.
+  --fit_ligand_min_blob_volume <float>  Fit_ligand: minimum z-map cluster volume (A^3) at
+                                    --fit_ligand_blob_contour, counting searched voxels only;
+                                    smaller clusters are rejected before merging (PanDDA's
+                                    min_blob_volume). 0 disables the filter. Default: 10.0.
+  --fit_ligand_merge_distance <float>  Fit_ligand: z-map clusters whose edges (closest pair of
+                                    voxels) come within this distance (A) are merged, chaining,
+                                    into one event (PanDDA uses 5.0). 0 disables. Default: 0.
+  --fit_ligand_outer_mask <float>  Fit_ligand: only z-map voxels within this distance (A) of a
+                                    protein atom of the deposited model are searched (PanDDA's
+                                    outer_mask). Default: 6.0.
+  --fit_ligand_symmetry_mask <float>  Fit_ligand: z-map voxels within this distance (A) of an
+                                    atom of a crystal-symmetry copy of the model are not searched
+                                    (PanDDA's inner_mask_symmetry). Default: 3.0.
+  --fit_ligand_symmetry_tolerance <float>  Fit_ligand: two z-map clusters are symmetry copies if
+                                    a space-group operator maps a voxel of one within this
+                                    distance (A) of a voxel of the other; only the copy with the
+                                    most protein contacts per voxel is kept. Default: PanDDA's
+                                    1.05 x sqrt(3) x grid spacing.
+  --fit_ligand_contact_cutoff <float>  Fit_ligand: radius (A) for protein contacts - symmetry
+                                    copies are scored by protein atoms within this distance of
+                                    any cluster voxel (per voxel), and an event with no protein
+                                    atom this close to its event centroid is rejected.
+                                    Default: 8.0.
   --rsr_n_cycles <int>              Real-space refinement cycles. PLACER, Filter, PLACER2,
                                     Build final, Rotamer_optimize. Default: 1000.
   --rsr_map_weight <float>         Real-space refinement map-vs-geometry weight. PLACER, Filter,
@@ -207,7 +219,8 @@ Options:
                                     real-space refine. Default: 10.0.
   --rsr_moved_threshold <float>    Real-space refinement: minimum displacement to log a residue
                                     as "moved". Filter, Build final, Rotamer_optimize. Default: 0.01.
-  --f2_filter_proportion <float>       Filter2: proportion of conformers kept. Default: 0.25.
+  --f2_filter_proportion <float>       Filter2: proportion of conformers kept. Default: 1
+                                        (program.sh default - filter.py's own default is 0.25).
   --f2_min_cluster_proportion <float>  Filter2: min cluster-size proportion to keep. Default: 0.1.
   --f2_rscc_cutoff <float>             Filter2: minimum RSCC to keep a cluster rep. Default: 0.6.
   --f2_clustering_mode <all-atom|centroid>  Filter2: clustering distance metric. Default: centroid.
@@ -258,7 +271,7 @@ Examples:
   $0 run_1 placer_1 filter_1 --overwrite
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 --replot
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 -c
-  $0 run_1 placer_1 filter_1 --z_threshold 5 --num_peaks 50
+  $0 run_1 placer_1 filter_1 --z_threshold 5 --fit_ligand_min_blob_volume 10
   $0 run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 --f1_rscc_cutoff 0.5 --f2_rscc_cutoff 0.7
   $0 run_1 placer_1 filter_1 --dataset x00001-1
   $0 run_1 placer_1 filter_1 --dataset x00001-1,x00002-1,x00003-1
@@ -274,7 +287,7 @@ CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 LIG_PDB_DIR="${BASE_DIR}/pdb_final_geometry"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
 CONDA_ENV_QFIT="nikhils_program"
-CONDA_ENV_PLACER="placer_env"
+CONDA_ENV_PLACER="placer"
 CONDA_ENV_RSR="nikhils_program"
 CONDA_ENV_EVAL="nikhils_program"
 CONDA_ENV_DESPOT="DESPOT"
@@ -397,16 +410,17 @@ dataset_arg=""
 DATASET_OVERRIDE_FILE=""
 
 # fit_ligand tunables (stage 1a). Left empty by default so fit_ligand's own
-# argparse defaults (-z/--z_threshold=4, -n/--num_peaks=100, --rmsd_cutoff=2,
-# --clash_mode=all-atom) apply; only passed through when explicitly set here.
+# argparse defaults (-z/--z_threshold=3, --blob_contour=2.5, --min_blob_volume=10.0,
+# --merge_distance=0, --outer_mask=6.0, --symmetry_mask=3.0, --symmetry_tolerance=PanDDA's,
+# --contact_cutoff=8.0) apply; only passed through when explicitly set here.
 z_threshold=""
-num_peaks=""
-fit_ligand_rmsd_cutoff=""
-fit_ligand_peak_grouping=""
+fit_ligand_blob_contour=""
+fit_ligand_min_blob_volume=""
+fit_ligand_merge_distance=""
+fit_ligand_outer_mask=""
+fit_ligand_symmetry_mask=""
 fit_ligand_symmetry_tolerance=""
 fit_ligand_contact_cutoff=""
-fit_ligand_contact_fraction=""
-fit_ligand_clash_mode=""
 
 # filter tunables (stage 3a, filter_run_name), left empty by default so
 # filter's own argparse defaults apply.
@@ -425,7 +439,7 @@ f1_halogen_rscc_floor=""
 
 # filter tunables (stage 5a, filter2_run_name) - same underlying `filter`
 # script as f1_*, set independently.
-f2_filter_proportion=""
+f2_filter_proportion="1"
 f2_min_cluster_proportion=""
 f2_rscc_cutoff=""
 f2_clustering_mode=""
@@ -526,8 +540,12 @@ while [[ $# -gt 0 ]]; do
             z_threshold="$2"
             shift 2
             ;;
-        --num_peaks)
-            num_peaks="$2"
+        --fit_ligand_blob_contour)
+            fit_ligand_blob_contour="$2"
+            shift 2
+            ;;
+        --fit_ligand_min_blob_volume)
+            fit_ligand_min_blob_volume="$2"
             shift 2
             ;;
         --f1_filter_proportion)
@@ -586,12 +604,16 @@ while [[ $# -gt 0 ]]; do
             despot_pareto_margin_std="$2"
             shift 2
             ;;
-        --fit_ligand_rmsd_cutoff)
-            fit_ligand_rmsd_cutoff="$2"
+        --fit_ligand_merge_distance)
+            fit_ligand_merge_distance="$2"
             shift 2
             ;;
-        --fit_ligand_peak_grouping)
-            fit_ligand_peak_grouping="$2"
+        --fit_ligand_outer_mask)
+            fit_ligand_outer_mask="$2"
+            shift 2
+            ;;
+        --fit_ligand_symmetry_mask)
+            fit_ligand_symmetry_mask="$2"
             shift 2
             ;;
         --fit_ligand_symmetry_tolerance)
@@ -600,14 +622,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --fit_ligand_contact_cutoff)
             fit_ligand_contact_cutoff="$2"
-            shift 2
-            ;;
-        --fit_ligand_contact_fraction)
-            fit_ligand_contact_fraction="$2"
-            shift 2
-            ;;
-        --fit_ligand_clash_mode)
-            fit_ligand_clash_mode="$2"
             shift 2
             ;;
         --f1_clash_vdw_scale)
@@ -795,14 +809,14 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--dataset" "${dataset_arg:-<all datasets>}"
     echo
     echo "-- Fit_ligand --"
-    printf '  %-38s %s\n' "--z_threshold" "${z_threshold:-<default: 4>}"
-    printf '  %-38s %s\n' "--num_peaks" "${num_peaks:-<default: 100>}"
-    printf '  %-38s %s\n' "--fit_ligand_rmsd_cutoff" "${fit_ligand_rmsd_cutoff:-<default: 2>}"
-    printf '  %-38s %s\n' "--fit_ligand_peak_grouping" "${fit_ligand_peak_grouping:-<default: symmetry>}"
-    printf '  %-38s %s\n' "--fit_ligand_symmetry_tolerance" "${fit_ligand_symmetry_tolerance:-<default: 2.0>}"
+    printf '  %-38s %s\n' "--z_threshold" "${z_threshold:-<default: 3>}"
+    printf '  %-38s %s\n' "--fit_ligand_blob_contour" "${fit_ligand_blob_contour:-<default: 2.5>}"
+    printf '  %-38s %s\n' "--fit_ligand_min_blob_volume" "${fit_ligand_min_blob_volume:-<default: 10.0>}"
+    printf '  %-38s %s\n' "--fit_ligand_merge_distance" "${fit_ligand_merge_distance:-<default: 0>}"
+    printf '  %-38s %s\n' "--fit_ligand_outer_mask" "${fit_ligand_outer_mask:-<default: 6.0>}"
+    printf '  %-38s %s\n' "--fit_ligand_symmetry_mask" "${fit_ligand_symmetry_mask:-<default: 3.0>}"
+    printf '  %-38s %s\n' "--fit_ligand_symmetry_tolerance" "${fit_ligand_symmetry_tolerance:-<default: 1.05 x sqrt(3) x grid spacing>}"
     printf '  %-38s %s\n' "--fit_ligand_contact_cutoff" "${fit_ligand_contact_cutoff:-<default: 8.0>}"
-    printf '  %-38s %s\n' "--fit_ligand_contact_fraction" "${fit_ligand_contact_fraction:-<default: 0.9>}"
-    printf '  %-38s %s\n' "--fit_ligand_clash_mode" "${fit_ligand_clash_mode:-<default: all-atom>}"
     echo
     echo "-- Real-space refinement (PLACER, Filter, PLACER2, Build final, Rotamer_optimize) --"
     printf '  %-38s %s\n' "--rsr_n_cycles" "${rsr_n_cycles:-<default: 1000>}"
@@ -820,7 +834,7 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--f1_halogen_rscc_floor" "${f1_halogen_rscc_floor:-<default: 0.3>}"
     echo
     echo "-- Filter2 --"
-    printf '  %-38s %s\n' "--f2_filter_proportion" "${f2_filter_proportion:-<default: 0.25>}"
+    printf '  %-38s %s\n' "--f2_filter_proportion" "${f2_filter_proportion:-<default: 1>}"
     printf '  %-38s %s\n' "--f2_min_cluster_proportion" "${f2_min_cluster_proportion:-<default: 0.1>}"
     printf '  %-38s %s\n' "--f2_rscc_cutoff" "${f2_rscc_cutoff:-<default: 0.6>}"
     printf '  %-38s %s\n' "--f2_clustering_mode" "${f2_clustering_mode:-<default: centroid>}"
@@ -913,8 +927,8 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # when GNU parallel forks them into new subshells, so it all gets exported.
 export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name rotamer_run_name despot_run_name
 export num_placer_confs num_placer2_confs compare_ref_set overwrite replot
-export z_threshold num_peaks fit_ligand_rmsd_cutoff fit_ligand_clash_mode \
-       fit_ligand_peak_grouping fit_ligand_symmetry_tolerance fit_ligand_contact_cutoff fit_ligand_contact_fraction
+export z_threshold fit_ligand_blob_contour fit_ligand_min_blob_volume fit_ligand_merge_distance \
+       fit_ligand_outer_mask fit_ligand_symmetry_mask fit_ligand_symmetry_tolerance fit_ligand_contact_cutoff
 export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
        f1_clustering_mode f1_clustering_cutoff f1_clash_vdw_scale f1_halogen_rscc_floor
 export f2_filter_proportion f2_min_cluster_proportion f2_rscc_cutoff \
@@ -1720,12 +1734,13 @@ fit_ligand_process_dataset() {
     mkdir -p "${run_out_dir}"
     write_params_txt "${run_out_dir}/fit_ligand_params.txt" \
         "z_threshold=${z_threshold}" \
-        "num_peaks=${num_peaks}" \
-        "clash_mode=${fit_ligand_clash_mode}" \
-        "peak_grouping=${fit_ligand_peak_grouping}" \
+        "blob_contour=${fit_ligand_blob_contour}" \
+        "min_blob_volume=${fit_ligand_min_blob_volume}" \
+        "merge_distance=${fit_ligand_merge_distance}" \
+        "outer_mask=${fit_ligand_outer_mask}" \
+        "symmetry_mask=${fit_ligand_symmetry_mask}" \
         "symmetry_tolerance=${fit_ligand_symmetry_tolerance}" \
-        "contact_cutoff=${fit_ligand_contact_cutoff}" \
-        "contact_fraction=${fit_ligand_contact_fraction}"
+        "contact_cutoff=${fit_ligand_contact_cutoff}"
 
     for pdb_dir in "${pdb_dirs[@]}"; do
         local dir_name=$(basename "$pdb_dir")
@@ -1743,13 +1758,13 @@ fit_ligand_process_dataset() {
 
         local fit_ligand_extra_args=()
         [ -n "$z_threshold" ] && fit_ligand_extra_args+=(-z "$z_threshold")
-        [ -n "$num_peaks" ] && fit_ligand_extra_args+=(-n "$num_peaks")
-        [ -n "$fit_ligand_rmsd_cutoff" ] && fit_ligand_extra_args+=(--rmsd_cutoff "$fit_ligand_rmsd_cutoff")
-        [ -n "$fit_ligand_peak_grouping" ] && fit_ligand_extra_args+=(--peak_grouping "$fit_ligand_peak_grouping")
+        [ -n "$fit_ligand_blob_contour" ] && fit_ligand_extra_args+=(--blob_contour "$fit_ligand_blob_contour")
+        [ -n "$fit_ligand_min_blob_volume" ] && fit_ligand_extra_args+=(--min_blob_volume "$fit_ligand_min_blob_volume")
+        [ -n "$fit_ligand_merge_distance" ] && fit_ligand_extra_args+=(--merge_distance "$fit_ligand_merge_distance")
+        [ -n "$fit_ligand_outer_mask" ] && fit_ligand_extra_args+=(--outer_mask "$fit_ligand_outer_mask")
+        [ -n "$fit_ligand_symmetry_mask" ] && fit_ligand_extra_args+=(--symmetry_mask "$fit_ligand_symmetry_mask")
         [ -n "$fit_ligand_symmetry_tolerance" ] && fit_ligand_extra_args+=(--symmetry_tolerance "$fit_ligand_symmetry_tolerance")
         [ -n "$fit_ligand_contact_cutoff" ] && fit_ligand_extra_args+=(--contact_cutoff "$fit_ligand_contact_cutoff")
-        [ -n "$fit_ligand_contact_fraction" ] && fit_ligand_extra_args+=(--contact_fraction "$fit_ligand_contact_fraction")
-        [ -n "$fit_ligand_clash_mode" ] && fit_ligand_extra_args+=(--clash_mode "$fit_ligand_clash_mode")
 
         fit_ligand "${DATASETS_DIR}/${dataset}" \
             "${pdb_file}" \
@@ -1792,7 +1807,8 @@ do_centroid_rmsd_all() {
     python "$CENTROID_RMSD_ALL_PY" \
         "$run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -1800,10 +1816,10 @@ do_centroid_rmsd_all() {
 ######################################################################
 # Stage 1d: check_fit_ligand_symmetry_mates (only with -c)
 ######################################################################
-# How many of fit_ligand's own output poses are crystallographic symmetry mates of a
-# reference ligand (centroid_cutoff, same 2.0 A default as everywhere else) - fit_ligand's
-# poses aren't guaranteed to share the reference's frame yet, so each is first CA-superimposed
-# onto the reference, same as centroid_rmsd_all.py.
+# How many of fit_ligand's own output poses are crystallographic symmetry mates of another
+# pose placed for the same dataset (centroid_cutoff, same 2.0 A default as everywhere else) -
+# fit_ligand's poses aren't guaranteed to share the reference's frame yet, so each is first
+# CA-superimposed onto the reference, same as centroid_rmsd_all.py.
 
 fit_ligand_symmetry_mates_outputs_exist() {
     files_exist "${GRAPHS_DIR}/${run_name}/fit_ligand_symmetry_mates.png"
@@ -1905,13 +1921,15 @@ placer_process_dataset() {
 
         echo "  Running PLACER on: ${pdb_name}.pdb (ligand: $(basename "$ligand_mol2"), predict_ligand=${lig_id})"
 
-        python "$RUN_PLACER_PY" \
+        if ! python "$RUN_PLACER_PY" \
             --ifile "${m_output_pdb}" \
             --odir "${out_dir}/." \
             -n ${num_placer_confs} \
             --ligand_file "LIG:${ligand_mol2}" \
             --predict_ligand "${lig_id}" \
-            --ignore_ligand_hydrogens
+            --ignore_ligand_hydrogens; then
+            log_issue "${dataset}" "ERROR [${dataset}]: PLACER failed for ${pdb_name}.pdb (ligand $(basename "$ligand_mol2")) - see traceback above. This peak's ligand conformer will be missing from round-1 output." err
+        fi
     done
 }
 export -f placer_process_dataset
@@ -2071,7 +2089,8 @@ do_placer_sampling_refined_round1() {
     python "$CALC_PLACER_SAMPLING_PY" \
         "$run_name" "$placer_run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -2085,7 +2104,8 @@ do_placer_sampling_unrefined_round1() {
     python "$CALC_PLACER_SAMPLING_UNREFINED_PY" \
         "$run_name" "$placer_run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -2608,13 +2628,15 @@ placer2_process_dataset() {
 
         echo "  Running PLACER on: ${dataset}_backbone_refined_${model_idx}.pdb (ligand: ${lig_name}.mol2, predict_ligand=${lig_id})"
 
-        python "$RUN_PLACER_PY" \
+        if ! python "$RUN_PLACER_PY" \
             --ifile "${pdb_file}" \
             --odir "${out_dir}/." \
             -n ${num_placer2_confs} \
             --ligand_file "LIG:${ligand_file}" \
             --predict_ligand "${lig_id}" \
-            --ignore_ligand_hydrogens
+            --ignore_ligand_hydrogens; then
+            log_issue "${dataset}" "ERROR [${dataset}]: PLACER2 failed for model ${model_idx} (${pdb_file}, ligand ${lig_name}.mol2) - see traceback above. This window's ligand conformer will be missing from round-2 output." err
+        fi
     done
 }
 export -f placer2_process_dataset
