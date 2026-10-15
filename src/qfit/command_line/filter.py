@@ -73,13 +73,16 @@ def build_argparser():
     p.add_argument(
         "-n",
         "--filter_proportion",
-        default=0.25,
+        default=1,
         metavar="<float>",
         type=float,
         help="Proportion (0-1) of the total number of input conformers "
              "(summed across all placer_files) to filter down to. "
-             "e.g. 0.25 keeps the best 25%% of all input conformers. "
-             "(default: 0.25)",
+             "e.g. 0.25 keeps the best 25%% of all input conformers; 1 keeps "
+             "all of them (the top-N cut is effectively disabled). Note that "
+             "a value of 0 does NOT disable this filter - max(1, round(0)) "
+             "still keeps exactly 1 conformer, which is the most aggressive "
+             "possible cut, not the least. (default: 1)",
     )
     p.add_argument(
         "--min_cluster_proportion",
@@ -91,9 +94,10 @@ def build_argparser():
              "number of conformers in a single placer_file's coor_set "
              "(assumed to be the same for every placer_file). e.g. with 100 "
              "conformers per placer_file, 0.1 means a cluster needs more "
-             "than 10 members to be accepted. Runs before RSCC filtering; "
-             "clusters below this are treated as noise and discarded. "
-             "(default: 0.1)",
+             "than 10 members to be accepted; 0 disables this filter (every "
+             "cluster with at least 1 member passes). Runs before RSCC "
+             "filtering; clusters below this are treated as noise and "
+             "discarded. (default: 0.1)",
     )
     p.add_argument(
         "--clash_vdw_scale",
@@ -160,7 +164,7 @@ def build_argparser():
 
 class Filter():
     def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder,
-                 resolution, filter_proportion=0.1, min_cluster_proportion=0.1,
+                 resolution, filter_proportion=1, min_cluster_proportion=0.1,
                  clash_vdw_scale=0.75, rscc_cutoff=0.6,
                  clustering_mode='all-atom', clustering_cutoff=4.0,
                  halogen_rscc_floor=0.3):
@@ -358,8 +362,9 @@ class Filter():
             #the same for every placer_file). e.g. with the default
             #min_cluster_proportion of 0.1 and 100 conformers per
             #placer_file, a cluster needs more than 0.1 * 100 = 10 members
-            #to survive; smaller clusters are treated as noise. This runs
-            #before the RSCC filter.
+            #to survive; smaller clusters are treated as noise. 0 disables
+            #this filter (every cluster with at least 1 member passes). This
+            #runs before the RSCC filter.
             # self.coor_sets is empty whenever the placer_files glob matched
             # nothing at all (zip() with an empty placer_files list means the
             # main loop above never ran) - next()'s default avoids a

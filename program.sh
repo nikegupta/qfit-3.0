@@ -104,7 +104,7 @@
 #
 # Idempotency: every step checks whether its own output already exists - per dataset (main
 # pipeline steps 0b-0d, 7a-7c, 8a) or per run (graphing steps 1b, 1c, 2c, 3d, 4c, 5b, 6d, 7e, 7f,
-# 8b, 8c, 8d, 8e, 9) - and skips if so. PLACER/RSR steps use a loose "at least one output exists"
+# 8b, 8c, 8d, 8e, 8f, 8g, 9) - and skips if so. PLACER/RSR steps use a loose "at least one output exists"
 # check. Pass --overwrite to force every step to redo, or --replot for just the graphing steps.
 #
 # Dataset scoping: by default every stage runs over every dataset in DATASETS_FILE
@@ -161,7 +161,7 @@ Options:
                             already exists (normally such a step is skipped - see "Idempotency"
                             in the header comment). Applies to every stage, including the
                             graphing steps. 
-  --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7e, 7f, 8b, 8c, 8d, 8e, 9) to
+  --replot                 Force just the graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7e, 7f, 8b, 8c, 8d, 8e, 8f, 8g, 9) to
                             re-run in place, even if their output already exists. Does not
                             affect the main pipeline steps (use --overwrite for those too).
   --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
@@ -180,7 +180,7 @@ Options:
   --fit_ligand_min_blob_volume <float>  Fit_ligand: minimum z-map cluster volume (A^3) at
                                     --fit_ligand_blob_contour, counting searched voxels only;
                                     smaller clusters are rejected before merging (PanDDA's
-                                    min_blob_volume). 0 disables the filter. Default: 10.0.
+                                    min_blob_volume). 0 disables the filter. Default: 5.0.
   --fit_ligand_merge_distance <float>  Fit_ligand: z-map clusters whose edges (closest pair of
                                     voxels) come within this distance (A) are merged, chaining,
                                     into one event (PanDDA uses 5.0). 0 disables. Default: 0.
@@ -204,7 +204,7 @@ Options:
                                     Build final, Rotamer_optimize. Default: 1000.
   --rsr_map_weight <float>         Real-space refinement map-vs-geometry weight. PLACER, Filter,
                                     PLACER2, Build final, Rotamer_optimize. Default: 50.0.
-  --f1_filter_proportion <float>       Filter: proportion of conformers kept. Default: 0.25.
+  --f1_filter_proportion <float>       Filter: proportion of conformers kept. Default: 1.
   --f1_min_cluster_proportion <float>  Filter: min cluster-size proportion to keep. Default: 0.1.
   --f1_rscc_cutoff <float>             Filter: minimum RSCC to keep a cluster rep. Default: 0.6.
   --f1_clustering_mode <all-atom|centroid>  Filter: clustering distance metric. Default: centroid.
@@ -219,8 +219,7 @@ Options:
                                     real-space refine. Default: 10.0.
   --rsr_moved_threshold <float>    Real-space refinement: minimum displacement to log a residue
                                     as "moved". Filter, Build final, Rotamer_optimize. Default: 0.01.
-  --f2_filter_proportion <float>       Filter2: proportion of conformers kept. Default: 1
-                                        (program.sh default - filter.py's own default is 0.25).
+  --f2_filter_proportion <float>       Filter2: proportion of conformers kept. Default: 1.
   --f2_min_cluster_proportion <float>  Filter2: min cluster-size proportion to keep. Default: 0.1.
   --f2_rscc_cutoff <float>             Filter2: minimum RSCC to keep a cluster rep. Default: 0.6.
   --f2_clustering_mode <all-atom|centroid>  Filter2: clustering distance metric. Default: centroid.
@@ -338,6 +337,7 @@ PLOT_DESPOT_VS_REF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_despot_vs_ref.py"
 PLOT_RSCC_DESPOT_TRADEOFF_PY="${ANALYSIS_SCRIPTS_DIR}/plot_rscc_despot_tradeoff.py"
 PLOT_RESIDUES_VS_REF_DESPOT_PY="${ANALYSIS_SCRIPTS_DIR}/plot_residues_vs_ref_despot.py"
 CHECK_EXCESS_SYMMETRY_MATES_PY="${ANALYSIS_SCRIPTS_DIR}/check_excess_symmetry_mates.py"
+CHECK_DESPOT_SYMMETRY_MATES_PY="${ANALYSIS_SCRIPTS_DIR}/check_despot_symmetry_mates.py"
 PLOT_LIGAND_CLASH_FILTERED_PY="${ANALYSIS_SCRIPTS_DIR}/plot_ligand_clash_filtered.py"
 ASSIGN_BOND_ORDERS_PY="${LIG_SCRIPTS_DIR}/assign_bond_orders.py"
 PDB_TO_MOL2_SH="${LIG_SCRIPTS_DIR}/pdb_to_mol2.sh"
@@ -357,7 +357,7 @@ for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN"
          "$PLOT_DESPOT_ENERGIES_PY" "$PLOT_DESPOT_ENERGIES_POOLED_PY" \
          "$PLOT_LIG_VS_REF_DESPOT_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_PY" "$PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY" \
          "$PLOT_DESPOT_VS_REF_PY" "$PLOT_RSCC_DESPOT_TRADEOFF_PY" "$PLOT_RESIDUES_VS_REF_DESPOT_PY" \
-         "$CHECK_EXCESS_SYMMETRY_MATES_PY" \
+         "$CHECK_EXCESS_SYMMETRY_MATES_PY" "$CHECK_DESPOT_SYMMETRY_MATES_PY" \
          "$PDB_TO_MOL2_SH" "$PROTEIN_TO_MOL2_SH" "$DESPOT_SCRIPT"; do
     if [ ! -f "$f" ]; then
         echo "Error: required file not found: ${f}" >&2
@@ -410,7 +410,7 @@ dataset_arg=""
 DATASET_OVERRIDE_FILE=""
 
 # fit_ligand tunables (stage 1a). Left empty by default so fit_ligand's own
-# argparse defaults (-z/--z_threshold=3, --blob_contour=2.5, --min_blob_volume=10.0,
+# argparse defaults (-z/--z_threshold=3, --blob_contour=2.5, --min_blob_volume=5.0,
 # --merge_distance=0, --outer_mask=6.0, --symmetry_mask=3.0, --symmetry_tolerance=PanDDA's,
 # --contact_cutoff=8.0) apply; only passed through when explicitly set here.
 z_threshold=""
@@ -811,7 +811,7 @@ print_run_parameters() {
     echo "-- Fit_ligand --"
     printf '  %-38s %s\n' "--z_threshold" "${z_threshold:-<default: 3>}"
     printf '  %-38s %s\n' "--fit_ligand_blob_contour" "${fit_ligand_blob_contour:-<default: 2.5>}"
-    printf '  %-38s %s\n' "--fit_ligand_min_blob_volume" "${fit_ligand_min_blob_volume:-<default: 10.0>}"
+    printf '  %-38s %s\n' "--fit_ligand_min_blob_volume" "${fit_ligand_min_blob_volume:-<default: 5.0>}"
     printf '  %-38s %s\n' "--fit_ligand_merge_distance" "${fit_ligand_merge_distance:-<default: 0>}"
     printf '  %-38s %s\n' "--fit_ligand_outer_mask" "${fit_ligand_outer_mask:-<default: 6.0>}"
     printf '  %-38s %s\n' "--fit_ligand_symmetry_mask" "${fit_ligand_symmetry_mask:-<default: 3.0>}"
@@ -825,7 +825,7 @@ print_run_parameters() {
     printf '  %-38s %s\n' "--rsr_moved_threshold" "${rsr_moved_threshold:-<default: 0.01>}"
     echo
     echo "-- Filter --"
-    printf '  %-38s %s\n' "--f1_filter_proportion" "${f1_filter_proportion:-<default: 0.25>}"
+    printf '  %-38s %s\n' "--f1_filter_proportion" "${f1_filter_proportion:-<default: 1>}"
     printf '  %-38s %s\n' "--f1_min_cluster_proportion" "${f1_min_cluster_proportion:-<default: 0.1>}"
     printf '  %-38s %s\n' "--f1_rscc_cutoff" "${f1_rscc_cutoff:-<default: 0.6>}"
     printf '  %-38s %s\n' "--f1_clustering_mode" "${f1_clustering_mode:-<default: centroid>}"
@@ -958,7 +958,7 @@ export PLOT_DESPOT_LIGAND_SUMMARY_SINGLE_PY
 export PLOT_DESPOT_VS_REF_PY
 export PLOT_RSCC_DESPOT_TRADEOFF_PY
 export PLOT_RESIDUES_VS_REF_DESPOT_PY
-export CHECK_EXCESS_SYMMETRY_MATES_PY
+export CHECK_EXCESS_SYMMETRY_MATES_PY CHECK_DESPOT_SYMMETRY_MATES_PY
 export PLOT_LIGAND_CLASH_FILTERED_PY
 export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE
 export REF_SET REF_SET_PDB_PATTERN
@@ -1142,7 +1142,7 @@ run_step_pooled() {
 }
 
 # run_step_replot <description> <check_fn> <run_fn>
-# For graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7d, 7e, 7f, 8b, 8c, 8d, 8e, 9): skips run_fn (via
+# For graphing steps (1b, 1c, 2c, 3d, 4c, 5b, 6d, 7d, 7e, 7f, 8b, 8c, 8d, 8e, 8f, 8g, 9): skips run_fn (via
 # run_step) when check_fn - a function name taking no args - returns success
 # (0, "all of this step's outputs already exist"), UNLESS --replot or
 # --overwrite was given.
@@ -2487,7 +2487,8 @@ do_plot_lig_vs_ref_filter1() {
     python "$PLOT_LIG_VS_REF_FILTER1_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -3067,7 +3068,8 @@ do_plot_lig_vs_ref_filter2() {
     python "$PLOT_LIG_VS_REF_FILTER2_PY" \
         "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -3931,7 +3933,8 @@ do_plot_lig_vs_ref_despot() {
         "$run_name" "$placer_run_name" "$filter_run_name" \
         "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -3956,7 +3959,8 @@ do_plot_despot_vs_ref() {
         "$run_name" "$placer_run_name" "$filter_run_name" \
         "$placer2_run_name" "$filter2_run_name" "$final_run_name" "${rotamer_run_name}/${despot_run_name}" \
         --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
-        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir"
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
     echo "All jobs completed"
     print_elapsed "$start_time"
 }
@@ -4042,6 +4046,35 @@ do_check_excess_symmetry_mates() {
 
 excess_symmetry_mates_outputs_exist() {
     files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/excess_symmetry_mates.png"
+}
+
+######################################################################
+# Stage 8g: check_despot_symmetry_mates (only with -c and <despot_run_name>)
+######################################################################
+# How many of despot_filter's own surviving ligand instances (despot_filtered.pdb) are
+# crystallographic symmetry mates of ANOTHER surviving instance in the same despot_filtered.pdb
+# - same internal-check logic as check_fit_ligand_symmetry_mates.py (centroid_cutoff, same 2.0
+# A default), just applied to despot_filter's own survivors instead of fit_ligand's raw poses.
+# despot_filtered.pdb already shares the reference's frame, so no CA-superposition is needed.
+
+do_check_despot_symmetry_mates() {
+    conda_activate "$CONDA_ENV_QFIT"
+
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
+    echo "Starting run"
+    local start_time=$(date +%s)
+    python "$CHECK_DESPOT_SYMMETRY_MATES_PY" \
+        "$run_name" "$placer_run_name" "$filter_run_name" "$placer2_run_name" "$filter2_run_name" \
+        "$final_run_name" "$rotamer_run_name" "$despot_run_name" \
+        --datasets-dir "$DATASETS_DIR" --datasets-file "$DATASETS_FILE" \
+        --ref-set "$REF_SET" --ref-pdb-pattern "$REF_SET_PDB_PATTERN" --graphs-dir "$out_dir" \
+        --cell-lookup-file "$DESPOT_CELL_LOOKUP_FILE"
+    echo "All jobs completed"
+    print_elapsed "$start_time"
+}
+
+despot_symmetry_mates_outputs_exist() {
+    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/despot_symmetry_mates.png"
 }
 
 ######################################################################
@@ -4375,8 +4408,8 @@ stage2_placer() {
 
 stage3_filter() {
     run_step "Stage 3a: filter (${filter_run_name})" do_filter
-    run_step "Stage 3b: rsr_backbone (${filter_run_name})" do_rsr_backbone
-    run_step "Stage 3c: calc_backbone_refined_rscc (${filter_run_name})" do_calc_backbone_rscc
+    # run_step "Stage 3b: rsr_backbone (${filter_run_name})" do_rsr_backbone
+    # run_step "Stage 3c: calc_backbone_refined_rscc (${filter_run_name})" do_calc_backbone_rscc
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 3d: plot_lig_vs_ref_filter1 + plot_residues_vs_ref_backbone (${filter_run_name})" \
             filter1_ref_comparison_outputs_exist do_filter1_ref_comparison
@@ -4476,6 +4509,10 @@ stage8_despot() {
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 8f: check_excess_symmetry_mates (${despot_run_name})" \
             excess_symmetry_mates_outputs_exist do_check_excess_symmetry_mates
+    fi
+    if [ "$compare_ref_set" -eq 1 ]; then
+        run_step_pooled_replot "Stage 8g: check_despot_symmetry_mates (${despot_run_name})" \
+            despot_symmetry_mates_outputs_exist do_check_despot_symmetry_mates
     fi
 }
 

@@ -48,12 +48,12 @@ def build_argparser():
     )
     p.add_argument(
         "--min_blob_volume",
-        default=10.0,
+        default=5.0,
         metavar="<float>",
         type=float,
         help="Minimum z-map cluster volume (Å^3) at --blob_contour, measured over searched "
              "voxels only; smaller clusters are rejected before merging. 0 disables the filter "
-             "(default: 10.0, PanDDA's min_blob_volume).",
+             "(default: 5.0; PanDDA's own min_blob_volume default is 10.0).",
     )
     p.add_argument(
         "--run_name",
@@ -109,7 +109,7 @@ def build_argparser():
 
 class LigandPlacer():
     def __init__(self, dataset, ligand_file, resolution, run_name, z_threshold=3,
-                 blob_contour=2.5, min_blob_volume=10.0,
+                 blob_contour=2.5, min_blob_volume=5.0,
                  symmetry_tolerance=None, contact_cutoff=8.0,
                  merge_distance=0.0, outer_mask=6.0, symmetry_mask=3.0):
         # Read in args
