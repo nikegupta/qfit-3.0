@@ -14,13 +14,22 @@ computed.
 
 For each reference LIG conformation (altloc-aware), keeps the minimum
 centroid distance to any ligand pose across every fit_ligand PDB for that
-dataset, pooled across all datasets into a single histogram.
+dataset, pooled across all datasets into a histogram. Two versions are written:
+  centroid_rmsd_all.png/.csv - distance to the reference's own coordinates
+    (not symmetry aware; same output as before symmetry handling was added).
+  centroid_rmsd_all_sa.png/.csv - symmetry aware: each aligned pose centroid is
+    compared against the reference centroid and every crystal-symmetry image of
+    it (space-group operators and lattice translations, cell/space group from
+    --cell-lookup-file), so a pose placed at a symmetry-equivalent copy of the
+    reference site counts as found. Its csv keeps the direct distance alongside
+    as 'dist_direct'.
 
 Run at the end of stage 1 (fit_ligand), only when -c (compare to reference
 set) is given.
 
 Usage:
-  centroid_rmsd_all.py <run_name> --ref-set <dir> --graphs-dir <dir> [options]
+  centroid_rmsd_all.py <run_name> --ref-set <dir> --graphs-dir <dir> \
+      --cell-lookup-file <path> [options]
 """
 from pathlib import Path
 
@@ -30,8 +39,8 @@ import biotite.structure as struc
 import biotite.structure.io.pdb as pdb
 
 from rscc_common import (
-    build_ref_argparser, read_datasets, read_pdb_raw_atoms, lig_conformations_filtered,
-    plot_distance_histogram, ref_pdb_path, write_plot_csv,
+    CrystalSymmetry, build_ref_argparser, read_cell_lookup, read_datasets, read_pdb_raw_atoms,
+    lig_conformations_filtered, plot_distance_histogram, ref_pdb_path, write_plot_csv,
 )
 
 
@@ -68,12 +77,15 @@ def align_to_reference(mobile_struct, target_struct):
     return transformation
 
 
-def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
+def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi, symmetry):
     """Returns (matched_rows, not_found_rows):
-      matched_rows - list of {ref_chain, ref_resi, ref_altloc, dist} dicts,
-        one per reference LIG conformation matched against the closest
+      matched_rows - list of {ref_chain, ref_resi, ref_altloc, dist, dist_direct}
+        dicts, one per reference LIG conformation matched against the closest
         ligand pose (after CA superposition) across every *.pdb file
-        directly in run_dir.
+        directly in run_dir. dist is the symmetry-inclusive minimum (over
+        the reference centroid and its crystal-symmetry images, via
+        symmetry - a CrystalSymmetry, or None to skip symmetry), dist_direct
+        the minimum to the reference's own coordinates.
       not_found_rows - list of {ref_chain, ref_resi, ref_altloc} dicts (no
         dist - there's nothing to measure a distance to) for every
         reference LIG conformation in a dataset whose fit_ligand run
@@ -101,6 +113,7 @@ def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
         return [], not_found_rows
 
     min_dists = {key: np.inf for key in ref_confs}
+    min_direct = {key: np.inf for key in ref_confs}
 
     for pdb_file in pdb_files:
         try:
@@ -120,28 +133,44 @@ def process_dataset(dataset, run_dir, ref_path, model_chain, model_resi):
         for ref_key, ref_centroid in ref_confs.items():
             for m_centroid in model_confs.values():
                 aligned = transformation.apply(m_centroid.reshape(1, 3))[0]
-                dist = float(np.linalg.norm(ref_centroid - aligned))
-                if dist < min_dists[ref_key]:
-                    min_dists[ref_key] = dist
+                direct = float(np.linalg.norm(ref_centroid - aligned))
+                dist = direct if symmetry is None else min(direct, symmetry.distance(ref_centroid, aligned))
+                min_direct[ref_key] = min(min_direct[ref_key], direct)
+                min_dists[ref_key] = min(min_dists[ref_key], dist)
 
     matched_rows = [
-        {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'dist': dist}
+        {'ref_chain': key[0], 'ref_resi': key[1], 'ref_altloc': key[2], 'dist': dist,
+         'dist_direct': min_direct[key]}
         for key, dist in min_dists.items() if np.isfinite(dist)
     ]
     return matched_rows, []
 
 
 def main():
-    args = build_ref_argparser(__doc__, ['run_name']).parse_args()
+    parser = build_ref_argparser(__doc__, ['run_name'])
+    parser.add_argument(
+        '--cell-lookup-file', required=True,
+        help='Path to a "dataset a b c alpha beta gamma space_group" lookup file (the same '
+             'format/file program.sh\'s DESPOT_CELL_LOOKUP_FILE already builds from CSV_FILE)',
+    )
+    args = parser.parse_args()
 
+    cells = read_cell_lookup(args.cell_lookup_file)
     datasets = read_datasets(args.datasets_file)
     all_rows = []
     all_not_found_rows = []
     for dataset in datasets:
         run_dir = Path(args.datasets_dir) / dataset / args.run_name
         ref_path = ref_pdb_path(args, dataset)
-        rows, not_found_rows = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1)
+        symmetry = CrystalSymmetry(cells[dataset]) if dataset in cells else None
+        if symmetry is None:
+            print(f'  {dataset}: no cell/space-group info in --cell-lookup-file; '
+                  f'distances are NOT symmetry-inclusive.')
+        rows, not_found_rows = process_dataset(dataset, run_dir, ref_path, model_chain='C', model_resi=1,
+                                               symmetry=symmetry)
+        n_mate = sum(row['dist'] < row['dist_direct'] for row in rows)
         print(f'  {dataset}: {len(rows)} ref LIG conformation(s) matched'
+              + (f' ({n_mate} closest to a symmetry mate)' if n_mate else '')
               + (f', {len(not_found_rows)} not found (fit_ligand placed 0 ligands)'
                  if not_found_rows else ''))
         for row in rows:
@@ -153,19 +182,32 @@ def main():
 
     out_dir = Path(args.graphs_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = 'centroid_rmsd_all.png'
-    plot_distance_histogram(
-        [row['dist'] for row in all_rows],
-        title=f'fit_ligand vs Reference Centroid Distance ({args.run_name})',
-        xlabel='Minimum Centroid Distance to Closest fit_ligand Pose (Å)',
-        out_path=out_dir / out_name,
-        bin_width=1.0,
-        not_found_count=len(all_not_found_rows),
-    )
-    if all_rows or all_not_found_rows:
-        combined_rows = all_rows + [{**row, 'dist': None} for row in all_not_found_rows]
-        write_plot_csv(out_dir, out_name,
-                        pd.DataFrame(combined_rows)[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'dist']])
+    key_cols = ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc']
+    combined = pd.DataFrame(all_rows + [{**row, 'dist': None, 'dist_direct': None}
+                                        for row in all_not_found_rows],
+                            columns=key_cols + ['dist', 'dist_direct'])
+    for out_name, title, xlabel, dist_col in [
+        ('centroid_rmsd_all.png',
+         f'fit_ligand vs Reference Centroid Distance ({args.run_name})',
+         'Minimum Centroid Distance to Closest fit_ligand Pose (Å)', 'dist_direct'),
+        ('centroid_rmsd_all_sa.png',
+         f'fit_ligand vs Reference Centroid Distance, Symmetry Aware ({args.run_name})',
+         'Minimum Centroid Distance to Closest fit_ligand Pose, Incl. Symmetry Mates (Å)', 'dist'),
+    ]:
+        plot_distance_histogram(
+            [row[dist_col] for row in all_rows],
+            title=title,
+            xlabel=xlabel,
+            out_path=out_dir / out_name,
+            bin_width=1.0,
+            not_found_count=len(all_not_found_rows),
+        )
+        if all_rows or all_not_found_rows:
+            if dist_col == 'dist_direct':
+                df = combined[key_cols + ['dist_direct']].rename(columns={'dist_direct': 'dist'})
+            else:
+                df = combined
+            write_plot_csv(out_dir, out_name, df)
 
 
 if __name__ == '__main__':

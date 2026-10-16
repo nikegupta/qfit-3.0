@@ -185,6 +185,12 @@ def build_placer_sampling_argparser(description):
                          "reference-ligand match set). When given (mode B only), also writes "
                          "placer_sampling_restricted.png/.csv restricted to reference ligands "
                          "that found a match there - see restrict_to_filter_matched.")
+    p.add_argument('--cell-lookup-file', default=None,
+                    help='Optional path to a "dataset a b c alpha beta gamma space_group" '
+                         'lookup file (the same format/file program.sh\'s DESPOT_CELL_LOOKUP_FILE '
+                         'already builds from CSV_FILE). When given, also writes a '
+                         'crystal-symmetry-aware twin of every output (see '
+                         'process_placer_sampling_dataset\'s symmetry argument).')
     return p
 
 
@@ -424,7 +430,8 @@ def compute_rmsd_symmetric(model_atoms, ref_atoms):
     return float(np.sqrt(np.mean(squared_diffs)))
 
 
-def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_chain, model_resi):
+def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_chain, model_resi,
+                                     symmetry=None):
     """For a single dataset, returns one min-RMSD value per reference LIG
     conformation matched: the minimum symmetry-aware RMSD from that
     reference LIG to the closest sampled ligand conformer across every
@@ -434,6 +441,15 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
     If a block has no LIG under model_chain/model_resi, falls back to any LIG
     in that block. Empty list if model_dir/ref_path don't exist or nothing
     matches.
+
+    symmetry: optional CrystalSymmetry (crystallographic, not compute_rmsd_symmetric's own
+    atom-permutation symmetry). When given, each sampled ligand conformer is NOT compared
+    against every crystal-symmetry image of the reference ligand (that would multiply the
+    number of RMSD calculations by the number of space-group operators); instead, the
+    conformer's own centroid first picks the single nearest crystal-symmetry image of the
+    reference ligand (CrystalSymmetry.nearest_image - may be the reference unchanged, when
+    the direct/identity comparison is already closest), and RMSD is computed only against
+    that one chosen image. A different sampled conformer may pick a different image.
 
     Deliberately non-recursive: callers' model_dir is a stage's own output
     directory, which - for round-1 (calc_placer_sampling.py's mode A,
@@ -482,7 +498,15 @@ def process_placer_sampling_dataset(model_dir, ref_path, file_pattern, model_cha
 
             for ref_key, ref_atom_list in ref_groups.items():
                 for model_atom_list in model_groups.values():
-                    rmsd = compute_rmsd_symmetric(model_atom_list, ref_atom_list)
+                    if symmetry is None:
+                        compare_atoms = ref_atom_list
+                    else:
+                        model_centroid = np.array([a['coord'] for a in model_atom_list]).mean(axis=0)
+                        ref_coor = np.array([a['coord'] for a in ref_atom_list])
+                        image_coor, _dist = symmetry.nearest_image(ref_coor, model_centroid)
+                        compare_atoms = [{'name': a['name'], 'coord': c}
+                                          for a, c in zip(ref_atom_list, image_coor)]
+                    rmsd = compute_rmsd_symmetric(model_atom_list, compare_atoms)
                     if rmsd is not None and rmsd < min_rmsds[ref_key]:
                         min_rmsds[ref_key] = rmsd
                         best_source[ref_key] = (str(model_file), model_idx)
@@ -637,7 +661,7 @@ def residue_label_from_key(chain_id, res_id, altloc):
 
 
 def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_override=None,
-                         rscc_column='rscc'):
+                         rscc_column='rscc', symmetry=None):
     """For one dataset, matches every reference LIG conformation in
     ref_pdb_path(args, dataset) to the nearest cluster-rep ligand pose in
     run_dir/cluster_rep_models.pdb (by centroid distance, no RSCC
@@ -664,6 +688,16 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
     a MODEL block with no LIG atoms: never matched, and not counted as excess
     either (it isn't "extra" pipeline output, it was deliberately filtered
     out). None (default) means every row is eligible, the original behavior.
+
+    symmetry: optional CrystalSymmetry. When given, a reference/pipeline centroid pair is
+    matched by the minimum distance to EITHER the direct (identity-frame) comparison OR any
+    crystal-symmetry image of the reference ligand (CrystalSymmetry.distance's own
+    include_identity=True default already covers both) - recovering a pipeline pose that's
+    actually sitting on a symmetry-equivalent copy of the reference site, which the plain
+    identity-frame distance (symmetry=None, the default) would otherwise miss or misclassify
+    as excess (see check_excess_symmetry_mates.py, whose post-hoc check this folds directly
+    into matching). Only which pairs count as matched changes - the RSCC values themselves
+    are read exactly as before.
 
     Returns (matched_ref_rscc, matched_pipeline_rscc, n_unmatched_ref,
     n_excess_pipeline, matched_rows, unmatched_ref_rows, excess_pipeline_rows).
@@ -771,7 +805,8 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
             c = pipeline_centroids[i]
             if c is None:
                 continue
-            dist = float(np.linalg.norm(c - ref_centroid))
+            dist = (float(np.linalg.norm(c - ref_centroid)) if symmetry is None
+                    else symmetry.distance(ref_centroid, c))
             if dist < best_dist:
                 best_dist = dist
                 best_row = i
@@ -810,7 +845,8 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
 
 def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None,
                      resi_col_name='cluster_rep_index', chain_col_name='pipeline_chain',
-                     cluster_csv_override_for_dataset=None, rscc_column='rscc'):
+                     cluster_csv_override_for_dataset=None, rscc_column='rscc',
+                     cell_lookup=None):
     """Pools stage-appropriate cluster_reps.csv ligand RSCC vs matched
     reference ligand RSCC across every dataset in datasets.txt into a single
     scatter plot (Reference on x, Pipeline on y - qfit compare_lig_rscc's
@@ -843,73 +879,98 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
 
     cluster_csv_override_for_dataset(dataset)/rscc_column: optional; threaded straight through
     to _dataset_lig_vs_ref's cluster_csv_override/rscc_column - see that function's docstring.
+
+    cell_lookup: optional {dataset: (a, b, c, alpha, beta, gamma, space_group)} (see
+    read_cell_lookup). When given, this ALSO writes a crystal-symmetry-aware twin of every
+    output (<out_name stem>_sa.png/.csv/_sa_unmatched_ref.csv/_sa_excess_pipeline.csv):
+    matching uses _dataset_lig_vs_ref's symmetry argument instead of plain identity-frame
+    distance, so a pipeline ligand actually sitting on a symmetry-equivalent copy of the
+    reference site counts as matched there - see that function's own docstring. The plotted
+    RSCC values are unaffected; only which pairs count as matched can change. A dataset
+    missing from cell_lookup falls back to identity-frame-only matching for that dataset's
+    _sa pass (same fallback centroid_rmsd_all.py uses).
     """
-    datasets = read_datasets(args.datasets_file)
-    all_ref, all_pipeline, all_rows = [], [], []
-    all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
-    total_unmatched, total_excess = 0, 0
-
-    for dataset in datasets:
-        run_dir = run_dir_for_dataset(dataset)
-        alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
-        cluster_csv_override = (
-            cluster_csv_override_for_dataset(dataset) if cluster_csv_override_for_dataset
-            else None
-        )
-        (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
-         unmatched_ref_rows, excess_pipeline_rows) = _dataset_lig_vs_ref(
-            dataset, args, run_dir, alive_rows=alive_rows,
-            cluster_csv_override=cluster_csv_override, rscc_column=rscc_column,
-        )
-        all_ref.extend(ref_vals)
-        all_pipeline.extend(pipeline_vals)
-        total_unmatched += n_unmatched
-        total_excess += n_excess
-        for row in matched_rows:
-            row_out = dict(row)
-            row_out['dataset'] = dataset
-            all_rows.append(row_out)
-        for row in unmatched_ref_rows:
-            row_out = dict(row)
-            row_out['dataset'] = dataset
-            all_unmatched_ref_rows.append(row_out)
-        for row in excess_pipeline_rows:
-            row_out = dict(row)
-            row_out['dataset'] = dataset
-            all_excess_pipeline_rows.append(row_out)
-        print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
-              f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
-
-    graphs_dir = Path(args.graphs_dir)
-    graphs_dir.mkdir(parents=True, exist_ok=True)
-    plot_rscc_scatter(
-        all_ref, all_pipeline,
-        xlabel='Reference RSCC', ylabel='Pipeline RSCC',
-        title=title,
-        out_path=graphs_dir / out_name,
-        extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
-                    f'Excess pipeline LIGs: {total_excess}'),
-    )
-
-    if all_rows:
-        rows_df = pd.DataFrame(all_rows).rename(
-            columns={'cluster_rep_index': resi_col_name, 'pipeline_chain': chain_col_name}
-        )[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc',
-           chain_col_name, resi_col_name, 'pipeline_rscc']]
-        write_plot_csv(graphs_dir, out_name, rows_df)
-
     out_stem = Path(out_name).stem
-    if all_unmatched_ref_rows:
-        unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
-            ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc', 'reason']
-        ]
-        write_plot_csv(graphs_dir, f'{out_stem}_unmatched_ref.png', unmatched_df)
+    out_suffix = Path(out_name).suffix
+    passes = [(None, out_name)]
+    if cell_lookup is not None:
+        passes.append((cell_lookup, f'{out_stem}_sa{out_suffix}'))
 
-    if all_excess_pipeline_rows:
-        excess_df = pd.DataFrame(all_excess_pipeline_rows).rename(
-            columns={'cluster_rep_index': resi_col_name, 'pipeline_chain': chain_col_name}
-        )[['dataset', chain_col_name, resi_col_name, 'pipeline_rscc', 'placer_file', 'index']]
-        write_plot_csv(graphs_dir, f'{out_stem}_excess_pipeline.png', excess_df)
+    for lookup, this_out_name in passes:
+        datasets = read_datasets(args.datasets_file)
+        all_ref, all_pipeline, all_rows = [], [], []
+        all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
+        total_unmatched, total_excess = 0, 0
+
+        for dataset in datasets:
+            run_dir = run_dir_for_dataset(dataset)
+            alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
+            cluster_csv_override = (
+                cluster_csv_override_for_dataset(dataset) if cluster_csv_override_for_dataset
+                else None
+            )
+            symmetry = None
+            if lookup is not None:
+                if dataset not in lookup:
+                    print(f'  {dataset}: no cell/space-group info in --cell-lookup-file; '
+                          f'falling back to identity-frame matching for the symmetry-aware pass.')
+                else:
+                    symmetry = CrystalSymmetry(lookup[dataset])
+            (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
+             unmatched_ref_rows, excess_pipeline_rows) = _dataset_lig_vs_ref(
+                dataset, args, run_dir, alive_rows=alive_rows,
+                cluster_csv_override=cluster_csv_override, rscc_column=rscc_column,
+                symmetry=symmetry,
+            )
+            all_ref.extend(ref_vals)
+            all_pipeline.extend(pipeline_vals)
+            total_unmatched += n_unmatched
+            total_excess += n_excess
+            for row in matched_rows:
+                row_out = dict(row)
+                row_out['dataset'] = dataset
+                all_rows.append(row_out)
+            for row in unmatched_ref_rows:
+                row_out = dict(row)
+                row_out['dataset'] = dataset
+                all_unmatched_ref_rows.append(row_out)
+            for row in excess_pipeline_rows:
+                row_out = dict(row)
+                row_out['dataset'] = dataset
+                all_excess_pipeline_rows.append(row_out)
+            print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
+                  f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
+
+        graphs_dir = Path(args.graphs_dir)
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+        plot_rscc_scatter(
+            all_ref, all_pipeline,
+            xlabel='Reference RSCC', ylabel='Pipeline RSCC',
+            title=title if lookup is None else f'{title} (Symmetry Aware)',
+            out_path=graphs_dir / this_out_name,
+            extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
+                        f'Excess pipeline LIGs: {total_excess}'),
+        )
+
+        if all_rows:
+            rows_df = pd.DataFrame(all_rows).rename(
+                columns={'cluster_rep_index': resi_col_name, 'pipeline_chain': chain_col_name}
+            )[['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc',
+               chain_col_name, resi_col_name, 'pipeline_rscc']]
+            write_plot_csv(graphs_dir, this_out_name, rows_df)
+
+        this_out_stem = Path(this_out_name).stem
+        if all_unmatched_ref_rows:
+            unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
+                ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc', 'reason']
+            ]
+            write_plot_csv(graphs_dir, f'{this_out_stem}_unmatched_ref.png', unmatched_df)
+
+        if all_excess_pipeline_rows:
+            excess_df = pd.DataFrame(all_excess_pipeline_rows).rename(
+                columns={'cluster_rep_index': resi_col_name, 'pipeline_chain': chain_col_name}
+            )[['dataset', chain_col_name, resi_col_name, 'pipeline_rscc', 'placer_file', 'index']]
+            write_plot_csv(graphs_dir, f'{this_out_stem}_excess_pipeline.png', excess_df)
 
 
 def _dataset_residues_vs_ref(dataset, args, structure_rscc, restrict_labels):
@@ -1664,7 +1725,7 @@ def _ref_despot_conformations(dataset, args):
     return result
 
 
-def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
+def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=None):
     """For one dataset, matches every reference LIG conformation with a
     heavy-atom-normalized DESPOT score (_ref_despot_conformations) to the
     nearest cluster-rep ligand pose in run_dir/cluster_rep_models.pdb (by
@@ -1703,6 +1764,9 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
     per eligible cluster-rep ligand that was never any reference ligand's
     nearest match - {cluster_rep_index, pipeline_chain, placer_file, index} -
     placer_file/index are that row's own cluster_reps.csv columns.
+
+    symmetry: optional CrystalSymmetry - same meaning as _dataset_lig_vs_ref's own symmetry
+    argument (crystal-symmetry-aware centroid matching instead of identity-frame only).
     """
     ref_conformations = _ref_despot_conformations(dataset, args)
     if not ref_conformations:
@@ -1763,7 +1827,8 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
             c = pipeline_centroids[i]
             if c is None:
                 continue
-            dist = float(np.linalg.norm(c - ref_centroid))
+            dist = (float(np.linalg.norm(c - ref_centroid)) if symmetry is None
+                    else symmetry.distance(ref_centroid, c))
             if dist < best_dist:
                 best_dist = dist
                 best_row = i
@@ -1807,7 +1872,8 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None):
             unmatched_ref_rows, excess_pipeline_rows)
 
 
-def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None):
+def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_dataset=None,
+                        cell_lookup=None):
     """Pools per-dataset heavy-atom-normalized DESPOT score comparisons
     (reference structure vs matched pipeline cluster-rep ligand - same
     centroid-distance matching plot_lig_vs_ref uses for RSCC, see
@@ -1837,73 +1903,93 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
     despot_filtered.pdb-derived set plot_lig_vs_ref_despot.py uses so this
     plot's matched pairs - and its unmatched/excess counts - agree exactly
     with lig_vs_reference_rscc.png in the same despot_run_name folder.
+
+    cell_lookup: optional {dataset: (a, b, c, alpha, beta, gamma, space_group)} (see
+    read_cell_lookup) - same meaning as plot_lig_vs_ref's own cell_lookup argument: when
+    given, ALSO writes a crystal-symmetry-aware twin of every output (<out_name stem>_sa.png/
+    .csv/_sa_unmatched_ref.csv/_sa_excess_pipeline.csv), matching via
+    _dataset_despot_vs_ref's symmetry argument instead of plain identity-frame distance.
     """
-    datasets = read_datasets(args.datasets_file)
-    all_ref, all_pipeline, all_rows = [], [], []
-    all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
-    total_unmatched, total_excess = 0, 0
-
-    for dataset in datasets:
-        run_dir = run_dir_for_dataset(dataset)
-        alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
-        (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
-         unmatched_ref_rows, excess_pipeline_rows) = _dataset_despot_vs_ref(
-            dataset, args, run_dir, alive_rows=alive_rows
-        )
-        all_ref.extend(ref_vals)
-        all_pipeline.extend(pipeline_vals)
-        total_unmatched += n_unmatched
-        total_excess += n_excess
-        for row in matched_rows:
-            row_out = dict(row)
-            row_out['dataset'] = dataset
-            all_rows.append(row_out)
-        for row in unmatched_ref_rows:
-            row_out = dict(row)
-            row_out['dataset'] = dataset
-            all_unmatched_ref_rows.append(row_out)
-        for row in excess_pipeline_rows:
-            row_out = dict(row)
-            row_out['dataset'] = dataset
-            all_excess_pipeline_rows.append(row_out)
-        print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
-              f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
-
-    graphs_dir = Path(args.graphs_dir)
-    graphs_dir.mkdir(parents=True, exist_ok=True)
-
     out_stem = Path(out_name).stem
-    if all_unmatched_ref_rows:
-        unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
-            ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized', 'reason']
+    out_suffix = Path(out_name).suffix
+    passes = [(None, out_name)]
+    if cell_lookup is not None:
+        passes.append((cell_lookup, f'{out_stem}_sa{out_suffix}'))
+
+    for lookup, this_out_name in passes:
+        datasets = read_datasets(args.datasets_file)
+        all_ref, all_pipeline, all_rows = [], [], []
+        all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
+        total_unmatched, total_excess = 0, 0
+
+        for dataset in datasets:
+            run_dir = run_dir_for_dataset(dataset)
+            alive_rows = alive_rows_for_dataset(dataset) if alive_rows_for_dataset else None
+            symmetry = None
+            if lookup is not None:
+                if dataset not in lookup:
+                    print(f'  {dataset}: no cell/space-group info in --cell-lookup-file; '
+                          f'falling back to identity-frame matching for the symmetry-aware pass.')
+                else:
+                    symmetry = CrystalSymmetry(lookup[dataset])
+            (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
+             unmatched_ref_rows, excess_pipeline_rows) = _dataset_despot_vs_ref(
+                dataset, args, run_dir, alive_rows=alive_rows, symmetry=symmetry,
+            )
+            all_ref.extend(ref_vals)
+            all_pipeline.extend(pipeline_vals)
+            total_unmatched += n_unmatched
+            total_excess += n_excess
+            for row in matched_rows:
+                row_out = dict(row)
+                row_out['dataset'] = dataset
+                all_rows.append(row_out)
+            for row in unmatched_ref_rows:
+                row_out = dict(row)
+                row_out['dataset'] = dataset
+                all_unmatched_ref_rows.append(row_out)
+            for row in excess_pipeline_rows:
+                row_out = dict(row)
+                row_out['dataset'] = dataset
+                all_excess_pipeline_rows.append(row_out)
+            print(f'  {dataset}: {len(ref_vals)} matched ligand(s), {n_unmatched} unmatched '
+                  f'reference ligand(s), {n_excess} excess pipeline ligand(s)')
+
+        graphs_dir = Path(args.graphs_dir)
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+
+        this_out_stem = Path(this_out_name).stem
+        if all_unmatched_ref_rows:
+            unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
+                ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized', 'reason']
+            ]
+            write_plot_csv(graphs_dir, f'{this_out_stem}_unmatched_ref.png', unmatched_df)
+        if all_excess_pipeline_rows:
+            excess_df = pd.DataFrame(all_excess_pipeline_rows)[
+                ['dataset', 'pipeline_chain', 'cluster_rep_index', 'placer_file', 'index']
+            ]
+            write_plot_csv(graphs_dir, f'{this_out_stem}_excess_pipeline.png', excess_df)
+
+        if not all_ref:
+            print(f'  No matched ligand(s) found for any dataset; skipping {this_out_name}.')
+            continue
+
+        plot_rscc_scatter(
+            all_ref, all_pipeline,
+            xlabel='Reference DESPOT Score (normalized)',
+            ylabel='Pipeline DESPOT Score (normalized)',
+            title=title if lookup is None else f'{title} (Symmetry Aware)',
+            out_path=graphs_dir / this_out_name,
+            extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
+                        f'Excess pipeline LIGs: {total_excess}'),
+            axis_range=_auto_axis_range(all_ref, all_pipeline),
+        )
+
+        rows_df = pd.DataFrame(all_rows)[
+            ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized',
+             'pipeline_chain', 'cluster_rep_index', 'pipeline_despot_normalized']
         ]
-        write_plot_csv(graphs_dir, f'{out_stem}_unmatched_ref.png', unmatched_df)
-    if all_excess_pipeline_rows:
-        excess_df = pd.DataFrame(all_excess_pipeline_rows)[
-            ['dataset', 'pipeline_chain', 'cluster_rep_index', 'placer_file', 'index']
-        ]
-        write_plot_csv(graphs_dir, f'{out_stem}_excess_pipeline.png', excess_df)
-
-    if not all_ref:
-        print(f'  No matched ligand(s) found for any dataset; skipping {out_name}.')
-        return
-
-    plot_rscc_scatter(
-        all_ref, all_pipeline,
-        xlabel='Reference DESPOT Score (normalized)',
-        ylabel='Pipeline DESPOT Score (normalized)',
-        title=title,
-        out_path=graphs_dir / out_name,
-        extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
-                    f'Excess pipeline LIGs: {total_excess}'),
-        axis_range=_auto_axis_range(all_ref, all_pipeline),
-    )
-
-    rows_df = pd.DataFrame(all_rows)[
-        ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized',
-         'pipeline_chain', 'cluster_rep_index', 'pipeline_despot_normalized']
-    ]
-    write_plot_csv(graphs_dir, out_name, rows_df)
+        write_plot_csv(graphs_dir, this_out_name, rows_df)
 
 
 def _dataset_rscc_despot_tradeoff(dataset, args, run_dir, alive_rows, cluster_csv_override):
@@ -2764,3 +2850,93 @@ def plot_placer2_vs_placer1_rmsd(round1_csv, round2_csv, out_dir, filter1_csv=No
         color_by_density=True,
     )
     write_plot_csv(out_dir, out_name, merged)
+
+
+def read_cell_lookup(path):
+    """Parses '--cell-lookup-file' lines "dataset a b c alpha beta gamma space_group" (the
+    same format/file program.sh's DESPOT_CELL_LOOKUP_FILE already builds from CSV_FILE) into
+    {dataset: (a, b, c, alpha, beta, gamma, space_group)}."""
+    cells = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            a, b, c, alpha, beta, gamma = (float(x) for x in parts[1:7])
+            cells[parts[0]] = (a, b, c, alpha, beta, gamma, parts[7])
+    return cells
+
+
+class CrystalSymmetry:
+    """Point-to-point distances minimised over a crystal's space-group operators and lattice
+    translations, for comparing ligand centroids that may sit at symmetry-equivalent sites.
+    Reference PDBs' CRYST1 records can't be trusted for this (they may say P 1), so the cell
+    comes from --cell-lookup-file (see read_cell_lookup). Operators come from cctbx, imported
+    here rather than at module level since not every script using rscc_common needs it."""
+
+    _OFFSETS = np.array([(i, j, k) for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
+                        dtype=float)
+
+    def __init__(self, cell):
+        from cctbx import crystal
+        a, b, c, alpha, beta, gamma, space_group = cell
+        symmetry = crystal.symmetry(unit_cell=(a, b, c, alpha, beta, gamma),
+                                    space_group_symbol=space_group)
+        unit_cell = symmetry.unit_cell()
+        self.orth = np.array(unit_cell.orthogonalization_matrix()).reshape(3, 3)
+        self.frac = np.array(unit_cell.fractionalization_matrix()).reshape(3, 3)
+        self.ops = [(np.array(op.r().as_double()).reshape(3, 3), np.array(op.t().as_double()),
+                     op.is_unit_mx() and not any(op.t().as_double()))
+                    for op in symmetry.space_group().all_ops()]
+
+    def distance(self, a, b, include_identity=True):
+        """Minimum distance (A) from b to any symmetry image of a. include_identity=False
+        leaves out a itself (identity operator with no lattice translation), so the result is
+        the distance from b to a's nearest symmetry mate."""
+        fa, fb = self.frac @ np.asarray(a, dtype=float), self.frac @ np.asarray(b, dtype=float)
+        best = np.inf
+        for R, t, identity in self.ops:
+            image = R @ fa + t
+            # nearest lattice image of this operator's copy, +/-1 cell (exact for oblique cells)
+            translations = np.round(fb - image) + self._OFFSETS
+            if identity and not include_identity:
+                translations = translations[np.any(translations != 0, axis=1)]
+            dists = np.linalg.norm((image + translations - fb) @ self.orth.T, axis=1)
+            best = min(best, float(dists.min()))
+        return best
+
+    def nearest_image(self, atoms, query_point):
+        """Rigidly transforms atoms (an Nx3 cartesian array - e.g. a full ligand conformer,
+        not just its centroid) by whichever space-group operator + nearest lattice
+        translation puts ITS OWN CENTROID nearest query_point (cartesian), searched over
+        every operator INCLUDING identity (so the result may be atoms unchanged, when the
+        direct/identity comparison is already closest) - see distance(), which this reuses
+        the same per-operator nearest-lattice-image search from, but for a whole rigid group
+        instead of a single point. The one (R, t, lattice offset) found via the centroid is
+        applied identically to every atom, so the group's own internal geometry (bond
+        lengths, etc.) is preserved exactly - this is what lets a ligand matched to a
+        crystal-symmetry mate by its centroid alone still be compared atom-by-atom (e.g. for
+        RMSD) against that same image.
+
+        Returns (image_atoms, dist): image_atoms is atoms' Nx3 cartesian image, dist is the
+        resulting (minimum) centroid distance to query_point."""
+        atoms = np.asarray(atoms, dtype=float)
+        centroid = atoms.mean(axis=0)
+        fa = self.frac @ centroid
+        fb = self.frac @ np.asarray(query_point, dtype=float)
+        frac_atoms = atoms @ self.frac.T
+
+        best_dist = np.inf
+        best_R, best_t, best_offset = None, None, None
+        for R, t, _identity in self.ops:
+            image = R @ fa + t
+            translations = np.round(fb - image) + self._OFFSETS
+            dists = np.linalg.norm((image + translations - fb) @ self.orth.T, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] < best_dist:
+                best_dist = float(dists[idx])
+                best_R, best_t, best_offset = R, t, translations[idx]
+
+        image_frac = frac_atoms @ best_R.T + best_t + best_offset
+        image_cart = image_frac @ self.orth.T
+        return image_cart, best_dist
