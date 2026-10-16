@@ -286,7 +286,7 @@ CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 LIG_PDB_DIR="${BASE_DIR}/pdb_final_geometry"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
 CONDA_ENV_QFIT="nikhils_program"
-CONDA_ENV_PLACER="placer"
+CONDA_ENV_PLACER="placer_env"
 CONDA_ENV_RSR="nikhils_program"
 CONDA_ENV_EVAL="nikhils_program"
 CONDA_ENV_DESPOT="DESPOT"
@@ -4408,8 +4408,8 @@ stage2_placer() {
 
 stage3_filter() {
     run_step "Stage 3a: filter (${filter_run_name})" do_filter
-    # run_step "Stage 3b: rsr_backbone (${filter_run_name})" do_rsr_backbone
-    # run_step "Stage 3c: calc_backbone_refined_rscc (${filter_run_name})" do_calc_backbone_rscc
+    run_step "Stage 3b: rsr_backbone (${filter_run_name})" do_rsr_backbone
+    run_step "Stage 3c: calc_backbone_refined_rscc (${filter_run_name})" do_calc_backbone_rscc
     if [ "$compare_ref_set" -eq 1 ]; then
         run_step_pooled_replot "Stage 3d: plot_lig_vs_ref_filter1 + plot_residues_vs_ref_backbone (${filter_run_name})" \
             filter1_ref_comparison_outputs_exist do_filter1_ref_comparison
