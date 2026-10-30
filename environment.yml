@@ -21,3 +21,4 @@ dependencies:
   - coot-headless
   - openbabel
   - pdb2pqr
+  - gemmi

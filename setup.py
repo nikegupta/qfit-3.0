@@ -61,6 +61,10 @@ def main():
                 "despot_filter = qfit.command_line.despot_filter:main",
                 "select_optimized_residues = qfit.command_line.select_optimized_residues:main",
                 "extract_ligand_conformers = qfit.command_line.extract_ligand_conformers:main",
+                "generate_conformers = qfit.command_line.generate_conformers:main",
+                "build_clash_ensemble = qfit.command_line.build_clash_ensemble:main",
+                "run_edia = qfit.command_line.run_edia:main",
+                "evaluate_structure = qfit.command_line.evaluate_structure:main",
             ]
         },
     )

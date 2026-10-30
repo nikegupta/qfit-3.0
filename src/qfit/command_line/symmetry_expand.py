@@ -14,6 +14,9 @@ from qfit import Structure
 # many mates/chains can exhaust single characters).
 _CHAIN_ID_ALPHABET = string.ascii_uppercase + string.ascii_lowercase + string.digits
 
+# Default atoms the symmetry-mate distance cutoff is measured from.
+DEFAULT_TARGET_SELECTION = 'resname LIG'
+
 
 def build_argparser():
     p = argparse.ArgumentParser(
@@ -58,9 +61,10 @@ def build_argparser():
         'distance_cutoff',
         type=float,
         help='A symmetry mate is considered only if at least one of its (protein) atoms is '
-             'within this distance (Å) of some ligand (resname LIG) atom in the input '
-             'structure. Of a considered mate, only the residues with at least one atom '
-             'within this distance of a ligand atom are kept - the rest of that mate\'s '
+             'within this distance (Å) of some target atom (see --target-selection; by '
+             'default every resname LIG atom) in the input structure. Of a considered mate, '
+             'only the residues with at least one atom within this distance of a target '
+             'atom are kept - the rest of that mate\'s '
              'residues (too far to matter for a local energy calculation) are discarded, '
              'which keeps the expanded structure small.'
     )
@@ -87,6 +91,16 @@ def build_argparser():
              'scoring is not set up to handle. A final_model_refined.pdb already has none '
              'of these, so this is a no-op on one; kept as an explicit, toggleable flag '
              'rather than always-on for control.'
+    )
+    p.add_argument(
+        '--target-selection',
+        default=DEFAULT_TARGET_SELECTION,
+        help='qfit selection string for the atoms distance_cutoff is measured from, e.g. '
+             '"chain B and resi 407" to expand around a protein residue instead of the '
+             f'ligand(s) (default: "{DEFAULT_TARGET_SELECTION}"). Applied to '
+             '--ligand-conformers-pdb instead of input_pdb when that is given. Only changes '
+             'the distance reference: resname LIG atoms are still never symmetry-expanded or '
+             'written to output_pdb, and are still written to ligand_output_dir.'
     )
     p.add_argument(
         '--ligand-conformers-pdb',
@@ -155,12 +169,17 @@ def _full_atom_mask(struct, subset_mask):
     return full_mask
 
 
-def find_protein_symmetry_mates(structure, distance_cutoff, ligand_conformers=None):
+def find_protein_symmetry_mates(structure, distance_cutoff, ligand_conformers=None,
+                                target_selection=DEFAULT_TARGET_SELECTION):
     """
     Finds every crystallographic symmetry mate of structure's protein atoms
-    (resname != LIG) that comes within distance_cutoff of a ligand (resname LIG) atom, and
+    (resname != LIG) that comes within distance_cutoff of a target atom, and
     returns them as a list of new Structure objects (deep copies, safe to modify/combine
     further).
+
+    target_selection: qfit selection string for the target atoms (default 'resname LIG',
+    i.e. the ligand(s)); e.g. 'chain B and resi 407' measures from a protein residue instead.
+    Below, "ligand" refers to whatever atoms target_selection picks.
 
     ligand_conformers: optional Structure to use as the mate-proximity target INSTEAD of
     structure's own ligand atoms - e.g. every placer2 conformer pooled into one pdb, not just
@@ -196,11 +215,11 @@ def find_protein_symmetry_mates(structure, distance_cutoff, ligand_conformers=No
     if protein.natoms == 0:
         raise ValueError('No protein (non-LIG) atoms found in structure.')
     ligand = (ligand_conformers if ligand_conformers is not None else structure).extract(
-        'resname LIG')
+        target_selection)
     if ligand.natoms == 0:
         source = 'ligand_conformers' if ligand_conformers is not None else 'structure'
-        raise ValueError(f'No ligand (resname LIG) atoms found in {source} - nothing to '
-                          f'measure distance_cutoff against.')
+        raise ValueError(f'No atoms matching "{target_selection}" found in {source} - nothing '
+                          f'to measure distance_cutoff against.')
     protein_baseline_coor = protein.coor.copy()
     tree = cKDTree(ligand.coor)
 
@@ -225,7 +244,7 @@ def find_protein_symmetry_mates(structure, distance_cutoff, ligand_conformers=No
             residues_in_range = np.unique(residue_id[atom_dists <= distance_cutoff])
             keep_mask = np.isin(residue_id, residues_in_range)
             print(f'  Accepted symmetry mate {len(mates) + 1}: '
-                  f'minimum atom-atom distance to ligand = {min_dist:.2f} Å, '
+                  f'minimum atom-atom distance to target = {min_dist:.2f} Å, '
                   f'keeping {keep_mask.sum()}/{protein.natoms} atom(s) '
                   f'({len(residues_in_range)} residue(s)) within {distance_cutoff} Å')
             mates.append(protein.extract(_full_atom_mask(protein, keep_mask)).copy())
@@ -354,9 +373,10 @@ def main():
             ligand_conformers = ligand_conformers.combine(Structure.fromfile(str(extra_pdb)))
         ligand_source = ', '.join(str(p) for p in args.ligand_conformers_pdb)
 
-    mates = find_protein_symmetry_mates(structure, args.distance_cutoff, ligand_conformers)
+    mates = find_protein_symmetry_mates(structure, args.distance_cutoff, ligand_conformers,
+                                        target_selection=args.target_selection)
     print(f'Found {len(mates)} protein symmetry mate(s) within {args.distance_cutoff} '
-          f'Å of the ligand(s) in {ligand_source}.')
+          f'Å of "{args.target_selection}" in {ligand_source}.')
 
     used_chain_ids = set(structure.chain)
     protein_output = structure.extract('not resname LIG')
