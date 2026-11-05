@@ -1,194 +1,196 @@
-# nikhils_program
+# snEDIAm: density-based scoring of predicted ligand poses
 
-Nikhil's program is a pipeline for automatically fitting ligands and protein conformational changes to PanDDAs maps.
-Given, per dataset, an apo/ground-state protein model, one or more PanDDA event maps, and a candidate ligand
-(SMILES + crystal cell/space group), the pipeline places the ligand into density, samples and
-refines its conformation (and the surrounding protein sidechains) across several rounds, merges
-everything into one composite model, real-space refines it, optionally re-optimizes rotamers near
-the ligand, and finally rescores the surviving ligand pose with an independent statistical
-potential (DESPOT). Every stage is driven by `program.sh` , a single bash script that wires
-together several console tools from a local `qfit-3.0` checkout, an external PLACER install, and
-an external DESPOT install.
+This branch (`snEDIAm`) turns qfit-3.0 into a toolkit for asking one question: **how well does a
+predicted ligand pose fit the experimental electron density, compared with what chance alone
+would give?**
+
+A raw density-fit score is hard to interpret. A ligand of a given size, at a given resolution, in
+a given pocket, can score moderately well just by sitting in the right place. snEDIAm calibrates
+the score:
+
+- **Per-atom EDIA:** density fit is measured as per-atom EDIA (electron density for individual
+  atoms, EDIAscorer 1.3), summarised as the **mean atom EDIA** of the ligand.
+- **Null distribution:** for every modeled ligand conformation, a local null distribution is
+  built. It contains up to ~1000 random, non-clashing placements of the same ligand (random
+  torsions and orientation, centroid within 3 Å of the modeled ligand's), each scored against the
+  same map exactly as the real ligand is.
+- **Percentile:** a predicted pose is scored the same way, and its **percentile in that null
+  distribution** is the result. A pose at the 99th percentile fits the density better than 99% of
+  random placements in the same site.
+
+Two driver scripts do the work:
+
+| Script | Purpose |
+|---|---|
+| `generate_null.sh` | Builds and scores the null distribution of every modeled ligand conformation, per dataset |
+| `evaluate_structures.sh` | Matches each predicted structure to a reference ligand, scores its ligand and reports its percentile in that ligand's null |
+
+`prep_distribution.sh` (kept in `BASE_DIR`, alongside the data) connects the two. It collects one
+`generate_null.sh` run into a self-contained `distribution/` tree, which `evaluate_structures.sh`
+reads.
 
 ## Installation
 
-The pipeline spans four separate pieces of software, each with its own conda environment.
-`program.sh`'s own "User-specified configuration" block (near the top of the file) hardcodes the
-paths and environment names below - edit that block to match wherever you install things.
-
-### 1. qfit-3.0
+### 1. qfit-3.0 (this branch) and its conda environment
 
 ```bash
-git clone https://github.com/nikegupta/qfit-3.0 program_rotamer/qfit-3.0
+git clone -b snEDIAm https://github.com/nikegupta/qfit-3.0
 cd qfit-3.0
-conda env create -f environment.yml    # creates "nikhils_program_rotamer" - see name: in the yml
-conda activate nikhils_program
+conda env create -f environment.yml    # creates the "snEDIAm" environment
+conda activate snEDIAm
 pip install -e .
 ```
 
-This environment is used for most steps of the pipeline
+The install provides the console tools the drivers call (`generate_conformers`, `run_edia`,
+`build_clash_ensemble`). `match_ligand` runs as `python -m qfit.command_line.match_ligand`, and
+the plotting scripts live in `src/snediam_analysis_scripts/`.
 
-### 2. PLACER (protein-ligand conformer sampling)
+### 2. EDIAscorer 1.3
 
-PLACER is a separate repository, not vendored here:
-
-```bash
-git clone https://github.com/baker-laboratory/PLACER.git
-cd PLACER
-conda env create -f envs/placer_env.yml
-conda activate placer_env
-```
-
-Point `program.sh`'s `RUN_PLACER_PY` variable at that checkout's `run_PLACER.py`, and
-`CONDA_ENV_PLACER` at the `placer_env` environment name. PLACER also needs a CUDA-capable GPU
-(cuda-toolkit >= 12.1) - see the PLACER repo's own README for its full requirement list.
-
-### 3. DESPOT (final ligand-pose scoring)
-
-Also a separate repository:
+Get EDIAscorer 1.3 from the ZBH (University of Hamburg) and install its licence, which
+EDIAscorer reads from `~/.config/ZBH/`. EDIAscorer 1.3 needs glibc ≥ 2.29, so `run_edia` runs it
+inside a rootless **podman** container:
 
 ```bash
-git clone https://github.com/KUL-LBMD/DESPOT.git
-cd DESPOT
-conda env create -f environment.yml
-conda activate DESPOT
-pip install -e .
-bash download_data.sh   # downloads the pretrained potentials + metadata (~1.9 GB) into DESPOT/data
+podman pull registry.access.redhat.com/ubi9/ubi
 ```
 
-Point `DESPOT_SCRIPT` at that checkout's `scripts/score_complex.py` and `CONDA_ENV_DESPOT` at the
-`DESPOT` environment name. `DESPOT_DATABASE` selects which trained potential to score against
-(default: `CROWN`).
+`$HOME` is mounted into the container. EDIAscorer, the maps, the output folders and the licence
+must therefore all be under `$HOME`.
 
-### Configuring program.sh
+### 3. Other requirements
 
-Once all four environments exist, edit the "User-specified configuration" block at the top of
-`program.sh`: `BASE_DIR`, `CONDA_SH` (your `conda.sh` init script), the five `CONDA_ENV_*`
-variables, `RUN_PLACER_PY`, `DESPOT_SCRIPT`. The
-script will refuse to run (with a clear "required file not found" error) if any configured script
-path doesn't actually exist, so a misconfiguration is caught immediately rather than partway
-through a run.
+- GNU `parallel` (for `-p` dataset parallelism).
+- A conda `conda.sh` init script.
+
+### Configuration
+
+Each driver has a **"User-specified configuration"** block near its top. Edit it to match your
+install:
+
+- `BASE_DIR`, `CONDA_SH`, `CONDA_ENV_NULL` (`snEDIAm`);
+- `EDIASCORER` (path to the EDIAscorer 1.3 executable), `EDIA_IMAGE`;
+- the data paths and file-name patterns described below.
+
+The scripts stop with a clear error if a required file is missing.
 
 ## Input layout
 
-Before running the pipeline you need, under `BASE_DIR`:
+Under `BASE_DIR`:
 
-- **`datasets.txt`** - A file listing the datasets to run the pipeline on, one dataset per line.
-- **`datasets/<dataset>/`** - one directory per dataset id, containing:
-  - `<dataset>-aligned-structure.pdb` - the apo/ground-state protein model.
-  - `<dataset>-z_map.native.ccp4` - the zmap for that protein model
-  - `<dataset>-event_<N>_1-BDC_<value>_map.native.ccp4` - one or more PanDDA event maps.
-- **A CSV with required information about the datasets** (path set by `CSV_FILE`, `pxr_fragments.csv` in the github version) with columns
-  `dataset,resolution,ligand_name,a,b,c,alpha,beta,gamma,space_group,smiles` - one row per
-  dataset, giving the candidate ligand's SMILES and the crystal's cell/space group 
-- **`pdb_final_geometry/`** (path set by `LIG_PDB_DIR`) - contains the pdb structure and cif restraints file for each ligand in the dataset.
-- **`reference_set/<dataset>/`** (optional, only needed for `-c`) - a deposited/reference
-  structure per dataset, to compare pipeline output against.
+- **`datasets_test.txt`** (or any list set by `DATASETS_FILE`): dataset ids, one per line.
+- **`pxr_fragments.csv`** (`CSV_FILE`): one row per dataset with columns
+  `dataset,resolution,ligand_name,a,b,c,alpha,beta,gamma,space_group,smiles`.
+  - The unit cell, space group and resolution are always taken from here, never from PDB
+    CRYST1/REMARK records.
+  - The SMILES gives the ligand's bond orders.
+- **`datasets/<dataset>/`**, per dataset:
+  - `<dataset>_001.pdb`: the reference model (`STRUCTURE_PDB_PATTERN`) with the ligand(s) as
+    residue `LIG`. It is a multiconformer model: altloc A is the apo state and is ignored for
+    clash checks, but every altloc is kept as density context for EDIA.
+  - `<dataset>_refined_2fofc.ccp4`: the density map (`MAP_NAME_PATTERN`), in the model's frame.
+- **`test/datasets/<dataset>/`**: the predicted structures to evaluate, e.g.
+  `<dataset>_seed_42_sample_1_model.pdb` (`PREDICTION_PATTERN`). They can be numbered and
+  chained differently from the reference; matching uses sequence alignment.
 
-## Running the pipeline
+## Usage
 
-```bash
-./program.sh <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter2_run_name [final_run_name [rotamer_run_name [despot_run_name]]]]]]]
-             [-n <num_placer_confs>] [-n2 <num_placer2_confs>] [-g <gpu_ids>] [-p <num_parallel>]
-             [-c] [--overwrite] [--replot] [--dataset <id[,id...]>] [...many per-stage tunables]
-```
-
-Only `<run_name>` is required. The eight positional names correspond to the eight nested stages
-of the pipeline (see below) - supplying fewer of them simply stops the pipeline after that stage,
-and each name becomes a subdirectory nested under the previous one, so re-running with a new name
-at any point branches off cleanly without touching earlier results. Every step checks whether its
-own output already exists and skips it if so (pass `--overwrite` to force a redo, or `--replot`
-to redo just the graphing/analysis steps).
-
-Examples:
+### 1. Build the null distributions: `generate_null.sh`
 
 ```bash
-./program.sh run_1 placer_1 filter_1                                    # stages 0-3 only
-./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1        # through build_final + RSR
-./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1              # + rotamer optimization
-./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1 despot_1     # + DESPOT scoring
-./program.sh run_1 placer_1 filter_1 placer2_1 filter2_1 final_1 rotamer_1 -c            # + compare to reference_set
-./program.sh run_1 placer_1 filter_1 --dataset x00001-1,x00002-1        # restrict to specific datasets
+./generate_null.sh <run_name> [-p <num_parallel>] [--dataset <id[,id...]>]
+                   [--n_conformers 1000] [--sampling_radius 3] [--edia_workers <n>]
+                   [--overwrite] [--replot] [...]
 ```
 
-Key flags: `-n`/`-n2` set how many PLACER conformers to sample in rounds 1 and 2 (default 100
-each), these variables most significantly affect run time.
-`-g` sets which GPU id(s) PLACER uses; `-p` sets CPU parallelism for every other stage;
-`-c` additionally scores everything against `reference_set/` for validation. A large set of
-per-stage tunables are passed straight through to the corresponding step; see `./program.sh -h` for the full list.
-For best results `--f2_filter_proportion 1` should be added to prevent excessive culling of potential ligands.
+Run `./generate_null.sh -h` for every option. Each modeled ligand conformation (each altloc of
+each `LIG` residue) gets its own folder, `datasets/<dataset>/<run_name>/LIG_<chain><resi>_<altloc>/`
+(e.g. `LIG_A701_B`).
 
-## Pipeline stages
+- **Stage 1: `generate_conformers`.**
+  - Random placements are generated: a torsion conformer, a centroid drawn uniformly from a 3 Å
+    sphere around the modeled ligand's centroid, and a random orientation.
+  - Placements are kept if they don't clash with the protein (0.5 × vdW, altloc A ignored).
+  - Writes `conformers.pdb` (one MODEL per placement), `ligand.pdb` (the modeled conformation),
+    `conformer_summary.json` and `ensemble_mask.ccp4`.
+  - Pooled plots of ensemble volume, acceptance and reference coverage go to
+    `graphs/<run_name>/`.
+- **Stage 2: `run_edia`.**
+  - Per-atom EDIA of every placement (`distribution_residue_scores.csv`,
+    `distribution_atom_scores.csv`).
+  - Per-atom EDIA of the modeled ligand (`reference_residue_scores.csv`,
+    `reference_atom_scores.csv`).
+  - A histogram of the null's mean atom EDIA.
+- **Stage 3: pooled evaluation plots.** The reference ligands' scores, null medians and means,
+  and each reference's percentile in its own null.
 
-### Stage 1: fit_ligand
+Every step skips outputs that already exist (`--overwrite` redoes them, `--replot` redoes the
+plots). Interrupted EDIA scoring resumes from its finished calls. `--dataset` restricts a run to
+specific datasets.
 
-For each dataset, `fit_ligand` scans the event map(s) for density peaks above a Z-score threshold
-and, at each candidate peak and places a copy of the ligand at each peak (or a copy of each possible stereoisomer).
-Each accepted peak produces one seeded ligand-in-protein starting structure,
-recorded in a per-dataset manifest linking it back to the peak and ligand that produced it.
+`run_edia` is a standalone, general scorer. It takes any single- or multi-model ligand PDB, a
+protein target (LIG/HOH/DMS removed) and a map:
 
-### Stage 2: PLACER (round 1) + real-space refinement
+```bash
+run_edia ligand.pdb target.pdb map.ccp4 out_dir --cell a b c alpha beta gamma \
+         --space-group P212121 --resolution 1.96 [--smiles ...] \
+         [--residue-scores scores.csv] [--atom-scores atoms.csv]
+```
 
-Each `fit_ligand` seed is handed to **PLACER** (Protein-Ligand Atomistic Conformational Ensemble
-Resolver, run out of a separate install), which stochastically resamples the ligand's atomic
-positions and nearby protein sidechains to generate an ensemble of plausible conformers for
-that seed. Every conformer in the resulting ensemble is then **real-space refined** against the
-event map: a coot-headless-scripted refinement (`rsr_placer`, via `src/rsr_scripts/`) that
-locally minimizes the ligand and surrounding residues into the density without changing the rest
-of the model.
+### 2. Collect a run's distributions: `prep_distribution.sh`
 
-### Stage 3: filter
+```bash
+./prep_distribution.sh <generate_null_run> datasets_test.txt
+```
 
-`filter` clusters the (refined) round-1 conformers spatially, scores every conformer's fit to the
-event map (RSCC), and keeps one representative per cluster. 
-It then real-space refines the protein backbone around each surviving cluster's
-representative (`rsr_backbone`) and computes that backbone's own refined RSCC, giving each
-cluster a refined structural context to hand off to round 2.
+The script copies the reference structure and map once per dataset, and the run's null and
+reference score CSVs per run:
 
-### Stage 4: PLACER (round 2) + real-space refinement
+```
+distribution/<dataset>/<dataset>_001.pdb, <dataset>_refined_2fofc.ccp4
+distribution/<dataset>/<generate_null_run>/LIG_<chain><resi>_<altloc>/
+    distribution_residue_scores.csv, reference_residue_scores.csv (+ params)
+```
 
-The same PLACER sampling is run again, once per surviving cluster, this time seeded from that
-cluster's real-space-refined backbone (`filter`'s round-1 output) rather than the raw round-1
-seed - a second, more targeted round of conformer sampling now that the local protein environment
-has already been refined once. Every round-2 conformer is again real-space refined
-(`rsr_placer2`).
+Reruns skip files that are already up to date.
 
-### Stage 5: filter2
+### 3. Evaluate predictions: `evaluate_structures.sh`
 
-The same `filter` script is run again on the round-2 ensemble, once more clustering and picking a
-representative conformer per cluster - this is the final round of pose selection before the
-per-dataset model is assembled.
+```bash
+./evaluate_structures.sh <distribution_run> <run_name> [-p <num_parallel>] [--dataset <id[,id...]>]
+                         [--prediction_pattern '{dataset}_seed_42_sample_*_model.pdb']
+                         [--metric mean_atom_edia] [--overwrite] [--replot]
+```
 
-### Stage 6: build_final_model + real-space refinement
+`<distribution_run>` is the `generate_null.sh` run collected by `prep_distribution.sh`, and
+`<run_name>` names this evaluation. Each prediction gets its own folder,
+`test/datasets/<dataset>/<distribution_run>/<run_name>/<prediction>/`.
 
-`build_final_model` merges every surviving filter2 cluster's representative ligand pose into a
-single composite structure built on top of the apo protein, resolving any sidechain-sidechain
-clashes that result from combining poses that were each optimized independently. 
-The merged model is then real-space refined as a whole (`rsr_final`), and its
-per-residue and per-ligand RSCC against the event map(s) is computed.
+- **Stage 1: `match_ligand`.**
+  - The prediction is CA-superposed onto each reference chain that contains a ligand, by
+    sequence alignment.
+  - Its ligand is matched to the reference ligand conformation (with a null) whose centroid is
+    nearest.
+  - Writes `match.txt` (e.g. `LIG_B701_B`), `match.json` and `ligand.pdb` (the predicted ligand
+    in the reference frame).
+- **Stage 2: `run_edia`.** Per-atom EDIA of the predicted ligand against the reference protein
+  and map, scored exactly like the nulls (`prediction_residue_scores.csv`,
+  `prediction_atom_scores.csv`).
+- **Stage 3: pooled results**, in `test/graphs/<distribution_run>/<run_name>/`:
+  - `evaluation.csv`: one row per prediction, with match, fit, score, percentile in the matched
+    null, and the reference ligand's score and percentile.
+  - A histogram of prediction percentiles.
+  - A scatter of prediction against matched-reference mean atom EDIA.
+  - Violins of each matched reference ligand's null, with its predictions and reference
+    overlaid.
 
-### Stage 7: rotamer_optimize + real-space refinement
+Logs of every run go to `logs/<run_name>/` (`generate_null.sh`) and
+`test/logs/<distribution_run>/<run_name>/` (`evaluate_structures.sh`).
 
-`rotamer_optimize` re-samples chi/aromatic-ring
-rotamers for every residue near the ligand whose RSCC (against the pre-refinement final model)
-falls below a threshold, keeping a resampled rotamer only if it improves RSCC by a meaningful
-margin; it also resolves any new sidechain-sidechain clashes the resampling introduces. The
-result is real-space refined again (`rsr_rotamer`), and its RSCC recomputed. Because RSR can
-shift things after the fact in ways `rotamer_optimize`'s own acceptance check couldn't see,
-`select_optimized_residues` then compares each candidate residue's post-refinement RSCC against
-its RSCC in the (pre-rotamer-optimization) final model and reverts any residue whose RSCC didn't
-actually improve enough to justify the change.
+## Typical workflow
 
-### Stage 8: DESPOT scoring
-
-Every round-2 PLACER
-conformer (not just each cluster's single selected representative) is pooled and the model's
-protein is symmetry-expanded around all of them; each conformer is scored against the protein
-with DESPOT's `score_complex.py`, an independent statistical potential for protein-ligand
-interactions. For each filter2 cluster, `despot_filter` looks at the MSE-vs-DESPOT Pareto front
-of that cluster's conformers, computes each front member's own real-space-refined RSCC, and
-picks the conformer that best trades off RSCC against normalized DESPOT score - which can differ
-from the pose stage 5/6/7 carried forward. That winning pose is kept only if it clears both an
-RSCC and a DESPOT-score threshold; otherwise the whole cluster's ligand is dropped from the final
-output, and any residue whose only rotamer support came from a dropped ligand is reset back to
-its apo conformation.
+```bash
+./generate_null.sh run_21 -p 8 --edia_workers 4      # build and score the nulls
+../prep_distribution.sh run_21 ../datasets_test.txt  # collect them into distribution/
+./evaluate_structures.sh run_21 eval_1 -p 4          # score the predictions against them
+```

@@ -3,16 +3,18 @@
 Evaluation of the deposited ligands against their null distributions (generate_null.sh stage 3),
 pooled across every dataset in datasets.txt. Four separate histograms, each with the plotted
 data as a CSV. Everything is read from the run's pockets, <dataset>/<conformer_run_name>/
-chain<X>/ (run_edia, stage 2a), where the reference ligands were scored with the same map and
+LIG_<chain><resi>_<altloc>/ (or chain<X>/ in runs before the per-ligand nulls; run_edia, stage
+2a), where the reference ligands were scored with the same map and
 settings as the pocket's null conformers. The score plotted is --metric, a column of
-edia_scores.csv and reference_edia.csv: by default mean_atom_edia (the plain mean of a
-molecule's per-atom EDIA), or e.g. EDIAm. With <m> the metric lower-cased:
+distribution_residue_scores.csv and reference_residue_scores.csv (edia_scores.csv and
+reference_edia.csv in runs scored before run_edia was generalized): by default mean_atom_edia
+(the plain mean of a molecule's per-atom EDIA), or e.g. EDIAm. With <m> the metric lower-cased:
 
-  structure_<m>             The score of every reference ligand (each LIG residue of the
-                            dataset's structure, one per altloc): reference_edia.csv. One point
-                            per reference.
-  null_median_<m>           Median score of the null conformers of each chain pocket:
-                            edia_scores.csv (references not included). One point per pocket.
+  structure_<m>             The score of every reference ligand (the pocket's ligand
+                            conformation; in chain<X> runs each LIG residue of the chain, one
+                            per altloc): reference_residue_scores.csv. One point per reference.
+  null_median_<m>           Median score of the null conformers of each pocket:
+                            distribution_residue_scores.csv. One point per pocket.
   null_mean_<m>             The same, mean score.
   structure_<m>_percentile  Percentile of each reference's score in the null distribution of
                             its pocket: the percentage of null conformers scoring below it, ties
@@ -24,7 +26,7 @@ Score histograms use 0.01 bins on an x axis from the lowest value - 0.01 to the 
 bins from the lowest percentile - 1 to the highest + 1, with a log count axis. Molecules
 without a score (failed EDIA calls) are left out and counted; a pocket without the metric's
 column (scored by an earlier run_edia) is warned about and left out, and a pocket without
-reference_edia.csv contributes only to the null plots.
+reference scores contributes only to the null plots.
 
 Usage:
   plot_edia_evaluation.py <conformer_run_name> --datasets-dir <dir> --datasets-file <file>
@@ -42,7 +44,9 @@ from pathlib import Path
 
 import numpy as np
 
-from plot_edia_histogram import DEFAULT_METRIC, EDIA_BIN_WIDTH, metric_label, plot, read_metric
+from plot_edia_histogram import (DEFAULT_METRIC, DISTRIBUTION_FILES, EDIA_BIN_WIDTH,
+                                 REFERENCE_FILES, distribution_files, first_existing,
+                                 metric_label, plot, read_metric)
 from plot_ensemble_volumes import read_datasets, write_csv
 
 PERCENTILE_BIN_WIDTH = 1.0
@@ -53,6 +57,20 @@ def map_name(params_file):
     if not params_file.exists():
         return ''
     return Path(json.loads(params_file.read_text()).get('map', '')).name
+
+
+def pocket_chain(pocket, rows=()):
+    """Chain of a pocket folder: from its score rows' chain column, else its old-style
+    edia_params.json, else its chain<X> name."""
+    chain = next((r.get('chain') for r in rows if r.get('chain')), None)
+    if chain:
+        return chain
+    params_file = pocket / 'edia_params.json'
+    if params_file.exists():
+        chain = json.loads(params_file.read_text()).get('chain')
+        if chain:
+            return chain
+    return pocket.name[len('chain'):] if pocket.name.startswith('chain') else ''
 
 
 def percentile_of(value, null):
@@ -70,7 +88,7 @@ def main():
     parser.add_argument('--graphs-dir', required=True,
                         help='Output directory for the pooled (cross-dataset) plots')
     parser.add_argument('--metric', default=DEFAULT_METRIC,
-                        help=f'edia_scores.csv / reference_edia.csv column to evaluate. '
+                        help=f'Null / reference score CSV column to evaluate. '
                              f'Default: {DEFAULT_METRIC}.')
     args = parser.parse_args()
     run, metric = args.conformer_run_name, args.metric
@@ -79,24 +97,27 @@ def main():
     structure_rows, pocket_rows, percentile_rows = [], [], []
     n_null_missing = n_reference_missing = 0
     for dataset in read_datasets(args.datasets_file):
-        pockets = sorted(p.parent for p in
-                         (Path(args.datasets_dir) / dataset / run).glob('chain*/edia_scores.csv'))
+        run_dir = Path(args.datasets_dir) / dataset / run
+        pockets = sorted({p.parent for folder in ('LIG_*', 'chain*')
+                          for csv_name, _ in DISTRIBUTION_FILES
+                          for p in run_dir.glob(f'{folder}/{csv_name}')})
         if not pockets:
-            print(f'  Warning: no {run} chain*/edia_scores.csv found for {dataset}')
+            print(f'  Warning: no {run} LIG_*/ or chain*/ null scores '
+                  f'({" or ".join(c for c, _ in DISTRIBUTION_FILES)}) found for {dataset}')
         for pocket in pockets:
-            chain = pocket.name[len('chain'):]
-            density = map_name(pocket / 'edia_params.json')
+            scores, params_file = distribution_files(pocket)
+            density = map_name(params_file)
 
             # Null distribution.
             try:
-                _, null, missing = read_metric(pocket / 'edia_scores.csv', metric)
+                null_rows, null, missing = read_metric(scores, metric)
             except KeyError:
-                print(f'  Warning: no {metric} column in {pocket}/edia_scores.csv (rerun '
-                      f'stage 2a); left out')
+                print(f'  Warning: no {metric} column in {scores} (rerun stage 2a); left out')
                 continue
+            chain = pocket_chain(pocket, null_rows)
             n_null_missing += missing
             if not len(null):
-                print(f'  Warning: no {metric} values in {pocket}/edia_scores.csv')
+                print(f'  Warning: no {metric} values in {scores}')
                 continue
             pocket_rows.append({'dataset': dataset, 'pocket': pocket.name, 'chain': chain,
                                 'n_conformers': len(null), 'n_without_score': missing,
@@ -105,17 +126,18 @@ def main():
                                 'map': density})
 
             # Reference ligands, scored with the same map and settings.
-            if not (pocket / 'reference_edia.csv').exists():
-                print(f'  Warning: no reference_edia.csv in {pocket} (rerun stage 2a)')
+            reference_csv = first_existing(pocket, REFERENCE_FILES)
+            if not reference_csv.exists():
+                print(f'  Warning: no {" or ".join(REFERENCE_FILES)} in {pocket} (rerun stage '
+                      f'2a)')
                 continue
             try:
-                rows, _, _ = read_metric(pocket / 'reference_edia.csv', metric)
+                rows, _, _ = read_metric(reference_csv, metric)
             except KeyError:
-                print(f'  Warning: no {metric} column in {pocket}/reference_edia.csv (rerun '
-                      f'stage 2a)')
+                print(f'  Warning: no {metric} column in {reference_csv} (rerun stage 2a)')
                 continue
             for r in rows:
-                ligand = f'{dataset} LIG {chain}{r.get("resi")}' + (
+                ligand = f'{dataset} LIG {r.get("chain") or chain}{r.get("resi")}' + (
                     f' alt {r["altloc"]}' if r.get('altloc') else '')
                 try:
                     score = float(r[metric])
@@ -126,8 +148,8 @@ def main():
                           + (f' (EDIA call {r["status"]})' if r.get('status') else ''))
                     n_reference_missing += 1
                     continue
-                row = {'dataset': dataset, 'pocket': pocket.name, 'chain': chain,
-                       'resi': r['resi'], 'altloc': r.get('altloc', ''), metric: score,
+                row = {'dataset': dataset, 'pocket': pocket.name,
+                       'chain': r.get('chain') or chain, 'resi': r['resi'], 'altloc': r.get('altloc', ''), metric: score,
                        'map': density}
                 structure_rows.append(row)
                 percentile_rows.append({**row, 'n_conformers': len(null),

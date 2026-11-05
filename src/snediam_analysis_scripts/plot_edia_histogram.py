@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Histogram of an EDIA score of every null conformer of one chain pocket (generate_null.sh stage
-2b), from <dataset_dir>/<conformer_run_name>/chain<X>/edia_scores.csv (run_edia): by default
+Histogram of an EDIA score of every null conformer of one pocket (generate_null.sh stage 2b),
+from <dataset_dir>/<conformer_run_name>/<pocket>/distribution_residue_scores.csv (run_edia on
+conformers.pdb; edia_scores.csv in runs scored before run_edia was generalized; pocket
+LIG_<chain><resi>_<altloc>, or chain<X> in runs before the per-ligand nulls): by default
 mean_atom_edia (the plain mean of the conformer's per-atom EDIA), or any other numeric column
 (--metric, e.g. EDIAm), in 0.01 bins, conformer count per bin, x axis from the lowest value -
 0.01 to the highest + 0.01. Conformers without a value (failed EDIA calls) are left out and
 counted in the subtitle.
 
 Usage:
-  plot_edia_histogram.py <dataset_dir> <conformer_run_name> <chain> [--metric <column>]
+  plot_edia_histogram.py <dataset_dir> <conformer_run_name> <pocket> [--metric <column>]
 
 Output:
-  <dataset_dir>/<conformer_run_name>/chain<X>/<metric>_histogram.png (metric lower-cased, e.g.
+  <dataset_dir>/<conformer_run_name>/<pocket>/<metric>_histogram.png (metric lower-cased, e.g.
   mean_atom_edia_histogram.png, ediam_histogram.png)
 """
 import argparse
@@ -30,6 +32,24 @@ EDIA_BIN_WIDTH = 0.01
 EDIA_PAD = 0.01
 DEFAULT_METRIC = 'mean_atom_edia'
 METRIC_LABELS = {'mean_atom_edia': 'mean atom EDIA'}
+# A pocket's null scores and their run_edia params: current names first, then the names of runs
+# scored before run_edia was generalized.
+DISTRIBUTION_FILES = [('distribution_residue_scores.csv', 'distribution_residue_scores_params.json'),
+                      ('edia_scores.csv', 'edia_params.json')]
+REFERENCE_FILES = ['reference_residue_scores.csv', 'reference_edia.csv']
+
+
+def first_existing(pocket, names):
+    """The first of pocket/<name> that exists (else the first name's path)."""
+    return next((pocket / n for n in names if (pocket / n).exists()), pocket / names[0])
+
+
+def distribution_files(pocket):
+    """(null scores CSV, its params JSON) of a pocket: the first pair whose CSV exists."""
+    for csv_name, params_name in DISTRIBUTION_FILES:
+        if (pocket / csv_name).exists():
+            return pocket / csv_name, pocket / params_name
+    return pocket / DISTRIBUTION_FILES[0][0], pocket / DISTRIBUTION_FILES[0][1]
 
 
 def metric_label(metric, capital=False):
@@ -98,28 +118,33 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('dataset_dir')
     p.add_argument('conformer_run_name')
-    p.add_argument('chain')
+    p.add_argument('pocket',
+                   help='Pocket folder in the run folder: LIG_<chain><resi>_<altloc>, or for runs '
+                        'before the per-ligand nulls chain<X> (or just the chain letter).')
     p.add_argument('--metric', default=DEFAULT_METRIC,
-                   help=f'edia_scores.csv column to plot. Default: {DEFAULT_METRIC}.')
+                   help=f'Null score CSV column to plot. Default: {DEFAULT_METRIC}.')
     args = p.parse_args()
 
     dataset = Path(args.dataset_dir).name
-    pocket = Path(args.dataset_dir) / args.conformer_run_name / f'chain{args.chain}'
+    pocket_name = f'chain{args.pocket}' if len(args.pocket) == 1 else args.pocket
+    pocket = Path(args.dataset_dir) / args.conformer_run_name / pocket_name
+    scores, params_file = distribution_files(pocket)
+    if not scores.exists():
+        raise SystemExit(f'No {" or ".join(c for c, _ in DISTRIBUTION_FILES)} in {pocket}')
     try:
-        _, values, n_missing = read_metric(pocket / 'edia_scores.csv', args.metric)
+        _, values, n_missing = read_metric(scores, args.metric)
     except KeyError:
-        raise SystemExit(f'No {args.metric} column in {pocket}/edia_scores.csv (scored by an '
-                         f'earlier run_edia? rerun stage 2a)')
+        raise SystemExit(f'No {args.metric} column in {scores} (scored by an earlier run_edia? '
+                         f'rerun stage 2a)')
     if not len(values):
-        raise SystemExit(f'No {args.metric} values in {pocket}/edia_scores.csv')
-    params_file = pocket / 'edia_params.json'
+        raise SystemExit(f'No {args.metric} values in {scores}')
     map_name = (Path(json.loads(params_file.read_text())['map']).name
                 if params_file.exists() else 'unknown map')
     subtitle = (f'{len(values)} null conformers'
                 + (f' ({n_missing} without a score left out)' if n_missing else '')
                 + f'; median {np.median(values):.2f}; map {map_name}; {EDIA_BIN_WIDTH:g} bins')
     out = pocket / f'{args.metric.lower()}_histogram.png'
-    plot(values, f'Null conformer {metric_label(args.metric)}: {dataset} chain {args.chain} '
+    plot(values, f'Null conformer {metric_label(args.metric)}: {dataset} {pocket_name} '
                  f'({args.conformer_run_name})', subtitle, out,
          xlabel=metric_label(args.metric, capital=True))
     print(f'Wrote {out}')

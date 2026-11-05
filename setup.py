@@ -64,7 +64,6 @@ def main():
                 "generate_conformers = qfit.command_line.generate_conformers:main",
                 "build_clash_ensemble = qfit.command_line.build_clash_ensemble:main",
                 "run_edia = qfit.command_line.run_edia:main",
-                "evaluate_structure = qfit.command_line.evaluate_structure:main",
             ]
         },
     )

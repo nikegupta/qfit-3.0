@@ -1,74 +1,54 @@
 """
-generate_conformers - samples a null ensemble of ligand placements in one chain's binding pocket.
+generate_conformers - samples a null ensemble of ligand placements around one reference ligand.
 
-Each sample is a random torsional conformer of the dataset's ligand, translated and rotated at
-random within the chain's pocket volume's minimum enclosing sphere, and kept only if it lies
-inside the pocket volume and doesn't clash with the structure's bound state. Samples are drawn
-until --n-conformers are kept (or --max-candidates-per-conformer x --n-conformers have been
-tried).
-One ensemble covers the pocket of ligand_chain, however many modeled ligand copies (LIG residues)
-that chain holds: these are the reference ligands (--reference-resi, default every LIG residue in
-the chain), and the first is the template.
+The reference is one conformation of one modeled ligand: the LIG residue chain/resi of
+structure_pdb, its blank-altloc heavy atoms plus those of --altloc (default: the first altloc
+letter present). Each sample is a random torsional conformer of the dataset's ligand, its centroid
+placed at random within --sampling-radius (default 3 Å) of the reference's centroid and rotated
+at random, kept only if it doesn't clash with the structure. Samples are drawn until
+--n-conformers are kept (or --max-candidates-per-conformer x --n-conformers have been tried).
 
   1. Torsion library: --n-torsion-confs conformers embedded from the ligand's SMILES
      (pxr_fragments.csv) with RDKit ETKDGv3 (hydrogens added for embedding, then removed), each
-     superposed on the template ligand's heavy atoms (best symmetry-equivalent mapping) and
-     written in the template's atom order and names.
+     superposed on the reference's heavy atoms (best symmetry-equivalent mapping) and written in
+     the reference's atom order and names (the template of every output model).
   2. Each candidate draws, independently and uniformly:
        - a torsion conformer from the library;
-       - a translation of the conformer's centroid from the sampling centre, evenly spread by
-         volume within the max radius: direction with cos(polar) and azimuth uniform,
-         distance = max_radius * cbrt(u); polar/azimuth rounded to --angle-step degrees and the
-         distance to --radius-step Å. The centre and max radius come from the pocket ensemble:
-         the minimum enclosing sphere of the centroids of every ensemble model's LIG residues in
-         this chain (models superposed onto the reference on all CA; centre moved into this
-         structure's frame), its radius plus a cushion (default 2 Å). This is a cap, not a
-         bound: a pose whose centroid is farther out isn't sampled even if it fits the pocket
-         volume (step 3);
+       - a translation of the conformer's centroid from the reference's centroid, evenly spread
+         by volume within --sampling-radius: direction with cos(polar) and azimuth uniform,
+         distance = radius * cbrt(u); polar/azimuth rounded to --angle-step degrees and the
+         distance to --radius-step Å;
        - an orientation: a uniformly random rotation (all three rotational degrees of freedom)
          about the conformer's centroid.
-  3. Pocket volume: every heavy atom of a candidate must lie inside ligand_chain's pocket volume
-     from the pocket ensemble (--clash-ensemble): every ensemble model's LIG heavy atoms in that
-     chain, each
-     made a sphere of one fixed radius (default 2 Å, the same for every element - a cushion
-     around the observed atom positions, not a physical size), with a probe (default 2 Å) rolled
-     over the union of those spheres: the volume the probe can't enter, i.e. the spheres with
-     the crevices and gaps between them narrower than the probe filled in, and no growth
-     outward; on a 0.25 Å grid in the reference structure's frame.
-     Candidate atoms are moved into that frame by superposing this structure onto the reference
-     on all CA atoms they share.
-  4. Clash check against this structure: every heavy atom of structure_pdb is an obstacle
-     except LIG (every altloc), hydrogens, --exclude-resn residues and atoms whose altloc is in
-     --ignore-altlocs (default A). For a multiconformer model with the apo state as altloc A
-     and the bound state as B, a candidate must fit the bound state (blank-altloc and B atoms)
-     and may overlap the apo state. A candidate is dropped if any of its atoms clashes with any
-     obstacle: a ligand-obstacle atom pair clashes when closer than --clash-scale x (sum of vdW
-     radii), or --polar-clash-scale x for N-N, N-O and O-O pairs. No symmetry mates. Without
-     --clash-ensemble the structure alone gives the pocket volume and sampling sphere.
+  3. Clash check against this structure: every heavy atom of structure_pdb is an obstacle
+     except LIG (every residue, every altloc), hydrogens, --exclude-resn residues and atoms
+     whose altloc is in --ignore-altlocs (default A). For a multiconformer model with the apo
+     state as altloc A and the bound state as B, a candidate must fit the bound state
+     (blank-altloc and B atoms) and may overlap the apo state. A candidate is dropped if any of
+     its atoms clashes with any obstacle: a ligand-obstacle atom pair clashes when closer than
+     --clash-scale (default 0.5) x the sum of their vdW radii, for every element pair (a
+     different --polar-clash-scale for N-N, N-O and O-O pairs only if given).
+     No symmetry mates.
 
-Speed: candidates are generated and checked in numpy batches. The pocket volume is a grid
-lookup, done first. Lookup grids around the pocket mark, per ligand element, the points where an
-atom certainly clashes with an obstacle (cutoffs shrunk by half a voxel diagonal, so a grid hit
-is always real). Ligand atoms are checked core-first and a candidate is dropped at its first
-certain hit; survivors get exact KD-tree checks, so the result is exact. It is meant to
-run single-threaded (parallelism comes from running pockets side by side): the hot loop avoids
-BLAS, and when calling it directly set OPENBLAS_NUM_THREADS=1 (and OMP_/MKL_NUM_THREADS=1), as
-generate_null.sh does, so numpy's threaded OpenBLAS doesn't spread other products over every core.
+Speed: candidates are generated and checked in numpy batches. Lookup grids around the sampling
+sphere mark, per ligand element, the points where an atom certainly clashes with an obstacle
+(cutoffs shrunk by half a voxel diagonal, so a grid hit is always real). Ligand atoms are checked
+core-first and a candidate is dropped at its first certain hit; survivors get exact KD-tree
+checks, so the result is exact. It is meant to run single-threaded (parallelism comes from
+running ligands side by side): the hot loop avoids BLAS, and when calling it directly set
+OPENBLAS_NUM_THREADS=1 (and OMP_/MKL_NUM_THREADS=1), as generate_null.sh does, so numpy's threaded
+OpenBLAS doesn't spread other products over every core.
 
-Outputs (in output_dir):
-  conformers.pdb            the kept placements, one MODEL each (heavy atoms)
-  conformers.csv            per kept placement: torsion conformer, translation polar/azimuth/
-                            distance, rotation quaternion (x, y, z, w), centroid
-  torsion_library.pdb       the superposed torsion conformers, one MODEL each
-  ligand.pdb                the reference ligands (heavy atoms, first altloc), one MODEL each
-  obstacles.pdb             the obstacle atoms near the pocket, as they are in structure_pdb
+Outputs (in output_dir, generate_null.sh's datasets/<dataset>/<run>/LIG_<chain><resi>_<altloc>/):
+  conformers.pdb            the kept placements, one MODEL each (heavy atoms, the reference's
+                            atom names and order)
+  ligand.pdb                the reference conformation itself (heavy atoms, altloc column
+                            blank), the reference run_edia scores alongside the null
   ensemble_mask.ccp4        1 inside the vdW volume of any kept placement, 0 elsewhere (see below)
-  conformer_summary.json    parameters, sampling centre, obstacles (count, altlocs ignored),
-                            pocket ensemble, binding site, pocket volume (superposition
-                            onto the reference, share of reference ligand atoms inside),
-                            candidates tried, acceptance,
-                            conformers kept, ensemble volume, each reference ligand's distance
-                            from the centre and share of its vdW volume inside the mask, runtime
+  conformer_summary.json    written last: the reference (chain, resi, altloc, SMILES, centroid,
+                            share of its vdW volume inside the mask), sampling centre and radius,
+                            obstacles, torsion library, candidates tried, conformers kept,
+                            acceptance, ensemble mask volume, parameters (seed included), runtime
 
 Ensemble mask: the union of every kept placement's atom vdW spheres, on a grid of the crystal's
 own unit cell (cell from the CSV, written as P1) at --mask-spacing, boxed around the ensemble. It
@@ -77,6 +57,9 @@ is in the same frame as the model, so any later pose can be tested against it di
     from qfit.command_line.generate_conformers import mask_fraction_inside
     mask = XMap.fromfile('ensemble_mask.ccp4', resolution=1)
     fraction = mask_fraction_inside(mask, xyz, radii)   # share of the pose's vdW volume inside
+
+The pocket-ensemble code below (ClashEnsemble, VolumeChecker, pocket volumes) is no longer used
+by this script; build_clash_ensemble still imports it.
 """
 import argparse
 import csv
@@ -105,6 +88,8 @@ DEFAULT_VDW = vdwRadiiTable['C']
 MAX_CANDIDATES_PER_CONFORMER = 1_000_000
 # Altlocs that are not obstacles by default: the apo state of the multiconformer models.
 DEFAULT_IGNORE_ALTLOCS = ['A']
+# Placement centroids are sampled within this distance (Å) of the reference ligand's centroid.
+DEFAULT_SAMPLING_RADIUS = 3.0
 # Pocket volume: radius (Å) of the sphere every observed ligand heavy atom is made, and of the
 # probe rolled over them; and its grid spacing (Å, DEFAULT_VOLUME_SPACING below).
 DEFAULT_POCKET_ATOM_RADIUS = 2.0
@@ -124,13 +109,17 @@ def build_argparser():
     p.add_argument('fragments_csv',
                    help='CSV with dataset, a, b, c, alpha, beta, gamma, space_group, smiles.')
     p.add_argument('dataset', help='Dataset name (row of fragments_csv).')
-    p.add_argument('ligand_chain', help='Chain whose binding pocket is sampled.')
+    p.add_argument('chain', help='Chain of the reference LIG residue.')
+    p.add_argument('resi', type=int, help='Residue number of the reference LIG residue.')
     p.add_argument('output_dir')
-    p.add_argument('--reference-resi', type=int, nargs='+',
-                   help='Residue numbers of the reference LIG residues in ligand_chain (the first '
-                        'is the template). Default: every LIG residue in the chain.')
+    p.add_argument('--altloc',
+                   help='Altloc of the reference conformation (its atoms plus the blank-altloc '
+                        'ones). Default: the first altloc letter present.')
+    p.add_argument('--sampling-radius', type=float, default=DEFAULT_SAMPLING_RADIUS,
+                   help='Placement centroids are drawn evenly by volume within this distance (Å) '
+                        f'of the reference\'s centroid. Default: {DEFAULT_SAMPLING_RADIUS:g}.')
     p.add_argument('-n', '--n-conformers', type=int, default=1000,
-                   help='Number of non-clashing placements to keep. Default: 10000.')
+                   help='Number of non-clashing placements to keep. Default: 1000.')
     p.add_argument('--n-torsion-confs', type=int, default=200,
                    help='Size of the ETKDG torsion conformer library. Default: 200.')
     p.add_argument('--radius-step', type=float, default=0.1,
@@ -138,14 +127,12 @@ def build_argparser():
     p.add_argument('--angle-step', type=float, default=1.0,
                    help='Translation polar/azimuth angles are rounded to this step (degrees). '
                         'Default: 1.')
-    p.add_argument('--clash-scale', type=float, default=0.75,
-                   help='A pair clashes below this fraction of its vdW radius sum. Default: 0.75.')
-    p.add_argument('--polar-clash-scale', type=float, default=0.6,
-                   help='Same, for N-N, N-O and O-O pairs. Default: 0.6.')
-    p.add_argument('--clash-ensemble',
-                   help='Pocket ensemble file from build_clash_ensemble (built once per run); it '
-                        'provides the pocket volumes and sampling spheres. Default: '
-                        'structure_pdb alone (its own ligands).')
+    p.add_argument('--clash-scale', type=float, default=0.5,
+                   help='A pair clashes below this fraction of its vdW radius sum, for every '
+                        'element pair. Default: 0.5.')
+    p.add_argument('--polar-clash-scale', type=float, default=None,
+                   help='Same, for N-N, N-O and O-O pairs only. Default: --clash-scale (one '
+                        'threshold for all pairs).')
     p.add_argument('--exclude-resn', nargs='+', default=['HOH', 'DMS'],
                    help='Residue names left out of the obstacles (hydrogens and every LIG '
                         'residue are always left out). Default: HOH DMS.')
@@ -209,13 +196,28 @@ def first_altloc(lines):
     return [l for l in lines if l[16] == ' ' or (letters and l[16] == letters[0])]
 
 
-def read_ligand(pdb, chain, resi):
-    """Heavy-atom lines of the modeled ligand, first alternate conformer only (blank altloc plus
-    the first altloc letter present), with the altloc column blanked: RDKit's PDB reader keeps
-    only blank or A altlocs, so a ligand modeled as altloc B would otherwise read as no atoms."""
-    lines = first_altloc([l for l in open(pdb) if l.startswith(('ATOM', 'HETATM'))
-                          and l[17:20].strip() == LIGAND_RESN and l[21] == chain
-                          and int(l[22:26]) == resi and element_of(l) != 'H'])
+def ligand_altlocs(pdb, chain, resi):
+    """Altloc letters of the heavy atoms of LIG chain/resi, sorted (empty: blank altloc only)."""
+    return sorted({l[16] for l in open(pdb) if l.startswith(('ATOM', 'HETATM'))
+                   and l[17:20].strip() == LIGAND_RESN and l[21] == chain
+                   and int(l[22:26]) == resi and element_of(l) != 'H'} - {' '})
+
+
+def read_ligand(pdb, chain, resi, altloc=None):
+    """Heavy-atom lines of one conformation of the modeled ligand - the blank-altloc atoms plus
+    those of altloc (default: the first altloc letter present) - with the altloc column blanked:
+    RDKit's PDB reader keeps only blank or A altlocs, so a ligand modeled as altloc B would
+    otherwise read as no atoms."""
+    lines = [l for l in open(pdb) if l.startswith(('ATOM', 'HETATM'))
+             and l[17:20].strip() == LIGAND_RESN and l[21] == chain
+             and int(l[22:26]) == resi and element_of(l) != 'H']
+    if altloc:
+        lines = [l for l in lines if l[16] in (' ', altloc)]
+        if not any(l[16] == altloc for l in lines):
+            raise SystemExit(f'No {LIGAND_RESN} {chain} {resi} altloc {altloc} heavy atoms in '
+                             f'{pdb}')
+    else:
+        lines = first_altloc(lines)
     if not lines:
         raise SystemExit(f'No {LIGAND_RESN} {chain} {resi} heavy atoms in {pdb}')
     return [f'{l[:16]} {l[17:]}' for l in lines]
@@ -765,7 +767,10 @@ def obstacle_lines(pdb, exclude_resn, ignore_altlocs, center, cutoff):
 
 def main():
     args = build_argparser().parse_args()
+    if args.polar_clash_scale is None:
+        args.polar_clash_scale = args.clash_scale
     args.max_candidates = args.max_candidates_per_conformer * args.n_conformers
+    args.max_radius = args.sampling_radius  # sample()'s name for it
     start = time.time()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -775,40 +780,16 @@ def main():
     print(f'Random seed: {args.seed}')
 
     cell, _, smiles = read_crystal_info(args.fragments_csv, args.dataset)
-    resis = args.reference_resi or chain_ligands(args.structure_pdb, args.ligand_chain)
-    if not resis:
-        raise SystemExit(f'No {LIGAND_RESN} residues in chain {args.ligand_chain} of '
-                         f'{args.structure_pdb}')
-    args.reference_resi = resis
-    references = [read_ligand(args.structure_pdb, args.ligand_chain, r) for r in resis]
-    lig_lines = references[0]  # template: atom names/order of every output model
+    # The reference conformation: template (atom names/order of every output model) and centre.
+    altloc = args.altloc or (ligand_altlocs(args.structure_pdb, args.chain, args.resi)
+                             or [''])[0]
+    lig_lines = read_ligand(args.structure_pdb, args.chain, args.resi, altloc or None)
     lig_elements = [element_of(l) for l in lig_lines]
-
-    # Clash ensemble, the chain's pocket volume and this structure's superposition onto the
-    # reference (rot, shift: structure -> reference frame), which places the volume's sampling
-    # sphere.
-    if args.clash_ensemble:
-        ensemble = ClashEnsemble.load(args.clash_ensemble)
-    else:
-        ensemble = ClashEnsemble(args.structure_pdb, [args.structure_pdb])
-    volume = ensemble.volumes.get(args.ligand_chain)
-    if volume is None:
-        raise SystemExit(f'The clash ensemble has no pocket volume for chain {args.ligand_chain} '
-                         f'(no LIG residues in that chain in any ensemble model)')
-    fit = ca_superposition(ensemble.reference_ca, ca_coords(args.structure_pdb))
-    if fit is None:
-        raise SystemExit(f'{args.structure_pdb} shares fewer than 3 CA atoms with the reference '
-                         f'{ensemble.reference_pdb}')
-    rot, shift, n_ca, ca_rmsd = fit
-    center = (volume['center'] - shift) @ rot
-    args.max_radius = float(volume['max_radius'])
-    print(f'{args.dataset} chain {args.ligand_chain}: sampling centre {np.round(center, 3)} '
-          f'(reference frame {np.round(volume["center"], 3)}), max radius '
-          f'{args.max_radius:.2f} Å, SMILES {smiles}')
-    for r, lines in zip(resis, references):
-        c = coords(lines).mean(axis=0)
-        print(f'  reference {LIGAND_RESN} {args.ligand_chain} {r}: {len(lines)} heavy atoms, '
-              f'centroid {np.round(c, 3)}, {np.linalg.norm(c - center):.2f} Å from the centre')
+    lig_xyz = coords(lig_lines)
+    center = lig_xyz.mean(axis=0)
+    label = f'{LIGAND_RESN} {args.chain}{args.resi}' + (f' alt {altloc}' if altloc else '')
+    print(f'{args.dataset} {label}: {len(lig_lines)} heavy atoms, centroid {np.round(center, 3)} '
+          f'(the sampling centre), sampling radius {args.max_radius:g} Å, SMILES {smiles}')
 
     library, lib_rmsd = torsion_library(smiles, lig_lines, args.n_torsion_confs, args.seed)
     print(f'Torsion library: {len(library)} conformers, RMSD to modeled ligand '
@@ -837,60 +818,19 @@ def main():
           f'centre (altlocs {sorted(ignore) or "none"} ignored: {n_ignored} atoms); clash grid '
           f'{checker.shape[0]}^3 points at {args.grid_spacing} Å, built in {setup_s:.1f} s')
 
-    # Pocket volume: candidate atoms are moved into the reference frame (rot, shift above).
-    in_volume = VolumeChecker(volume, rot, shift)
-    ref_atoms = np.vstack([coords(lines) for lines in references])
-    ref_inside = 100 * float(1 - in_volume.outside(ref_atoms).mean())
-    volume_summary = {'chain': args.ligand_chain,
-                      'pocket_atom_radius_A': ensemble.info.get('pocket_atom_radius_A'),
-                      'pocket_probe_radius_A': ensemble.info.get('pocket_probe_radius_A'),
-                      # Clash ensembles built before the probe-closed volumes.
-                      **({'pocket_margin_A': ensemble.info['pocket_margin_A']}
-                         if 'pocket_margin_A' in ensemble.info else {}),
-                      'spacing_A': volume['spacing'],
-                      'volume_A3': round(float(volume['grid'].sum()) * volume['spacing'] ** 3, 1),
-                      'n_ligand_atoms': volume['n_ligand_atoms'],
-                      'superposition_n_ca': n_ca, 'superposition_ca_rmsd_A': round(ca_rmsd, 3),
-                      'reference_atoms_inside_percent': round(ref_inside, 1)}
-    print(f'Pocket volume (chain {args.ligand_chain}): {volume_summary["volume_A3"]:.0f} Å^3; '
-          f'this structure superposed onto the reference on {n_ca} CA (RMSD {ca_rmsd:.2f} Å); '
-          f'{ref_inside:.1f}% of the reference ligand atoms inside')
-
-    checks = [in_volume.outside, checker.certain_clash, checker.clash]
+    checks = [checker.certain_clash, checker.clash]
     result, n_tried = sample(library, lig_elements, checks, center, args, rng)
     n_kept = 0 if result is None else len(result['conf'])
 
-    with open(out_dir / 'ligand.pdb', 'w') as f:
-        for i, lines in enumerate(references, start=1):
-            f.write(f'MODEL     {i:4d}\n')
-            f.writelines(f'{l[:16]} {l[17:]}' for l in lines)
-            f.write('ENDMDL\n')
-        f.write('END\n')
-    write_models(out_dir / 'torsion_library.pdb', lig_lines, library)
-    (out_dir / 'obstacles.pdb').write_text(''.join(obs_lines) + 'END\n')
-    with open(out_dir / 'conformers.csv', 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['model', 'torsion_conf', 'trans_polar_deg', 'trans_azimuth_deg',
-                         'trans_distance_A', 'quat_x', 'quat_y', 'quat_z', 'quat_w',
-                         'centroid_x', 'centroid_y', 'centroid_z'])
-        if result is not None:
-            write_models(out_dir / 'conformers.pdb', lig_lines, result['xyz'])
-            centroids = result['xyz'].mean(axis=1)
-            for i in range(n_kept):
-                writer.writerow([i + 1, int(result['conf'][i]), result['polar'][i],
-                                 result['azimuth'][i], round(float(result['distance'][i]), 3),
-                                 *np.round(result['quat'][i], 6), *np.round(centroids[i], 3)])
-
-    reference_summary = []
-    for r, lines in zip(resis, references):
-        c = coords(lines).mean(axis=0)
-        reference_summary.append({'resi': r, 'n_heavy_atoms': len(lines),
-                                  'centroid': np.round(c, 3).tolist(),
-                                  'centroid_to_center_A': round(float(np.linalg.norm(c - center)),
-                                                                3),
-                                  'percent_inside': None})
+    reference = {'chain': args.chain, 'resi': args.resi, 'altloc': altloc,
+                 'n_heavy_atoms': len(lig_lines), 'centroid': np.round(center, 3).tolist(),
+                 'centroid_to_center_A': 0.0, 'percent_inside': None}
     mask_summary = None
+    with open(out_dir / 'ligand.pdb', 'w') as f:
+        f.writelines(f'{l[:16]} {l[17:]}' for l in lig_lines)
+        f.write('END\n')
     if result is not None:
+        write_models(out_dir / 'conformers.pdb', lig_lines, result['xyz'])
         lig_radii = np.array([vdwRadiiTable.get(e, DEFAULT_VDW) for e in lig_elements])
         mask = ensemble_mask(result['xyz'], lig_radii, cell, args.mask_spacing)
         mask.write_map_file(str(out_dir / 'ensemble_mask.ccp4'))
@@ -904,37 +844,31 @@ def main():
             'n_voxels': n_voxels,
             'volume_A3': round(n_voxels * voxel_volume, 1),
         }
-        for ref, lines in zip(reference_summary, references):
-            radii = np.array([vdwRadiiTable.get(element_of(l), DEFAULT_VDW) for l in lines])
-            ref['percent_inside'] = round(
-                100 * mask_fraction_inside(mask, coords(lines), radii), 1)
-        print(f'Ensemble mask: {mask_summary["volume_A3"]:.0f} Å^3; reference ligands inside: '
-              + ', '.join(f'{args.ligand_chain}{r["resi"]} {r["percent_inside"]}%'
-                          for r in reference_summary))
+        reference['percent_inside'] = round(
+            100 * mask_fraction_inside(mask, lig_xyz, lig_radii), 1)
+        print(f'Ensemble mask: {mask_summary["volume_A3"]:.0f} Å^3; reference ligand inside: '
+              f'{reference["percent_inside"]}%')
 
     summary = {
         'dataset': args.dataset,
-        'chain': args.ligand_chain,
+        'chain': args.chain,
+        'resi': args.resi,
+        'altloc': altloc,
         'sampling_center': np.round(center, 3).tolist(),
-        'sampling_center_reference_frame': np.round(volume['center'], 3).tolist(),
-        'max_radius_A': round(args.max_radius, 3),
-        # Template ligand (first reference): atom names/order of every output model.
-        'ligand': {'chain': args.ligand_chain, 'resi': resis[0], 'smiles': smiles,
+        'sampling_radius_A': args.max_radius,
+        # The reference conformation: atom names/order of every output model.
+        'ligand': {'chain': args.chain, 'resi': args.resi, 'altloc': altloc, 'smiles': smiles,
                    'n_heavy_atoms': len(lig_lines)},
-        'reference_ligands': reference_summary,
+        'reference_ligands': [reference],
         'params': {k: v for k, v in vars(args).items()
                    if k not in ('structure_pdb', 'fragments_csv', 'output_dir')},
         'torsion_library': {'n_conformers': len(library),
                             'rmsd_to_modeled_A': {'min': float(lib_rmsd.min()),
                                                   'median': float(np.median(lib_rmsd)),
                                                   'max': float(lib_rmsd.max())}},
-        'clash_ensemble': {'file': args.clash_ensemble, **ensemble.info},
         'obstacles': {'n_atoms': len(obs_lines), 'ignore_altlocs': sorted(ignore),
                       'n_ignored_atoms': n_ignored, 'within_A': round(region, 2),
                       'setup_s': round(setup_s, 1)},
-        'binding_site': {'cutoff_A': ensemble.info.get('binding_site_cutoff_A'),
-                         'resis': list(ensemble.binding_site)},
-        'pocket_volume': volume_summary,
         'candidates_tried': n_tried,
         'conformers_kept': n_kept,
         'acceptance': n_kept / n_tried if n_tried else 0.0,
@@ -942,8 +876,7 @@ def main():
         'ensemble_mask': mask_summary,
         'runtime_s': round(time.time() - start, 1),
         'files': {'conformers': 'conformers.pdb' if n_kept else None,
-                  'conformers_csv': 'conformers.csv', 'torsion_library': 'torsion_library.pdb',
-                  'ligand': 'ligand.pdb', 'obstacles': 'obstacles.pdb',
+                  'reference_ligand': 'ligand.pdb',
                   'ensemble_mask': 'ensemble_mask.ccp4' if n_kept else None},
     }
     (out_dir / 'conformer_summary.json').write_text(json.dumps(summary, indent=2) + '\n')

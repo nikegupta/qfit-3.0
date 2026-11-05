@@ -1,23 +1,25 @@
 #!/bin/bash
 #
 # generate_null.sh - driver for the null-distribution construction pipeline (random ligand
-# placements in each chain's binding pocket, scored against the density).
+# placements around each modeled ligand, scored against the density).
 # Takes positional args corresponding to the stages of the pipeline:
 #   conformer_run_name
 #
 # Runs, in order:
 #   STAGE_1: Null conformer sampling
-#   1a. build_clash_ensemble (once per run, before the parallel step)
-#                                       -> logs/<conformer_run_name>/clash_ensemble.pkl
-#   1b. generate_conformers             -> <dataset>/<conformer_run_name>/chain<X>/
-#   1c. plot_ensemble_volumes (pooled)  -> GRAPHS_DIR/<conformer_run_name>/
-#   1d. plot_conformer_acceptance (pooled) -> GRAPHS_DIR/<conformer_run_name>/
-#   1e. plot_reference_coverage (pooled)   -> GRAPHS_DIR/<conformer_run_name>/
-#   STAGE_2: per-atom EDIA scoring of the null conformers and reference ligands (per chain pocket)
-#   2a. run_edia                        -> <dataset>/<conformer_run_name>/chain<X>/
-#                                          edia_scores.csv, conformers/conformer_<n>.csv,
-#                                          reference_edia.csv, reference_atom_scores.csv
-#   2b. plot_edia_histogram             -> <dataset>/<conformer_run_name>/chain<X>/
+#   1a. generate_conformers             -> <dataset>/<conformer_run_name>/LIG_<chain><resi>_<alt>/
+#                                          conformers.pdb, conformer_summary.json,
+#                                          ensemble_mask.ccp4
+#   1b. plot_ensemble_volumes (pooled)  -> GRAPHS_DIR/<conformer_run_name>/
+#   1c. plot_conformer_acceptance (pooled) -> GRAPHS_DIR/<conformer_run_name>/
+#   1d. plot_reference_coverage (pooled)   -> GRAPHS_DIR/<conformer_run_name>/
+#   STAGE_2: per-atom EDIA scoring of the null conformers and reference ligand (per ligand null)
+#   2a. run_edia (twice per null)       -> <dataset>/<conformer_run_name>/LIG_<chain><resi>_<alt>/
+#                                          conformers.pdb: distribution_residue_scores.csv,
+#                                            distribution_atom_scores.csv (+ _params.json)
+#                                          ligand.pdb: reference_residue_scores.csv,
+#                                            reference_atom_scores.csv (+ _params.json)
+#   2b. plot_edia_histogram             -> <dataset>/<conformer_run_name>/LIG_<chain><resi>_<alt>/
 #                                          mean_atom_edia_histogram.png
 #   STAGE_3: Evaluation (pooled)
 #   3.  plot_edia_evaluation            -> GRAPHS_DIR/<conformer_run_name>/
@@ -29,69 +31,55 @@
 # EDIA (stage 2) scores against the dataset's density map
 # (DATASETS_DIR/<dataset>/MAP_NAME_PATTERN, default {dataset}_2fofc.ccp4; any CCP4 map in the
 # structure's frame - made outside this pipeline, e.g. by claude_scripts/make_2fofc_maps.py),
-# with the --exclude_resn residues (default HOH, DMS) removed from the model and resolution and
-# CRYST1 from CSV_FILE.
-# Stage 2: every pocket's conformers and the chain's reference ligands (each LIG residue of the
-# dataset's structure, one molecule per altloc) are scored one molecule per EDIAscorer 1.3 call
-# (the only way it writes per-atom scores), each against the dataset's structure with its LIG
-# residues removed (every altloc kept: a multiconformer model's apo state contributes density
-# too), cropped to the residues within --edia_crop_radius Å of the molecule (the map
-# is never cropped) - so the references always share the run's map and settings. EDIAscorer
-# 1.3 needs a newer glibc than this host's, so each pocket's calls run in one podman container
-# (EDIA_IMAGE), --edia_workers at a time: stage 2 uses -p x --edia_workers cores. Each
-# conformer's per-atom EDIA goes to conformers/conformer_<n>.csv (n = MODEL number in
-# conformers.pdb), its EDIAm and mean atom EDIA to edia_scores.csv (the null distribution;
-# references excluded), each reference's to reference_edia.csv and reference_atom_scores.csv,
-# and a histogram of the pocket's null mean atom EDIA (0.01 bins) to
-# mean_atom_edia_histogram.png. A failed call is recorded (status failed, files in
-# edia_atom_failed/) and doesn't stop the pocket. Datasets without a map are skipped with a
-# warning. Pockets scored by the earlier batched EDIAscorer 1.1 version (EDIAm only) are
-# rescored; an interrupted pocket resumes from its finished calls (edia_atom_work/).
+# with LIG and the --exclude_resn residues (default HOH, DMS) removed from the model, and the
+# unit cell, space group and resolution always read here from CSV_FILE and passed to run_edia
+# (--cell, --space-group, --resolution; the structure's own CRYST1 and REMARK records are not
+# used).
+# Stage 2: run_edia (a general scorer: ligand PDB, target, map) is run twice per null: on
+# conformers.pdb (the null distribution) and on ligand.pdb (the null's reference ligand
+# conformation; written by generate_conformers, or extracted here from the structure for nulls
+# sampled before it was). Each molecule is scored in its own EDIAscorer 1.3 call (the only way
+# it writes per-atom scores) against the dataset's structure without its LIG residues (every
+# altloc kept: a multiconformer model's apo state contributes density too), cropped to the
+# residues within --edia_crop_radius Å of the molecule (the map is never cropped), bond orders
+# from the dataset's SMILES - so the reference always shares the null's map and settings.
+# EDIAscorer 1.3 needs a newer glibc than this host's, so each call set runs in one podman
+# container (EDIA_IMAGE), --edia_workers at a time: stage 2 uses -p x --edia_workers cores.
+# Per-molecule scores (EDIAm, mean atom EDIA, ...; one row per conformer, model = MODEL number
+# in conformers.pdb) go to distribution_residue_scores.csv and reference_residue_scores.csv,
+# per-atom scores to distribution_atom_scores.csv and reference_atom_scores.csv, and a
+# histogram of the null's mean atom EDIA (0.01 bins) to mean_atom_edia_histogram.png. A failed
+# call is recorded (status failed, files in <name>_edia_failed/) and doesn't stop the null.
+# Datasets without a map are skipped with a warning; an interrupted null resumes from its
+# finished calls (<name>_edia_work/).
 # Stage 3 pools stage 2 across every dataset into four histograms, each with its CSV: the
-# reference ligands' mean atom EDIA (one point per LIG residue altloc), each pocket's median and
-# mean null mean atom EDIA (one point per pocket), and each reference's mean atom EDIA
-# percentile within its pocket's null distribution (ties counted as half).
+# reference ligands' mean atom EDIA (one point per LIG residue altloc), each null's median and
+# mean null mean atom EDIA (one point per null), and each reference's mean atom EDIA
+# percentile within its null distribution (ties counted as half).
 #
-# Per-pocket output: the null ensemble belongs to a chain's binding pocket, not to a modeled
-# ligand. Every chain holding at least one ligand (resname LIG) gets one ensemble, sampled within
-# a sphere around the observed ligand centroids of that chain (see below), in
-# <dataset>/<conformer_run_name>/chain<X>/ (e.g. .../conformers_1/chainA, .../chainB); all of the
-# chain's LIG residues are its reference ligands (the first is the atom-naming template).
+# Per-ligand output: every conformation of every modeled ligand (resname LIG; each altloc letter
+# of each residue, e.g. altloc B, or C and D) gets its own null ensemble, in
+# <dataset>/<conformer_run_name>/LIG_<chain><resi>_<altloc>/ (e.g. .../run_21/LIG_A701_B); a
+# ligand with no altloc letter at all gets LIG_<chain><resi>. That conformation is the reference
+# ligand: the atom-naming template, the sampling centre, and the one reference scored in stage 2.
 #
 # Structures: DATASETS_DIR/<dataset>/STRUCTURE_PDB_PATTERN, default {dataset}_001.pdb: the
 # multiconformer model, apo state as altloc A and bound state as B (ligands B only). Its LIG
 # residues are expected to carry the {dataset}.pdb chains and numbers, with secondary-site copies
 # removed (claude_scripts/filter_001_ligands.py).
 #
-# Pocket ensemble and pocket volume: every dataset in the full DATASETS_FILE (even under
-# --dataset) contributes its structure. Stage 1a builds, once per run, into
-# logs/<conformer_run_name>/ (model list: ensemble_models.txt):
-#   - pocket_residues.csv: binding-site residue numbers (chain agnostic), residues with a heavy
-#     atom within --binding_site_cutoff Å (default 4) of a LIG residue in any structure
-#     (informational);
-#   - pocket_volume_<chain>.ccp4: per chain, every structure superposed onto REFERENCE_PDB on all
-#     CA atoms, all their LIG heavy atoms in that chain made spheres of --pocket_atom_radius Å
-#     (default 2, a cushion around the observed positions), with a probe of
-#     --pocket_probe_radius Å (default 2) rolled over them: the volume the probe can't enter
-#     (gaps narrower than the probe filled, no outward growth) (0.25 Å grid, REFERENCE_PDB
-#     frame);
-#   - each chain's sampling sphere: the minimum enclosing sphere of all structures' ligand
-#     centroids in that chain (centre in REFERENCE_PDB's frame, moved into each sampled
-#     structure's frame by the CA superposition), radius + --centroid_margin Å (default 2);
-#     written to pocket_spheres.json;
-#   - clash_ensemble.pkl: all of the above;
-#   - ensemble_aligned/: every structure superposed onto REFERENCE_PDB, for viewing.
-# Every generate_conformers run loads the pkl. A placement is kept only if all its heavy atoms are
-# inside the chain's pocket volume (the sampled structure superposed onto REFERENCE_PDB on all
-# CA). Clashes are checked against the sampled structure itself: a placement is dropped if it
-# clashes with any of its heavy atoms except LIG, --exclude_resn residues and the
-# --ignore_altlocs altlocs (default A, the apo state) - it must fit the bound state and may
-# overlap the apo state. No crystal symmetry mates are used.
+# Sampling (stage 1a): each placement is a random torsion conformer (RDKit ETKDG library from the
+# SMILES), its centroid drawn evenly by volume within --sampling_radius Å (default 3) of the
+# reference conformation's centroid, at a uniformly random orientation. Clashes are checked
+# against the dataset's structure itself: a placement is dropped if it clashes with any of its
+# heavy atoms except LIG, --exclude_resn residues and the --ignore_altlocs altlocs (default A,
+# the apo state) - it must fit the bound state and may overlap the apo state. No crystal
+# symmetry mates are used. Placements are drawn until --n_conformers are kept.
 #
 # Modularity: each stage nests under the previous stage's run-name folder, so a new name
 # branches off without touching prior results.
 #
-# Idempotency: every step checks whether its own output already exists - per chain (main
+# Idempotency: every step checks whether its own output already exists - per ligand null (main
 # pipeline steps) or per run (graphing steps) - and skips if so. Pass --overwrite to force every
 # step to redo, or --replot for just the graphing steps.
 #
@@ -115,9 +103,7 @@ Usage: $0 <conformer_run_name>
            [--radius_step <float>] [--angle_step <float>] [--clash_scale <float>]
            [--polar_clash_scale <float>] [--exclude_resn <resn[,resn...]>]
            [--max_candidates_per_conformer <int>] [--seed <int>] [--mask_spacing <float>]
-           [--pocket_atom_radius <float>] [--pocket_probe_radius <float>]
-           [--centroid_margin <float>]
-           [--binding_site_cutoff <float>] [--ignore_altlocs <letters>]
+           [--sampling_radius <float>] [--ignore_altlocs <letters>]
            [--map_pattern <pattern>]
            [--edia_crop_radius <float>] [--edia_workers <int>]
 
@@ -129,14 +115,14 @@ Options:
                             already exists (normally such a step is skipped - see "Idempotency"
                             in the header comment). Applies to every stage, including the
                             graphing steps.
-  --replot                 Force just the graphing steps (1c-1e, 2b, 3) to re-run in place, even
+  --replot                 Force just the graphing steps (1b-1d, 2b, 3) to re-run in place, even
                             if their output already exists. Does not affect generate_conformers
                             or EDIA scoring.
   --dataset <id[,id...]>   Run only on this dataset, or comma-separated list of datasets
                             (e.g. x00001-1 or x00001-1,x00002-1), instead of every dataset
                             listed in DATASETS_FILE (datasets.txt). Graphing steps are
                             skipped.
-  --n_conformers <int>     Conformers: number of non-clashing placements kept per chain pocket.
+  --n_conformers <int>     Conformers: number of non-clashing placements kept per ligand null.
                             Default: 1000.
   --n_torsion_confs <int>  Conformers: size of the RDKit ETKDG torsion conformer library.
                             Default: 200.
@@ -145,31 +131,22 @@ Options:
   --angle_step <float>     Conformers: translation polar/azimuth angles are rounded to this step
                             (degrees). Default: 1.
   --clash_scale <float>    Conformers: a ligand-protein atom pair clashes below this fraction of
-                            the sum of their vdW radii. Default: 0.75.
-  --polar_clash_scale <float>  Conformers: the same, for N-N, N-O and O-O pairs. Default: 0.6.
+                            the sum of their vdW radii, for every element pair. Default: 0.5.
+  --polar_clash_scale <float>  Conformers: a different threshold for N-N, N-O and O-O pairs only.
+                            Default: --clash_scale (one threshold for all pairs).
   --exclude_resn <resn[,resn...]>  Conformers and EDIA: comma-separated residue names left
                             out of the clash obstacles and of the EDIA target (besides
                             hydrogens and every LIG residue). Default: HOH,DMS.
   --max_candidates_per_conformer <int>  Conformers: stop after this many candidate placements
-                            per conformer asked for (i.e. this x --n_conformers per chain
-                            pocket) even if fewer than --n_conformers were kept. Default: 1000000.
-  --seed <int>             Conformers: random seed. Default: a fresh seed per chain pocket from the
+                            per conformer asked for (i.e. this x --n_conformers per ligand
+                            null) even if fewer than --n_conformers were kept. Default: 1000000.
+  --seed <int>             Conformers: random seed. Default: a fresh seed per ligand null from the
                             clock, recorded in each conformer_summary.json (params.seed).
 
   --mask_spacing <float>   Conformers: grid spacing (Å) of ensemble_mask.ccp4, the mask of every
                             voxel the kept placements occupy. Default: 0.25.
-  --pocket_atom_radius <float>  Pocket ensemble: each chain's pocket volume starts from the
-                            ensemble's ligand heavy atoms as spheres of this radius (Å, every
-                            element alike). Default: 2.
-  --pocket_probe_radius <float>  Pocket ensemble: radius (Å) of the probe rolled over those
-                            spheres; gaps narrower than it are filled (0: just the spheres).
-                            Default: 0.5.
-  --centroid_margin <float>  Pocket ensemble: the ligand centroid is sampled within the observed
-                            ligand centroids' enclosing sphere, its radius grown by this much
-                            (Å). Default: 2.
-  --binding_site_cutoff <float>  Pocket ensemble: residues with a heavy atom within this
-                            distance (Å) of a LIG residue in any structure are listed as
-                            binding-site residues (informational). Default: 4.
+  --sampling_radius <float>  Conformers: placement centroids are drawn evenly by volume within
+                            this distance (Å) of the reference ligand's centroid. Default: 3.
   --ignore_altlocs <letters>  Conformers: altloc letters (e.g. A or A,C) whose atoms are not clash
                             obstacles - the apo state of the multiconformer structures; "none"
                             makes every altloc an obstacle. EDIA always keeps every altloc.
@@ -185,7 +162,7 @@ Examples:
   $0 conformers_1
   $0 conformers_1 -p 8
   $0 conformers_1 --dataset x01325-1
-  $0 conformers_2 --n_conformers 20000 --pocket_atom_radius 1.5
+  $0 conformers_2 --n_conformers 20000 --sampling_radius 2
   $0 conformers_1 --map_pattern "{dataset}-event_1_1-BDC_0.3_map.native.ccp4"
   $0 conformers_1 -p 4 --edia_workers 4
 EOF
@@ -196,7 +173,7 @@ EOF
 BASE_DIR="${BASE_DIR:-/home/ngupta/snEDIAm}"
 CSV_FILE="${BASE_DIR}/pxr_fragments.csv"
 DATASETS_DIR="${BASE_DIR}/datasets"
-DATASETS_FILE="${BASE_DIR}/datasets.txt"
+DATASETS_FILE="${BASE_DIR}/datasets_test.txt"
 GRAPHS_DIR="${BASE_DIR}/graphs"
 SNEDIAM_ANALYSIS_SCRIPTS_DIR="${BASE_DIR}/qfit-3.0/src/snediam_analysis_scripts"
 CONDA_SH="/home/ngupta/miniconda3/etc/profile.d/conda.sh"
@@ -205,10 +182,8 @@ CONDA_ENV_NULL="snEDIAm"
 # Per-dataset inputs, inside DATASETS_DIR/<dataset>/: the structure holding the modeled
 # ligand(s) - the multiconformer model (apo state altloc A, bound state B).
 STRUCTURE_PDB_PATTERN="{dataset}_001.pdb"
-# Residue name of the modeled ligands; every chain holding one gets a null ensemble.
+# Residue name of the modeled ligands; every conformation of each gets a null ensemble.
 LIGAND_RESN="LIG"
-# Structure every ensemble structure is superposed onto (the pocket volumes' frame).
-REFERENCE_PDB="${BASE_DIR}/reference.pdb"
 # Density map EDIA scores against, inside DATASETS_DIR/<dataset>/ (override: --map_pattern).
 MAP_NAME_PATTERN="{dataset}_refined_2fofc.ccp4"
 # EDIAscorer 1.3 executable, and the podman image (glibc >= 2.29, in the local image store) it
@@ -223,7 +198,7 @@ PLOT_REFERENCE_COVERAGE_PY="${SNEDIAM_ANALYSIS_SCRIPTS_DIR}/plot_reference_cover
 PLOT_EDIA_HISTOGRAM_PY="${SNEDIAM_ANALYSIS_SCRIPTS_DIR}/plot_edia_histogram.py"
 PLOT_EDIA_EVALUATION_PY="${SNEDIAM_ANALYSIS_SCRIPTS_DIR}/plot_edia_evaluation.py"
 
-for f in "$DATASETS_FILE" "$CSV_FILE" "$CONDA_SH" "$REFERENCE_PDB" "$PLOT_ENSEMBLE_VOLUMES_PY" \
+for f in "$DATASETS_FILE" "$CSV_FILE" "$CONDA_SH" "$PLOT_ENSEMBLE_VOLUMES_PY" \
          "$PLOT_CONFORMER_ACCEPTANCE_PY" "$PLOT_REFERENCE_COVERAGE_PY" \
          "$PLOT_EDIA_HISTOGRAM_PY" "$PLOT_EDIA_EVALUATION_PY"; do
     if [ ! -f "$f" ]; then
@@ -257,9 +232,9 @@ DATASET_OVERRIDE_FILE=""
 
 # generate_conformers tunables, left empty by default so generate_conformers' own argparse
 # defaults apply (--n-conformers 1000, --n-torsion-confs 200,
-# --radius-step 0.1, --angle-step 1, --clash-scale 0.75, --polar-clash-scale 0.6,
+# --radius-step 0.1, --angle-step 1, --clash-scale 0.5, --polar-clash-scale = clash scale,
 # --exclude-resn HOH DMS, --max-candidates-per-conformer 1000000, --seed from the clock,
-# --mask-spacing 0.25).
+# --mask-spacing 0.25, --sampling-radius 3).
 n_conformers=""
 n_torsion_confs=""
 radius_step=""
@@ -270,10 +245,7 @@ exclude_resn=""
 max_candidates_per_conformer=""
 seed=""
 mask_spacing=""
-pocket_atom_radius=""
-pocket_probe_radius=""
-centroid_margin=""
-binding_site_cutoff=""
+sampling_radius=""
 ignore_altlocs=""
 map_pattern=""
 # run_edia tunables, empty for its argparse defaults (--crop-radius 5, --workers 1).
@@ -338,20 +310,8 @@ while [[ $# -gt 0 ]]; do
             mask_spacing="$2"
             shift 2
             ;;
-        --pocket_atom_radius)
-            pocket_atom_radius="$2"
-            shift 2
-            ;;
-        --pocket_probe_radius)
-            pocket_probe_radius="$2"
-            shift 2
-            ;;
-        --centroid_margin)
-            centroid_margin="$2"
-            shift 2
-            ;;
-        --binding_site_cutoff)
-            binding_site_cutoff="$2"
+        --sampling_radius)
+            sampling_radius="$2"
             shift 2
             ;;
         --ignore_altlocs)
@@ -423,35 +383,18 @@ echo "n_conformers: ${n_conformers:-(not set - generate_conformers default 1000)
 echo "n_torsion_confs: ${n_torsion_confs:-(not set - generate_conformers default 200)}"
 echo "radius_step: ${radius_step:-(not set - generate_conformers default 0.1)}"
 echo "angle_step: ${angle_step:-(not set - generate_conformers default 1)}"
-echo "clash_scale: ${clash_scale:-(not set - generate_conformers default 0.75)}"
-echo "polar_clash_scale: ${polar_clash_scale:-(not set - generate_conformers default 0.6)}"
+echo "clash_scale: ${clash_scale:-(not set - generate_conformers default 0.5)}"
+echo "polar_clash_scale: ${polar_clash_scale:-(not set - same as clash_scale)}"
 echo "exclude_resn: ${exclude_resn:-(not set - generate_conformers default HOH,DMS)}"
 echo "max_candidates_per_conformer: ${max_candidates_per_conformer:-(not set - generate_conformers default 1000000)}"
-echo "seed: ${seed:-(not set - generate_conformers picks one per chain pocket from the clock)}"
+echo "seed: ${seed:-(not set - generate_conformers picks one per ligand null from the clock)}"
 echo "mask_spacing: ${mask_spacing:-(not set - generate_conformers default 0.25)}"
-echo "pocket_atom_radius: ${pocket_atom_radius:-(not set - build_clash_ensemble default 2)}"
-echo "pocket_probe_radius: ${pocket_probe_radius:-(not set - build_clash_ensemble default 2)}"
-echo "centroid_margin: ${centroid_margin:-(not set - build_clash_ensemble default 2)}"
-echo "binding_site_cutoff: ${binding_site_cutoff:-(not set - build_clash_ensemble default 4)}"
+echo "sampling_radius: ${sampling_radius:-(not set - generate_conformers default 3)}"
 echo "ignore_altlocs: ${ignore_altlocs:-(not set - generate_conformers default A)}"
 [ -n "$map_pattern" ] && MAP_NAME_PATTERN="$map_pattern"
 echo "map_pattern: ${MAP_NAME_PATTERN}"
 echo "edia_crop_radius: ${edia_crop_radius:-(not set - run_edia default 5)}"
 echo "edia_workers: ${edia_workers:-(not set - run_edia default 1)}"
-
-# Pocket ensemble: the structure of every dataset in the full DATASETS_FILE, written before any
-# --dataset override so partial runs use the same ensemble.
-ENSEMBLE_LIST="${log_dir}/ensemble_models.txt"
-CLASH_ENSEMBLE="${log_dir}/clash_ensemble.pkl"
-grep -v '^[[:space:]]*$' "$DATASETS_FILE" | tr -d '\r' | while read -r _ds; do
-    _pdb="${DATASETS_DIR}/${_ds}/${STRUCTURE_PDB_PATTERN//\{dataset\}/${_ds}}"
-    if [ -f "$_pdb" ]; then
-        echo "$_pdb"
-    else
-        echo "Warning: ${_pdb} not found; left out of the pocket ensemble" >&2
-    fi
-done > "$ENSEMBLE_LIST"
-echo "pocket ensemble: $(wc -l < "$ENSEMBLE_LIST") structures (${ENSEMBLE_LIST})"
 
 # --dataset override: repoint DATASETS_FILE at a generated temp file listing just the requested
 # dataset(s).
@@ -493,7 +436,7 @@ NUM_PARALLEL_DEFAULT=${num_parallel:-1}
 export conformer_run_name overwrite replot
 export n_conformers n_torsion_confs radius_step angle_step clash_scale
 export polar_clash_scale exclude_resn max_candidates_per_conformer seed mask_spacing
-export pocket_atom_radius pocket_probe_radius centroid_margin binding_site_cutoff ignore_altlocs ENSEMBLE_LIST CLASH_ENSEMBLE
+export sampling_radius ignore_altlocs
 export BASE_DIR DATASETS_DIR DATASETS_FILE GRAPHS_DIR CSV_FILE CONDA_SH CONDA_ENV_NULL
 export STRUCTURE_PDB_PATTERN LIGAND_RESN
 export MAP_NAME_PATTERN EDIASCORER EDIA_IMAGE edia_crop_radius edia_workers PLOT_EDIA_HISTOGRAM_PY
@@ -510,18 +453,32 @@ files_exist() {
 }
 export -f files_exist
 
-# list_ligands <pdb_file>: prints one "<chain> <resnum>" line per LIGAND_RESN residue in the
-# file, in file order.
+# list_ligands <pdb_file>: prints one "<chain> <resnum> <altloc>" line per conformation of each
+# LIGAND_RESN residue in the file - one line per altloc letter of the residue's heavy atoms, in
+# file order; a residue with no altloc letter gives one line with altloc "-".
 list_ligands() {
     local pdb_file=$1
     awk -v resn="$LIGAND_RESN" '
         ($1 == "ATOM" || $1 == "HETATM") {
             r = substr($0, 18, 3); gsub(/ /, "", r)
             if (r != resn) next
+            el = substr($0, 77, 2); gsub(/ /, "", el)
+            if (el == "") { el = substr($0, 13, 4); gsub(/ /, "", el); el = substr(el, 1, 1) }
+            if (toupper(el) == "H" || toupper(el) == "D") next
             chain = substr($0, 22, 1); gsub(/ /, "", chain)
             resnum = substr($0, 23, 4); gsub(/ /, "", resnum)
+            alt = substr($0, 17, 1)
             key = chain " " resnum
-            if (!(key in seen)) { seen[key] = 1; print key }
+            if (!(key in seen)) { seen[key] = 1; order[++n] = key }
+            if (alt != " " && !((key, alt) in has)) { has[key, alt] = 1; alts[key] = alts[key] alt }
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                key = order[i]
+                if (alts[key] == "") { print key " -"; continue }
+                m = split(alts[key], letters, "")
+                for (j = 1; j <= m; j++) print key " " letters[j]
+            }
         }
     ' "$pdb_file"
 }
@@ -608,12 +565,11 @@ print_elapsed() {
 export -f print_elapsed
 
 ######################################################################
-# Stage 1b: generate_conformers
+# Stage 1a: generate_conformers
 ######################################################################
-# For every chain of the dataset's structure that holds a ligand, samples non-clashing placements
-# (torsion conformer + translation + rotation) within that chain's sampling sphere and pocket
-# volume (both from the pocket ensemble). One ensemble per
-# chain, however many LIG residues the chain has (they're all passed as reference ligands).
+# For every conformation (altloc) of every ligand of the dataset's structure, samples
+# non-clashing placements (torsion conformer + translation + rotation) within --sampling_radius
+# of that conformation's centroid, into LIG_<chain><resi>_<altloc>/.
 
 conformers_process_dataset() {
     local dataset=$1
@@ -632,24 +588,17 @@ conformers_process_dataset() {
         return 1
     fi
 
-    # Chains holding a ligand, in file order, with their LIG residue numbers.
-    local chains=() chain resnum
-    declare -A chain_resis=()
-    for lig in "${ligands[@]}"; do
-        read -r chain resnum <<< "$lig"
-        if [ -z "${chain_resis[$chain]+x}" ]; then
-            chains+=("$chain")
-            chain_resis[$chain]="$resnum"
-        else
-            chain_resis[$chain]+=" $resnum"
-        fi
-    done
-
     conda_activate "$CONDA_ENV_NULL"
 
-    local out_dir label
-    for chain in "${chains[@]}"; do
-        label="chain${chain}"
+    local lig chain resnum altloc out_dir label
+    for lig in "${ligands[@]}"; do
+        read -r chain resnum altloc <<< "$lig"
+        if [ "$altloc" = "-" ]; then
+            altloc=""
+            label="${LIGAND_RESN}_${chain}${resnum}"
+        else
+            label="${LIGAND_RESN}_${chain}${resnum}_${altloc}"
+        fi
         out_dir="${dataset_dir}/${conformer_run_name}/${label}"
         if [ "$overwrite" -ne 1 ] && files_exist "${out_dir}/conformer_summary.json"; then
             echo "Skipping [${dataset} ${label}]: conformers already complete (${out_dir}/conformer_summary.json exists)."
@@ -660,7 +609,9 @@ conformers_process_dataset() {
         write_params_txt "${out_dir}/conformer_params.txt" \
             "structure=${structure}" \
             "chain=${chain}" \
-            "reference_ligands=${chain_resis[$chain]}" \
+            "resi=${resnum}" \
+            "altloc=${altloc}" \
+            "sampling_radius=${sampling_radius}" \
             "n_conformers=${n_conformers}" \
             "n_torsion_confs=${n_torsion_confs}" \
             "radius_step=${radius_step}" \
@@ -671,12 +622,7 @@ conformers_process_dataset() {
             "max_candidates_per_conformer=${max_candidates_per_conformer}" \
             "seed=${seed}" \
             "mask_spacing=${mask_spacing}" \
-            "clash_ensemble=${CLASH_ENSEMBLE}" \
-            "ignore_altlocs=${ignore_altlocs}" \
-            "pocket_atom_radius=${pocket_atom_radius}" \
-            "pocket_probe_radius=${pocket_probe_radius}" \
-            "centroid_margin=${centroid_margin}" \
-            "binding_site_cutoff=${binding_site_cutoff}"
+            "ignore_altlocs=${ignore_altlocs}"
 
         local extra_args=()
         [ -n "$n_conformers" ] && extra_args+=(--n-conformers "$n_conformers")
@@ -689,16 +635,16 @@ conformers_process_dataset() {
         [ -n "$max_candidates_per_conformer" ] && extra_args+=(--max-candidates-per-conformer "$max_candidates_per_conformer")
         [ -n "$seed" ] && extra_args+=(--seed "$seed")
         [ -n "$mask_spacing" ] && extra_args+=(--mask-spacing "$mask_spacing")
+        [ -n "$sampling_radius" ] && extra_args+=(--sampling-radius "$sampling_radius")
+        [ -n "$altloc" ] && extra_args+=(--altloc "$altloc")
         if [ "$ignore_altlocs" = "none" ]; then
             extra_args+=(--ignore-altlocs)
         elif [ -n "$ignore_altlocs" ]; then
             extra_args+=(--ignore-altlocs ${ignore_altlocs//,/ })
         fi
 
-        echo "Processing [${dataset} ${label}]: sampling sphere from the pocket ensemble, reference ${LIGAND_RESN} ${chain} ${chain_resis[$chain]}"
-        generate_conformers "$structure" "$CSV_FILE" "$dataset" "$chain" "$out_dir" \
-            --reference-resi ${chain_resis[$chain]} \
-            --clash-ensemble "$CLASH_ENSEMBLE" \
+        echo "Processing [${dataset} ${label}]: sampling around ${LIGAND_RESN} ${chain} ${resnum}${altloc:+ altloc ${altloc}}"
+        generate_conformers "$structure" "$CSV_FILE" "$dataset" "$chain" "$resnum" "$out_dir" \
             "${extra_args[@]}" \
             > "${out_dir}/generate_conformers_log.txt" 2>&1
         local status=$?
@@ -713,30 +659,6 @@ conformers_process_dataset() {
 }
 export -f conformers_process_dataset
 
-######################################################################
-# Stage 1a: build_clash_ensemble
-######################################################################
-# Once per run, before the parallel step: saves each chain's pocket volume and sampling sphere
-# (and the binding-site residues, informational); every generate_conformers run loads it.
-
-do_build_clash_ensemble() {
-    if [ "$overwrite" -ne 1 ] && [ -f "$CLASH_ENSEMBLE" ]; then
-        echo "Skipping: pocket ensemble already built (${CLASH_ENSEMBLE} exists; pass --overwrite to rebuild)."
-        return 0
-    fi
-    local extra_args=()
-    [ -n "$pocket_atom_radius" ] && extra_args+=(--pocket-atom-radius "$pocket_atom_radius")
-    [ -n "$pocket_probe_radius" ] && extra_args+=(--pocket-probe-radius "$pocket_probe_radius")
-    [ -n "$centroid_margin" ] && extra_args+=(--centroid-margin "$centroid_margin")
-    [ -n "$binding_site_cutoff" ] && extra_args+=(--binding-site-cutoff "$binding_site_cutoff")
-    conda_activate "$CONDA_ENV_NULL"
-    build_clash_ensemble "$REFERENCE_PDB" "$ENSEMBLE_LIST" "$CLASH_ENSEMBLE" \
-        --aligned-dir "${log_dir}/ensemble_aligned" "${extra_args[@]}"
-    local status=$?
-    conda_deactivate
-    return $status
-}
-
 do_conformers() {
     echo "Starting run"
     local start_time=$(date +%s)
@@ -747,13 +669,49 @@ do_conformers() {
 
 ######################################################################
 # Stage 2: per-atom EDIA scoring of the null conformers and reference ligands (2a) and mean
-# atom EDIA histogram (2b), per chain pocket
+# atom EDIA histogram (2b), per ligand null
 ######################################################################
-# For every chain<X> pocket of the dataset's run folder that has conformers: scores each of its
-# conformers and the chain's reference ligands alone (run_edia) against the dataset's density
-# map, then plots the pocket's null mean atom EDIA histogram (plot_edia_histogram.py). A pocket
-# counts as scored only if its edia_params.json records per-atom scoring; run_edia decides
-# between full scoring, resuming, and scoring just the references.
+# For every LIG_* null of the dataset's run folder that has conformers: run_edia scores
+# conformers.pdb (-> distribution_residue_scores.csv, distribution_atom_scores.csv) and then
+# ligand.pdb, the reference ligand conformation (-> reference_residue_scores.csv,
+# reference_atom_scores.csv), against the dataset's density map, then plots the null's mean
+# atom EDIA histogram (plot_edia_histogram.py). A null counts as scored once all four CSVs and
+# both params JSONs exist; run_edia itself skips a part already scored with the same inputs and
+# resumes an interrupted one.
+
+# crystal_info <dataset>: the dataset's row of CSV_FILE as "resolution a b c alpha beta gamma
+# space_group" (columns found by header name; plain comma-separated fields), nothing if absent.
+crystal_info() {
+    awk -F, -v ds="$1" '
+        NR == 1 { for (i = 1; i <= NF; i++) { h = $i; gsub(/[ \r"]/, "", h); col[h] = i }; next }
+        { gsub(/\r/, "") }
+        $col["dataset"] == ds {
+            sg = $col["space_group"]; gsub(/^ +| +$/, "", sg)
+            print $col["resolution"] + 0, $col["a"] + 0, $col["b"] + 0, $col["c"] + 0,
+                  $col["alpha"] + 0, $col["beta"] + 0, $col["gamma"] + 0, sg
+            exit
+        }' "$CSV_FILE"
+}
+export -f crystal_info
+
+# extract_ligand <structure_pdb> <chain> <resi> [altloc]: the LIG residue's heavy atoms (the
+# blank-altloc atoms plus the altloc's; every atom if no altloc is given), altloc column blanked,
+# as a PDB on stdout - the same conformation generate_conformers' read_ligand takes.
+extract_ligand() {
+    awk -v resn="$LIGAND_RESN" -v chain="$2" -v resi="$3" -v alt="$4" '
+        /^(ATOM  |HETATM)/ {
+            r = substr($0, 18, 3); gsub(/ /, "", r)
+            a = substr($0, 17, 1)
+            el = substr($0, 77, 2); gsub(/ /, "", el)
+            if (el == "") { n = substr($0, 13, 4); gsub(/ /, "", n); el = substr(n, 1, 1) }
+            el = toupper(el)
+            if (r == resn && substr($0, 22, 1) == chain && substr($0, 23, 4) + 0 == resi + 0 \
+                    && el != "H" && el != "D" && (alt == "" || a == " " || a == alt))
+                print substr($0, 1, 16) " " substr($0, 18)
+        }
+        END { print "END" }' "$1"
+}
+export -f extract_ligand
 
 edia_process_dataset() {
     local dataset=$1
@@ -765,59 +723,105 @@ edia_process_dataset() {
         echo "Warning [${dataset}]: density map not found: ${map}, skipping EDIA."
         return 1
     fi
+    # Unit cell, space group and resolution: always from CSV_FILE, passed to run_edia.
+    local resolution cell_a cell_b cell_c cell_alpha cell_beta cell_gamma space_group
+    read -r resolution cell_a cell_b cell_c cell_alpha cell_beta cell_gamma space_group \
+        < <(crystal_info "$dataset")
+    if [ -z "$space_group" ]; then
+        echo "ERROR [${dataset}]: no row (or no space_group) in ${CSV_FILE}, skipping EDIA."
+        return 1
+    fi
     local pockets=()
     mapfile -t pockets < <(find "${dataset_dir}/${conformer_run_name}" -mindepth 1 -maxdepth 1 \
-        -type d -name 'chain*' 2>/dev/null | sort)
+        -type d -name "${LIGAND_RESN}_*" 2>/dev/null | sort)
     if [ ${#pockets[@]} -eq 0 ]; then
-        echo "Warning [${dataset}]: no ${conformer_run_name}/chain* pockets, skipping EDIA."
+        echo "Warning [${dataset}]: no ${conformer_run_name}/${LIGAND_RESN}_* ligand nulls, skipping EDIA."
         return 1
     fi
 
     conda_activate "$CONDA_ENV_NULL"
 
-    local pocket chain label status scored
+    local pocket label status scored smiles lig_chain lig_resi lig_alt
     for pocket in "${pockets[@]}"; do
         label="${pocket##*/}"
-        chain="${label#chain}"
         scored=0
         if [ ! -f "${pocket}/conformers.pdb" ]; then
             echo "Skipping [${dataset} ${label}]: no conformers.pdb."
             continue
         fi
 
-        if [ "$overwrite" -ne 1 ] && files_exist "${pocket}/edia_scores.csv" "${pocket}/reference_edia.csv" \
-                && grep -q '"mode": "per_atom"' "${pocket}/edia_params.json" 2>/dev/null; then
-            echo "Skipping [${dataset} ${label}]: EDIA already complete (edia_scores.csv and reference_edia.csv exist, scored per atom)."
+        if [ "$overwrite" -ne 1 ] && files_exist \
+                "${pocket}/distribution_residue_scores.csv" "${pocket}/distribution_atom_scores.csv" \
+                "${pocket}/distribution_residue_scores_params.json" \
+                "${pocket}/reference_residue_scores.csv" "${pocket}/reference_atom_scores.csv" \
+                "${pocket}/reference_residue_scores_params.json"; then
+            echo "Skipping [${dataset} ${label}]: EDIA already complete (distribution_* and reference_* scores exist)."
         else
+            # The reference ligand conformation: ligand.pdb from generate_conformers, or, for
+            # nulls sampled before it wrote one, extracted from the structure (the folder
+            # label's residue: blank-altloc plus its altloc's heavy atoms, altloc blanked).
+            if [ ! -s "${pocket}/ligand.pdb" ]; then
+                if [[ ! "$label" =~ ^${LIGAND_RESN}_(.)(-?[0-9]+)(_(.))?$ ]]; then
+                    echo "ERROR [${dataset} ${label}]: no ligand.pdb, and the folder name is not ${LIGAND_RESN}_<chain><resi>[_<altloc>]"
+                    continue
+                fi
+                lig_chain="${BASH_REMATCH[1]}" lig_resi="${BASH_REMATCH[2]}" lig_alt="${BASH_REMATCH[4]}"
+                extract_ligand "$structure" "$lig_chain" "$lig_resi" "$lig_alt" > "${pocket}/ligand.pdb"
+                if ! grep -q '^HETATM\|^ATOM' "${pocket}/ligand.pdb"; then
+                    echo "ERROR [${dataset} ${label}]: no ${LIGAND_RESN} ${lig_chain}${lig_resi}${lig_alt:+ alt ${lig_alt}} heavy atoms in ${structure}"
+                    rm -f "${pocket}/ligand.pdb"
+                    continue
+                fi
+                echo "Wrote ${pocket}/ligand.pdb from ${structure##*/}"
+            fi
+            smiles=$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["ligand"]["smiles"])' \
+                "${pocket}/conformer_summary.json" 2>/dev/null)
+            if [ -z "$smiles" ]; then
+                echo "ERROR [${dataset} ${label}]: no ligand SMILES in ${pocket}/conformer_summary.json"
+                continue
+            fi
             write_params_txt "${pocket}/edia_params.txt" \
                 "map=${map}" \
                 "map_pattern=${MAP_NAME_PATTERN}" \
                 "structure=${structure}" \
                 "fragments_csv=${CSV_FILE}" \
-                "exclude_resn=${exclude_resn}" \
+                "cell=${cell_a} ${cell_b} ${cell_c} ${cell_alpha} ${cell_beta} ${cell_gamma}" \
+                "space_group=${space_group}" \
+                "resolution=${resolution}" \
+                "smiles=${smiles}" \
+                "exclude_resn=${LIGAND_RESN}${exclude_resn:+,${exclude_resn}}" \
                 "ediascorer=${EDIASCORER}" \
                 "container_image=${EDIA_IMAGE}" \
                 "crop_radius=${edia_crop_radius}" \
                 "workers=${edia_workers}"
-            local exclude_args=() overwrite_args=() tunable_args=()
-            [ -n "$exclude_resn" ] && exclude_args=(--exclude-resn ${exclude_resn//,/ })
-            [ "$overwrite" -eq 1 ] && overwrite_args=(--overwrite)
-            [ -n "$edia_crop_radius" ] && tunable_args+=(--crop-radius "$edia_crop_radius")
-            [ -n "$edia_workers" ] && tunable_args+=(--workers "$edia_workers")
-            echo "Processing [${dataset} ${label}]: per-atom EDIA against ${map##*/}"
-            # The log is appended to: an interrupted pocket resumes, and its earlier progress
+            local common_args=(--cell "$cell_a" "$cell_b" "$cell_c" "$cell_alpha" "$cell_beta" "$cell_gamma"
+                               --space-group "$space_group" --resolution "$resolution"
+                               --smiles "$smiles" --resn "$LIGAND_RESN"
+                               --exclude-resn "$LIGAND_RESN" ${exclude_resn//,/ }
+                               --ediascorer "$EDIASCORER" --container-image "$EDIA_IMAGE")
+            [ "$overwrite" -eq 1 ] && common_args+=(--overwrite)
+            [ -n "$edia_crop_radius" ] && common_args+=(--crop-radius "$edia_crop_radius")
+            [ -n "$edia_workers" ] && common_args+=(--workers "$edia_workers")
+            echo "Processing [${dataset} ${label}]: per-atom EDIA of conformers.pdb and ligand.pdb against ${map##*/}"
+            # The log is appended to: an interrupted null resumes, and its earlier progress
             # stays readable.
-            run_edia "$dataset_dir" "$conformer_run_name" "$chain" \
-                --map "$map" --structure "$structure" --fragments-csv "$CSV_FILE" \
-                --ediascorer "$EDIASCORER" --container-image "$EDIA_IMAGE" \
-                "${tunable_args[@]}" "${overwrite_args[@]}" "${exclude_args[@]}" \
-                >> "${pocket}/run_edia_log.txt" 2>&1
-            status=$?
-            if [ $status -ne 0 ]; then
-                echo "ERROR [${dataset} ${label}]: run_edia failed with exit code ${status} (see ${pocket}/run_edia_log.txt)"
-                continue
-            fi
-            echo "Completed [${dataset} ${label}]: $(tail -n 1 "${pocket}/run_edia_log.txt")"
+            status=0
+            local what
+            for what in distribution reference; do
+                local ligand_pdb="${pocket}/conformers.pdb"
+                [ "$what" = reference ] && ligand_pdb="${pocket}/ligand.pdb"
+                run_edia "$ligand_pdb" "$structure" "$map" "$pocket" \
+                    --residue-scores "${what}_residue_scores.csv" \
+                    --atom-scores "${what}_atom_scores.csv" \
+                    "${common_args[@]}" >> "${pocket}/run_edia_log.txt" 2>&1
+                status=$?
+                if [ $status -ne 0 ]; then
+                    echo "ERROR [${dataset} ${label}]: run_edia (${what}, ${ligand_pdb##*/}) failed with exit code ${status} (see ${pocket}/run_edia_log.txt)"
+                    break
+                fi
+                echo "Completed [${dataset} ${label}] ${what}: $(tail -n 1 "${pocket}/run_edia_log.txt")"
+            done
+            [ $status -ne 0 ] && continue
             scored=1
         fi
 
@@ -825,7 +829,7 @@ edia_process_dataset() {
         if [ "$overwrite" -ne 1 ] && [ "$replot" -ne 1 ] && [ "$scored" -ne 1 ] \
                 && files_exist "${pocket}/mean_atom_edia_histogram.png"; then
             echo "Skipping [${dataset} ${label}]: mean atom EDIA histogram exists (pass --replot to redo)."
-        elif ! python "$PLOT_EDIA_HISTOGRAM_PY" "$dataset_dir" "$conformer_run_name" "$chain"; then
+        elif ! python "$PLOT_EDIA_HISTOGRAM_PY" "$dataset_dir" "$conformer_run_name" "$label"; then
             echo "ERROR [${dataset} ${label}]: plot_edia_histogram failed"
         fi
     done
@@ -847,7 +851,7 @@ do_edia() {
 }
 
 ######################################################################
-# Stages 1c-1e and 3: pooled plots
+# Stages 1b-1d and 3: pooled plots
 ######################################################################
 # run_pooled_plot <script> [extra args...]: runs one snediam_analysis_scripts plot over every
 # dataset of the run.
@@ -905,17 +909,16 @@ do_plot_reference_coverage() {
 # --- Drive the requested stages, in order ---
 overall_start=$(date +%s)
 
-run_step "Stage 1a: build_clash_ensemble (${conformer_run_name})" do_build_clash_ensemble
-run_step "Stage 1b: generate_conformers (${conformer_run_name})" do_conformers
-run_step_pooled_replot "Stage 1c: plot_ensemble_volumes (${conformer_run_name})" \
+run_step "Stage 1a: generate_conformers (${conformer_run_name})" do_conformers
+run_step_pooled_replot "Stage 1b: plot_ensemble_volumes (${conformer_run_name})" \
     ensemble_volumes_outputs_exist do_plot_ensemble_volumes
-run_step_pooled_replot "Stage 1d: plot_conformer_acceptance (${conformer_run_name})" \
+run_step_pooled_replot "Stage 1c: plot_conformer_acceptance (${conformer_run_name})" \
     conformer_acceptance_outputs_exist do_plot_conformer_acceptance
-run_step_pooled_replot "Stage 1e: plot_reference_coverage (${conformer_run_name})" \
+run_step_pooled_replot "Stage 1d: plot_reference_coverage (${conformer_run_name})" \
     reference_coverage_outputs_exist do_plot_reference_coverage
-# run_step "Stage 2: per-atom EDIA scoring of the null conformers and reference ligands, mean atom EDIA histograms (${conformer_run_name}, map ${MAP_NAME_PATTERN})" do_edia
-# run_step_pooled_replot "Stage 3: EDIA evaluation plots (${conformer_run_name})" \
-#     edia_evaluation_outputs_exist do_plot_edia_evaluation
+run_step "Stage 2: per-atom EDIA scoring of the null conformers and reference ligands, mean atom EDIA histograms (${conformer_run_name}, map ${MAP_NAME_PATTERN})" do_edia
+run_step_pooled_replot "Stage 3: EDIA evaluation plots (${conformer_run_name})" \
+    edia_evaluation_outputs_exist do_plot_edia_evaluation
 
 echo "========= generate_null.sh complete ========="
 print_elapsed "$overall_start" "Total"
