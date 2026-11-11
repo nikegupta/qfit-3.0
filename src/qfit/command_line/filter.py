@@ -86,7 +86,7 @@ def build_argparser():
     )
     p.add_argument(
         "--min_cluster_proportion",
-        default=0.1,
+        default=0.01,
         metavar="<float>",
         type=float,
         help="Count filtering: minimum number of member conformers a spatial "
@@ -97,7 +97,7 @@ def build_argparser():
              "than 10 members to be accepted; 0 disables this filter (every "
              "cluster with at least 1 member passes). Runs before RSCC "
              "filtering; clusters below this are treated as noise and "
-             "discarded. (default: 0.1)",
+             "discarded. (default: 0.01, i.e. more than 1 member per 100)",
     )
     p.add_argument(
         "--clash_vdw_scale",
@@ -160,14 +160,139 @@ def build_argparser():
              "a good fit of the rest of the ligand. Runs after RSCC filtering "
              "and before per-placer_file de-duplication. (default: 0.3)",
     )
+    p.add_argument(
+        "--ligand_cif",
+        nargs="+",
+        default=None,
+        metavar="<cif>",
+        help="Restraint dictionary cif(s) for this dataset's ligand (one per "
+             "stereoisomer/variant directory under LIG_PDB_DIR). Used only to "
+             "name the sulfonyl atoms for --sulfonyl_rscc_floor, from each "
+             "cif's _chem_comp_bond list; every cif must name the same atoms. "
+             "If omitted, sulfonyl RSCC filtering is skipped.",
+    )
+    p.add_argument(
+        "--sulfonyl_rscc_floor",
+        default=0.3,
+        metavar="<float>",
+        type=float,
+        help="Sulfonyl RSCC filtering: for a cluster rep whose ligand contains "
+             "an S(=O)(=O) group (an S with two O neighbours bonded to nothing "
+             "else, per --ligand_cif), the RSCC is recomputed with that "
+             "sulfonyl S and every heavy atom directly bonded to it (its two "
+             "O atoms plus its C/N/O substituents; every such group, if more "
+             "than one) excluded, "
+             "against the same event map that gave the rep's full-ligand RSCC. "
+             "If that sulfonyl-less RSCC falls below this value, the rep is "
+             "rejected - same reasoning as --halogen_rscc_floor, for the "
+             "sulfonyl group's strong density signal. Runs after halogen RSCC "
+             "filtering and before per-placer_file de-duplication. Needs "
+             "--ligand_cif. (default: 0.3)",
+    )
     return p
+
+
+def _cif_bonds(path):
+    """
+    (atom_id_1, atom_id_2) pairs from the _chem_comp_bond loop of a restraint
+    dictionary cif (eLBOW/monomer-library layout), columns located by their
+    header position.
+    """
+    cols = []
+    bonds = []
+    in_loop = False
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('_chem_comp_bond.'):
+                in_loop = True
+                cols.append(s.split('.', 1)[1].split()[0])
+                continue
+            if not in_loop:
+                continue
+            if not s or s.startswith(('loop_', '_', '#', 'data_')):
+                if bonds:
+                    break
+                continue
+            fields = s.split()
+            bonds.append((fields[cols.index('atom_id_1')], fields[cols.index('atom_id_2')]))
+    if not bonds:
+        raise ValueError(f'no _chem_comp_bond entries found in {path}')
+    return bonds
+
+
+def _cif_atom_elements(path):
+    """atom_id -> element symbol (upper case) from the _chem_comp_atom loop."""
+    cols = []
+    elements = {}
+    in_loop = False
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('_chem_comp_atom.'):
+                in_loop = True
+                cols.append(s.split('.', 1)[1].split()[0])
+                continue
+            if not in_loop:
+                continue
+            if not s or s.startswith(('loop_', '_', '#', 'data_')):
+                if elements:
+                    break
+                continue
+            fields = s.split()
+            elements[fields[cols.index('atom_id')]] = fields[cols.index('type_symbol')].upper()
+    if not elements:
+        raise ValueError(f'no _chem_comp_atom entries found in {path}')
+    return elements
+
+
+def sulfonyl_atom_names(cif_paths):
+    """
+    Atom names of every sulfonyl sulfur and its directly bonded heavy atoms
+    in a ligand, from its restraint dictionary cif(s). A sulfonyl S is an S
+    bonded to at least two O atoms whose only non-H neighbour is that S; the
+    S is returned together with every non-H atom bonded to it (the two =O
+    plus the C/N/O substituents). Any other S (thioether, thiophene, ...) is
+    ignored. Topology only (not bond-order labels), so it holds
+    however the cif typed the S-O bonds. Every cif in cif_paths (one per
+    stereoisomer/variant of the same ligand) must give the same set - the
+    names are then looked up in the PLACER ligand, whichever variant it came
+    from. Returns a frozenset (empty if the ligand has no such group).
+    """
+    result = None
+    for path in cif_paths:
+        elements = _cif_atom_elements(path)
+        neighbours = {}
+        for a, b in _cif_bonds(path):
+            neighbours.setdefault(a, []).append(b)
+            neighbours.setdefault(b, []).append(a)
+
+        def heavy_neighbours(atom):
+            return [n for n in neighbours.get(atom, []) if elements.get(n) not in ('H', 'D')]
+
+        names = set()
+        for atom, element in elements.items():
+            if element != 'S':
+                continue
+            terminal_o = [n for n in heavy_neighbours(atom)
+                          if elements.get(n) == 'O' and heavy_neighbours(n) == [atom]]
+            if len(terminal_o) >= 2:
+                names.update([atom, *heavy_neighbours(atom)])
+        names = frozenset(names)
+
+        if result is None:
+            result = names
+        elif names != result:
+            raise ValueError(f'sulfonyl atoms differ between ligand cifs: {sorted(result)} '
+                             f'vs {sorted(names)} ({path})')
+    return result if result is not None else frozenset()
 
 class Filter():
     def __init__(self, dataset_dir, placer_files, fit_ligand_files, output_folder,
-                 resolution, filter_proportion=1, min_cluster_proportion=0.1,
+                 resolution, filter_proportion=1, min_cluster_proportion=0.01,
                  clash_vdw_scale=0.75, rscc_cutoff=0.6,
                  clustering_mode='all-atom', clustering_cutoff=4.0,
-                 halogen_rscc_floor=0.3):
+                 halogen_rscc_floor=0.3, ligand_cifs=None, sulfonyl_rscc_floor=0.3):
         self.dir = dataset_dir
         self.placer_files = placer_files
         self.fit_ligand_files = fit_ligand_files
@@ -216,6 +341,15 @@ class Filter():
         # poorly. A rep is rejected if its RSCC, recomputed with its Br/I
         # atom(s) excluded against the same event map, falls below this.
         self.halogen_rscc_floor = halogen_rscc_floor
+
+        # Sulfonyl RSCC filtering (_filterSulfonylOverfit): same idea as the
+        # halogen filter, for the sulfonyl group's strong density. The S and
+        # its bonded heavy atoms are named once here from the ligand's restraint dictionary
+        # cif(s) (sulfonyl_atom_names) and matched by name in each rep's
+        # ligand. No cifs given -> the filter is skipped (empty name set).
+        self.sulfonyl_rscc_floor = sulfonyl_rscc_floor
+        self.ligand_cifs = ligand_cifs
+        self.sulfonyl_atom_names = sulfonyl_atom_names(ligand_cifs) if ligand_cifs else frozenset()
 
         self._load_event_maps()
 
@@ -359,8 +493,8 @@ class Filter():
             #count filtering: drop clusters that are only supported by a
             #small number of conformers, relative to the number of
             #conformers in a single placer_file's coor_set (assumed to be
-            #the same for every placer_file). e.g. with the default
-            #min_cluster_proportion of 0.1 and 100 conformers per
+            #the same for every placer_file). e.g. with
+            #min_cluster_proportion 0.1 and 100 conformers per
             #placer_file, a cluster needs more than 0.1 * 100 = 10 members
             #to survive; smaller clusters are treated as noise. 0 disables
             #this filter (every cluster with at least 1 member passes). This
@@ -403,6 +537,14 @@ class Filter():
 
             print(f'number of reps after halogen rscc filtering: {len(self.cluster_reps)}')
 
+            #sulfonyl RSCC filtering: same as the halogen filter above, for
+            #an S(=O)(=O) S and its bonded atoms (see _filterSulfonylOverfit).
+            #Also before per-placer_file de-duplication, for the same reason.
+            self._filterSulfonylOverfit()
+            passed_sulfonyl_ids = set(self.cluster_reps.keys())
+
+            print(f'number of reps after sulfonyl rscc filtering: {len(self.cluster_reps)}')
+
             #filter down to best structure from each placer_file
             filtered_cluster_reps = {}
             visited = []
@@ -443,6 +585,8 @@ class Filter():
                     cluster_status[cluster_id] = 'failed_rscc_cutoff'
                 elif cluster_id not in passed_halogen_ids:
                     cluster_status[cluster_id] = 'failed_halogen_rscc_floor'
+                elif cluster_id not in passed_sulfonyl_ids:
+                    cluster_status[cluster_id] = 'failed_sulfonyl_rscc_floor'
                 elif cluster_id not in accepted_ids:
                     cluster_status[cluster_id] = 'lost_per_placer_file_dedup'
                 elif cluster_id in self.clash_rejected_ids:
@@ -471,7 +615,7 @@ class Filter():
             self._write_cluster_members_csv(
                 self.clusters, self.scores, unfiltered_cluster_reps,
                 unfiltered_cluster_rsccs, cluster_status, self.halogen_rscc_without_halogen,
-                cluster_members_csv
+                self.sulfonyl_rscc_without_sulfonyl, cluster_members_csv
             )
             print(f'full cluster membership and rejection reasons written to {cluster_members_csv}')
 
@@ -514,7 +658,8 @@ class Filter():
                 f.write('\n')
 
     def _write_cluster_members_csv(self, clusters, scores, cluster_reps, cluster_rsccs,
-                                    cluster_status, halogen_rscc_without_halogen, path):
+                                    cluster_status, halogen_rscc_without_halogen,
+                                    sulfonyl_rscc_without_sulfonyl, path):
         """
         Writes a csv covering every input placer model conformer that was
         scored (every placer_file/index pair in `scores`), with its cluster
@@ -534,9 +679,15 @@ class Filter():
                                       whose ligand contains Br/I (see
                                       _filterHalogenOverfit) - its RSCC with
                                       the halogen excluded; empty otherwise
+          sulfonyl_rscc_without_sulfonyl : same, for a representative whose
+                                      ligand contains an S(=O)(=O) group (see
+                                      _filterSulfonylOverfit) - its RSCC with
+                                      its sulfonyl S atom(s) and their
+                                      directly bonded heavy atoms excluded
           cluster_status           : 'accepted', 'failed_count_cutoff',
                                       'failed_rscc_cutoff',
                                       'failed_halogen_rscc_floor',
+                                      'failed_sulfonyl_rscc_floor',
                                       'lost_per_placer_file_dedup', or
                                       'failed_clash_filter (vs <placer_file>)'
                                       - why the representative (and therefore
@@ -559,6 +710,7 @@ class Filter():
         `halogen_rscc_without_halogen` is self.halogen_rscc_without_halogen
         (cluster_id -> halogen-less RSCC, only for halogen-containing reps
         that were actually checked by _filterHalogenOverfit).
+        `sulfonyl_rscc_without_sulfonyl` is the same for _filterSulfonylOverfit.
         """
         cluster_of = {}
         for cluster_id, members in clusters.items():
@@ -567,7 +719,8 @@ class Filter():
 
         with open(path, 'w+') as f:
             f.write('placer_file,index,mse,cluster,cluster_rep_placer_file,'
-                    'cluster_rep_index,cluster_rscc,halogen_rscc_without_halogen,cluster_status')
+                    'cluster_rep_index,cluster_rscc,halogen_rscc_without_halogen,'
+                    'sulfonyl_rscc_without_sulfonyl,cluster_status')
             f.write('\n')
             for placer_file, score_list in scores.items():
                 for index, mse in enumerate(score_list):
@@ -577,16 +730,18 @@ class Filter():
                         rep_index = ''
                         rscc = ''
                         halogen_rscc = ''
+                        sulfonyl_rscc = ''
                         status = 'not_clustered'
                     else:
                         rep_placer_file = cluster_reps[cluster_id][1]
                         rep_index = cluster_reps[cluster_id][2]
                         rscc = cluster_rsccs[cluster_id]
                         halogen_rscc = halogen_rscc_without_halogen.get(cluster_id, '')
+                        sulfonyl_rscc = sulfonyl_rscc_without_sulfonyl.get(cluster_id, '')
                         status = cluster_status[cluster_id]
 
                     f.write(f'{placer_file},{index},{mse},{cluster_id},{rep_placer_file},'
-                            f'{rep_index},{rscc},{halogen_rscc},{status}')
+                            f'{rep_index},{rscc},{halogen_rscc},{sulfonyl_rscc},{status}')
                     f.write('\n')
 
     def _rsccForEventMap(self, ligand, ligand_coor, event_map_name):
@@ -722,6 +877,67 @@ class Filter():
 
             if rscc_without_halogen < self.halogen_rscc_floor:
                 self.halogen_rejected_ids.add(cluster_id)
+            else:
+                kept_cluster_reps[cluster_id] = rep
+
+        self.cluster_reps = kept_cluster_reps
+
+    def _filterSulfonylOverfit(self):
+        """
+        Same as _filterHalogenOverfit, for an S(=O)(=O) group: the S and its
+        bonded atoms give a strong, localized density signal that can prop up a
+        cluster rep's full-ligand RSCC when the rest of the ligand fits
+        poorly (sulfonyl-containing fragments were overrepresented among
+        false positives in the pxr_unknown manual review).
+
+        For every current cluster rep whose ligand contains the atoms named
+        in self.sulfonyl_atom_names (from the ligand's restraint dictionary -
+        see sulfonyl_atom_names), recomputes RSCC with those atoms excluded,
+        against the same event map as self.cluster_rsccs[cluster_id], and
+        rejects the rep if it falls below self.sulfonyl_rscc_floor. Each
+        filter excludes only its own atoms, so a ligand with both a Br/I and
+        an S(=O)(=O) group is checked by both independently.
+
+        Records:
+        self.sulfonyl_rejected_ids           : set of cluster_ids dropped by this filter
+        self.sulfonyl_rscc_without_sulfonyl  : cluster_id -> the sulfonyl-less RSCC,
+                                        for every checked rep (kept or rejected)
+        """
+        self.sulfonyl_rejected_ids = set()
+        self.sulfonyl_rscc_without_sulfonyl = {}
+        if not self.ligand_cifs:
+            print('no --ligand_cif given: sulfonyl rscc filtering skipped')
+            return
+        print(f'sulfonyl atoms (from {len(self.ligand_cifs)} ligand cif(s)): '
+              f'{sorted(self.sulfonyl_atom_names) or "none"}')
+        if not self.sulfonyl_atom_names:
+            return
+
+        kept_cluster_reps = {}
+        for cluster_id, rep in self.cluster_reps.items():
+            placer_file = rep[1]
+            ligand_coor = rep[3]
+
+            # Flatten before masking - see _filterHalogenOverfit.
+            ligand = self.base_binding_sites[placer_file].extract('resname LIG')
+            flat_ligand = ligand.get_selected_structure(None)
+
+            names = np.array([n.strip() for n in flat_ligand.name])
+            sulfonyl_mask = np.isin(names, list(self.sulfonyl_atom_names))
+            if sulfonyl_mask.sum() != len(self.sulfonyl_atom_names):
+                missing = sorted(self.sulfonyl_atom_names - set(names[sulfonyl_mask]))
+                raise ValueError(f'{placer_file}: ligand is missing sulfonyl atom(s) {missing} '
+                                 f'named in --ligand_cif (or has duplicate names)')
+
+            sub_ligand = flat_ligand.get_selected_structure(~sulfonyl_mask)
+            sub_ligand_coor = ligand_coor[~sulfonyl_mask]
+
+            event_map_name = self.cluster_best_event_map[cluster_id]
+            rscc_without_sulfonyl = self._rsccForEventMap(sub_ligand, sub_ligand_coor, event_map_name)
+            self.sulfonyl_rscc_without_sulfonyl[cluster_id] = rscc_without_sulfonyl
+
+            if rscc_without_sulfonyl < self.sulfonyl_rscc_floor:
+                self.sulfonyl_rejected_ids.add(cluster_id)
             else:
                 kept_cluster_reps[cluster_id] = rep
 
@@ -1223,7 +1439,7 @@ def main():
                      args.resolution, args.filter_proportion, args.min_cluster_proportion,
                      args.clash_vdw_scale, args.rscc_cutoff,
                      args.clustering_mode, args.clustering_cutoff,
-                     args.halogen_rscc_floor)
+                     args.halogen_rscc_floor, args.ligand_cif, args.sulfonyl_rscc_floor)
     filter.run()
 
 

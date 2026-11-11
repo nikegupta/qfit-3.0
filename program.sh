@@ -6,7 +6,7 @@
 #
 # Runs, in order:
 #   0a. convert_ligs                     -> LIG_PDB_DIR/<ligand_name>*/<ligand_name>*.mol2
-#   0b. calc_apo_rscc                    -> <dataset>/<dataset>-aligned-structure_rscc.csv
+#   0b. calc_apo_rscc (of INPUT_PDB_PATTERN) -> <dataset>/<dataset>-aligned-structure_rscc.csv
 #   0c. calc_ref_set_rscc (only with -c) -> REF_SET/<dataset>/<REF_SET_PDB_PATTERN%.pdb>_rscc.csv
 #   0d. ref_set_despot (only with -c and <despot_run_name>): symmetry_expand + mol2 conversion +
 #       DESPOT score_complex.py on the reference structure
@@ -110,6 +110,12 @@
 # Dataset scoping: by default every stage runs over every dataset in DATASETS_FILE
 # (datasets.txt). Pass --dataset <id[,id...]> to restrict the whole invocation to just those
 # datasets. Every graphing step is skipped entirely when --dataset is given.
+#
+# Input structure: each dataset's starting (apo) model is DATASETS_DIR/<dataset>/<INPUT_PDB_PATTERN>,
+# with {dataset} replaced by the dataset id (set in the user-specified configuration below). Used by
+# calc_apo_rscc (0b), rsr_backbone (3b), build_final (6a) and despot (8a). calc_apo_rscc's output
+# keeps the fixed name <dataset>-aligned-structure_rscc.csv whatever the pattern, since
+# rscc_common.py reads that name.
 
 set -uo pipefail
 
@@ -126,6 +132,7 @@ Usage: $0 <run_name> [placer_run_name [filter_run_name [placer2_run_name [filter
            [--f2_rscc_cutoff <float>] [--f2_clustering_mode <all-atom|centroid>]
            [--f2_clustering_cutoff <float>] [--f1_clash_vdw_scale <float>] [--f2_clash_vdw_scale <float>]
            [--f1_halogen_rscc_floor <float>] [--f2_halogen_rscc_floor <float>]
+           [--f1_sulfonyl_rscc_floor <float>] [--f2_sulfonyl_rscc_floor <float>]
            [--despot_threshold <float>]
            [--despot_rscc_threshold <float>] [--despot_rscc_weight <float>]
            [--despot_pareto_margin_std <float>]
@@ -205,7 +212,7 @@ Options:
   --rsr_map_weight <float>         Real-space refinement map-vs-geometry weight. PLACER, Filter,
                                     PLACER2, Build final, Rotamer_optimize. Default: 50.0.
   --f1_filter_proportion <float>       Filter: proportion of conformers kept. Default: 1.
-  --f1_min_cluster_proportion <float>  Filter: min cluster-size proportion to keep. Default: 0.1.
+  --f1_min_cluster_proportion <float>  Filter: min cluster-size proportion to keep. Default: 0.01.
   --f1_rscc_cutoff <float>             Filter: minimum RSCC to keep a cluster rep. Default: 0.6.
   --f1_clustering_mode <all-atom|centroid>  Filter: clustering distance metric. Default: centroid.
   --f1_clustering_cutoff <float>       Filter: clustering distance cutoff. Default: 2.0.
@@ -214,18 +221,22 @@ Options:
                                         retain once the halogen is excluded (same event map).
                                         Below this, the rep is rejected as halogen-overfit.
                                         Default: 0.3.
+  --f1_sulfonyl_rscc_floor <float>     Filter: same as --f1_halogen_rscc_floor, for an
+                                        S(=O)(=O) group's S and every heavy atom bonded to it
+                                        (named from the ligand's cif). Default: 0.3.
                                     Default: 0.75.
   --rsr_backbone_cutoff <float>    Filter: distance from LIG used to pick residues to
                                     real-space refine. Default: 10.0.
   --rsr_moved_threshold <float>    Real-space refinement: minimum displacement to log a residue
                                     as "moved". Filter, Build final, Rotamer_optimize. Default: 0.01.
   --f2_filter_proportion <float>       Filter2: proportion of conformers kept. Default: 1.
-  --f2_min_cluster_proportion <float>  Filter2: min cluster-size proportion to keep. Default: 0.1.
+  --f2_min_cluster_proportion <float>  Filter2: min cluster-size proportion to keep. Default: 0.01.
   --f2_rscc_cutoff <float>             Filter2: minimum RSCC to keep a cluster rep. Default: 0.6.
   --f2_clustering_mode <all-atom|centroid>  Filter2: clustering distance metric. Default: centroid.
   --f2_clustering_cutoff <float>       Filter2: clustering distance cutoff. Default: 2.0.
   --f2_clash_vdw_scale <float>         Filter2: VDW-radius scale for cluster-rep clash detection.
   --f2_halogen_rscc_floor <float>      Filter2: same as --f1_halogen_rscc_floor. Default: 0.3.
+  --f2_sulfonyl_rscc_floor <float>     Filter2: same as --f1_sulfonyl_rscc_floor. Default: 0.3.
                                     Default: 0.75.
   --clash_vdw_scale <float>        Sidechain clash VDW-radius scale, shared by Build final and
                                     Rotamer_optimize. Default: 0.75.
@@ -300,6 +311,10 @@ ANALYSIS_SCRIPTS_DIR="${BASE_DIR}/qfit-3.0/src/analysis_scripts"
 LIG_SCRIPTS_DIR="${BASE_DIR}/qfit-3.0/src/lig_scripts"
 GRAPHS_DIR="${BASE_DIR}/graphs"
 
+# Each dataset's input (apo) structure, DATASETS_DIR/<dataset>/<INPUT_PDB_PATTERN> with {dataset}
+# replaced by the dataset id (e.g. "{dataset}-aligned-structure.pdb" for program_rotamer's datasets).
+INPUT_PDB_PATTERN="{dataset}-aligned-structure.pdb"
+
 # Only used when -c is given: reference_set/<dataset>/ subfolders (one per
 # datasets.txt entry) holding a reference structure to compare RSCC against.
 REF_SET="${BASE_DIR}/reference_set"
@@ -364,6 +379,10 @@ for f in "$DATASETS_FILE" "$CSV_FILE" "$RSR_SCRIPT_LIGAND" "$RSR_SCRIPT_PROTEIN"
         exit 1
     fi
 done
+if [[ "$INPUT_PDB_PATTERN" != *"{dataset}"* ]]; then
+    echo "Error: INPUT_PDB_PATTERN '${INPUT_PDB_PATTERN}' must contain {dataset}." >&2
+    exit 1
+fi
 for d in "$DATASETS_DIR" "$LIG_PDB_DIR"; do
     if [ ! -d "$d" ]; then
         echo "Error: required directory not found: ${d}" >&2
@@ -436,6 +455,12 @@ f1_clash_vdw_scale=""
 # strong signal propping up an otherwise poorly-fit ligand pose). Left empty by default so
 # filter.py's own argparse default applies (halogen_rscc_floor=0.3).
 f1_halogen_rscc_floor=""
+# Sulfonyl RSCC filtering (qfit.command_line.filter) - same as the halogen floor, for an
+# S(=O)(=O) group: the S and every heavy atom bonded to it (named from the ligand's restraint cif, passed
+# via --ligand_cif from fit_ligand_manifest.csv) are excluded and the RSCC recomputed against
+# the same event map; below this, the rep is rejected. Left empty by default so filter.py's
+# own argparse default applies (sulfonyl_rscc_floor=0.3).
+f1_sulfonyl_rscc_floor=""
 
 # filter tunables (stage 5a, filter2_run_name) - same underlying `filter`
 # script as f1_*, set independently.
@@ -446,6 +471,7 @@ f2_clustering_mode=""
 f2_clustering_cutoff=""
 f2_clash_vdw_scale=""
 f2_halogen_rscc_floor=""
+f2_sulfonyl_rscc_floor=""
 
 # Sidechain-sidechain clash resolution tunables, shared identically by build_final_model.py
 # (stage 6a) and rotamer_optimize.py (stage 7a) - both now use the same
@@ -632,12 +658,20 @@ while [[ $# -gt 0 ]]; do
             f1_halogen_rscc_floor="$2"
             shift 2
             ;;
+        --f1_sulfonyl_rscc_floor)
+            f1_sulfonyl_rscc_floor="$2"
+            shift 2
+            ;;
         --f2_clash_vdw_scale)
             f2_clash_vdw_scale="$2"
             shift 2
             ;;
         --f2_halogen_rscc_floor)
             f2_halogen_rscc_floor="$2"
+            shift 2
+            ;;
+        --f2_sulfonyl_rscc_floor)
+            f2_sulfonyl_rscc_floor="$2"
             shift 2
             ;;
         --clash_vdw_scale)
@@ -826,21 +860,23 @@ print_run_parameters() {
     echo
     echo "-- Filter --"
     printf '  %-38s %s\n' "--f1_filter_proportion" "${f1_filter_proportion:-<default: 1>}"
-    printf '  %-38s %s\n' "--f1_min_cluster_proportion" "${f1_min_cluster_proportion:-<default: 0.1>}"
+    printf '  %-38s %s\n' "--f1_min_cluster_proportion" "${f1_min_cluster_proportion:-<default: 0.01>}"
     printf '  %-38s %s\n' "--f1_rscc_cutoff" "${f1_rscc_cutoff:-<default: 0.6>}"
     printf '  %-38s %s\n' "--f1_clustering_mode" "${f1_clustering_mode:-<default: centroid>}"
     printf '  %-38s %s\n' "--f1_clustering_cutoff" "${f1_clustering_cutoff:-<default: 2.0>}"
     printf '  %-38s %s\n' "--f1_clash_vdw_scale" "${f1_clash_vdw_scale:-<default: 0.75>}"
     printf '  %-38s %s\n' "--f1_halogen_rscc_floor" "${f1_halogen_rscc_floor:-<default: 0.3>}"
+    printf '  %-38s %s\n' "--f1_sulfonyl_rscc_floor" "${f1_sulfonyl_rscc_floor:-<default: 0.3>}"
     echo
     echo "-- Filter2 --"
     printf '  %-38s %s\n' "--f2_filter_proportion" "${f2_filter_proportion:-<default: 1>}"
-    printf '  %-38s %s\n' "--f2_min_cluster_proportion" "${f2_min_cluster_proportion:-<default: 0.1>}"
+    printf '  %-38s %s\n' "--f2_min_cluster_proportion" "${f2_min_cluster_proportion:-<default: 0.01>}"
     printf '  %-38s %s\n' "--f2_rscc_cutoff" "${f2_rscc_cutoff:-<default: 0.6>}"
     printf '  %-38s %s\n' "--f2_clustering_mode" "${f2_clustering_mode:-<default: centroid>}"
     printf '  %-38s %s\n' "--f2_clustering_cutoff" "${f2_clustering_cutoff:-<default: 2.0>}"
     printf '  %-38s %s\n' "--f2_clash_vdw_scale" "${f2_clash_vdw_scale:-<default: 0.75>}"
     printf '  %-38s %s\n' "--f2_halogen_rscc_floor" "${f2_halogen_rscc_floor:-<default: 0.3>}"
+    printf '  %-38s %s\n' "--f2_sulfonyl_rscc_floor" "${f2_sulfonyl_rscc_floor:-<default: 0.3>}"
     echo
     echo "-- Build final / Rotamer_optimize sidechain clash resolution --"
     printf '  %-38s %s\n' "--clash_vdw_scale" "${clash_vdw_scale:-<default: 0.75>}"
@@ -925,14 +961,23 @@ NUM_GPUS=${#GPU_IDS_ARR[@]}
 # Everything below this point (dataset names, tunables, consolidated paths)
 # needs to be visible inside the per-dataset *_process_dataset functions even
 # when GNU parallel forks them into new subshells, so it all gets exported.
+# gpu_ids itself (plain comma-separated string, unlike GPU_IDS_ARR - a bash
+# array can't cross the fork into parallel's subshell) is exported so
+# placer_process_dataset/placer2_process_dataset can each re-derive their own
+# GPU_IDS_ARR and index it by GNU parallel's own job-slot number ({%}) rather
+# than a GPU id precomputed from a dataset's static position in the list -
+# see those functions for why that distinction matters.
+export gpu_ids
 export run_name placer_run_name filter_run_name placer2_run_name filter2_run_name final_run_name rotamer_run_name despot_run_name
 export num_placer_confs num_placer2_confs compare_ref_set overwrite replot
 export z_threshold fit_ligand_blob_contour fit_ligand_min_blob_volume fit_ligand_merge_distance \
        fit_ligand_outer_mask fit_ligand_symmetry_mask fit_ligand_symmetry_tolerance fit_ligand_contact_cutoff
 export f1_filter_proportion f1_min_cluster_proportion f1_rscc_cutoff \
-       f1_clustering_mode f1_clustering_cutoff f1_clash_vdw_scale f1_halogen_rscc_floor
+       f1_clustering_mode f1_clustering_cutoff f1_clash_vdw_scale f1_halogen_rscc_floor \
+       f1_sulfonyl_rscc_floor
 export f2_filter_proportion f2_min_cluster_proportion f2_rscc_cutoff \
-       f2_clustering_mode f2_clustering_cutoff f2_clash_vdw_scale f2_halogen_rscc_floor
+       f2_clustering_mode f2_clustering_cutoff f2_clash_vdw_scale f2_halogen_rscc_floor \
+       f2_sulfonyl_rscc_floor
 export clash_vdw_scale hbond_clash_vdw_scale max_clash_group_size \
        max_clash_group_expansions clash_domain_top_k clash_solve_node_budget \
        ligand_clash_prefilter_margin
@@ -961,7 +1006,7 @@ export PLOT_RESIDUES_VS_REF_DESPOT_PY
 export CHECK_EXCESS_SYMMETRY_MATES_PY CHECK_DESPOT_SYMMETRY_MATES_PY
 export PLOT_LIGAND_CLASH_FILTERED_PY
 export PDB_TO_MOL2_SH PROTEIN_TO_MOL2_SH DESPOT_SCRIPT DESPOT_DATABASE
-export REF_SET REF_SET_PDB_PATTERN
+export REF_SET REF_SET_PDB_PATTERN INPUT_PDB_PATTERN
 export CONDA_SH CONDA_ENV_QFIT CONDA_ENV_RSR CONDA_ENV_PLACER CONDA_ENV_EVAL CONDA_ENV_DESPOT
 export RUN_PLACER_PY
 
@@ -1404,7 +1449,7 @@ do_convert_ligs() {
 # Stage 0b: calc_apo_rscc
 ######################################################################
 # Computes the per-residue RSCC of each dataset's baseline
-# {dataset}-aligned-structure.pdb (no PLACER/RSR involved) so later analysis
+# INPUT_PDB_PATTERN structure (no PLACER/RSR involved) so later analysis
 # scripts have an apo baseline to compare backbone/final refined RSCC
 # against. This is dataset-scoped, not run-name-scoped, so it runs once per
 # dataset regardless of run_name and is skipped per-dataset whenever its
@@ -1417,7 +1462,7 @@ calc_apo_rscc_process_dataset() {
     local dataset=$1
     local dataset_dir="${DATASETS_DIR}/${dataset}"
 
-    local structure="${dataset_dir}/${dataset}-aligned-structure.pdb"
+    local structure="${dataset_dir}/${INPUT_PDB_PATTERN//\{dataset\}/${dataset}}"
     local output_csv="${dataset_dir}/${dataset}-aligned-structure_rscc.csv"
 
     if [ -f "$output_csv" ]; then
@@ -1872,11 +1917,23 @@ do_plot_fit_ligand_counts() {
 
 placer_process_dataset() {
     local dataset=$1
-    local gpu_id=$2
+    # $2 is GNU parallel's own job-slot number ({%}, 1..NUM_GPUS) - the slot
+    # actually running this job right now, not this dataset's static position
+    # in the dataset list. A slot number is never shared by two concurrently
+    # running jobs (parallel enforces that itself to honor -j), so deriving
+    # the GPU from it - instead of from precomputed per-dataset indices that
+    # are blind to how long any other dataset's job actually runs - guarantees
+    # two simultaneously running datasets never land on the same GPU, however
+    # unevenly sized the datasets are. GPU_IDS_ARR itself can't cross the fork
+    # into this subshell (bash arrays aren't exportable), so it's rebuilt here
+    # from the exported plain gpu_ids string.
+    local slot=$2
+    IFS=',' read -ra _gpu_ids_arr <<< "$gpu_ids"
+    local gpu_id=${_gpu_ids_arr[$(( (slot - 1) % ${#_gpu_ids_arr[@]} ))]}
 
     export CUDA_VISIBLE_DEVICES=$gpu_id
 
-    echo "========= Dataset: ${dataset} (GPU ${gpu_id}) ========="
+    echo "========= Dataset: ${dataset} (slot ${slot}, GPU ${gpu_id}) ========="
 
     local dataset_dir="${DATASETS_DIR}/${dataset}"
     local run_dir="${dataset_dir}/${run_name}"
@@ -1940,12 +1997,10 @@ do_placer() {
     echo "Starting run on GPU(s): ${GPU_IDS_ARR[*]}"
     local start_time=$(date +%s)
 
-    local idx=0
-    for dataset in "${DATASETS[@]}"; do
-        local gpu_id=${GPU_IDS_ARR[$((idx % NUM_GPUS))]}
-        echo "${dataset} ${gpu_id}"
-        idx=$((idx + 1))
-    done | parallel -j "$NUM_GPUS" --line-buffer --colsep ' ' placer_process_dataset {1} {2}
+    # {%} is GNU parallel's own job-slot number (1..NUM_GPUS), not a
+    # precomputed per-dataset value - see placer_process_dataset for why that
+    # distinction is what actually prevents two concurrent jobs sharing a GPU.
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_GPUS" --line-buffer placer_process_dataset {1} {%}
 
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -2124,6 +2179,24 @@ do_placer_sampling_round1() {
 # Stage 3a: filter
 ######################################################################
 
+# manifest_ligand_cifs <fit_ligand_manifest.csv>: prints (one per line, deduplicated) the
+# restraint cif next to every ligand pdb that fit_ligand used for this dataset/run - the same
+# ${ligand_file%.pdb}.cif mapping filter's cif_restraints_file annotation uses below. Only
+# cifs that exist are printed. Feeds filter's --ligand_cif (sulfonyl RSCC filtering).
+manifest_ligand_cifs() {
+    local manifest_file=$1
+    [ -f "$manifest_file" ] || return 0
+    local csv_dataset ligand_name ligand_file rest
+    while IFS=, read -r csv_dataset ligand_name ligand_file rest; do
+        ligand_file="${ligand_file//$'\r'/}"
+        ligand_file="$(echo -n "$ligand_file" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
+        [ -z "$ligand_file" ] && continue
+        local cif_path="${ligand_file%.pdb}.cif"
+        [ -f "$cif_path" ] && echo "$cif_path"
+    done < <(tail -n +2 "$manifest_file") | sort -u
+}
+export -f manifest_ligand_cifs
+
 filter_process_dataset() {
     local dataset=$1
     local dataset_dir="${DATASETS_DIR}/${dataset}"
@@ -2155,6 +2228,15 @@ filter_process_dataset() {
     [ -n "$f1_clustering_cutoff" ] && f1_extra_args+=(--clustering_cutoff "$f1_clustering_cutoff")
     [ -n "$f1_clash_vdw_scale" ] && f1_extra_args+=(--clash_vdw_scale "$f1_clash_vdw_scale")
     [ -n "$f1_halogen_rscc_floor" ] && f1_extra_args+=(--halogen_rscc_floor "$f1_halogen_rscc_floor")
+    [ -n "$f1_sulfonyl_rscc_floor" ] && f1_extra_args+=(--sulfonyl_rscc_floor "$f1_sulfonyl_rscc_floor")
+
+    local lig_cifs=()
+    mapfile -t lig_cifs < <(manifest_ligand_cifs "${dataset_dir}/${run_name}/fit_ligand_manifest.csv")
+    if [ ${#lig_cifs[@]} -gt 0 ]; then
+        f1_extra_args+=(--ligand_cif "${lig_cifs[@]}")
+    else
+        log_issue "${dataset}" "Warning [${dataset}]: no ligand cif found via fit_ligand_manifest.csv, filter's sulfonyl rscc filtering skipped."
+    fi
 
     filter ${dataset_dir} \
         "${dataset_dir}/${run_name}/${placer_run_name}/*_refined.pdb" \
@@ -2342,7 +2424,7 @@ rsr_backbone_process_dataset() {
     local cif_list
     cif_list=$(IFS=,; echo "${cif_paths[*]}")
 
-    local apo_pdb="${dataset_dir}/${dataset}-aligned-structure.pdb"
+    local apo_pdb="${dataset_dir}/${INPUT_PDB_PATTERN//\{dataset\}/${dataset}}"
     local multimodel_pdb="${run_dir}/cluster_rep_models.pdb"
     local output_pdb="${run_dir}/${dataset}_backbone_refined.pdb"
 
@@ -2525,11 +2607,17 @@ do_filter1_ref_comparison() {
 
 placer2_process_dataset() {
     local dataset=$1
-    local gpu_id=$2
+    # $2 is GNU parallel's own job-slot number ({%}) - see placer_process_dataset's
+    # own comment for why deriving the GPU from this (rather than a per-dataset
+    # value precomputed from static list position) is what actually prevents two
+    # concurrently running datasets from landing on the same GPU.
+    local slot=$2
+    IFS=',' read -ra _gpu_ids_arr <<< "$gpu_ids"
+    local gpu_id=${_gpu_ids_arr[$(( (slot - 1) % ${#_gpu_ids_arr[@]} ))]}
 
     export CUDA_VISIBLE_DEVICES=$gpu_id
 
-    echo "========= Dataset: ${dataset} (GPU ${gpu_id}) ========="
+    echo "========= Dataset: ${dataset} (slot ${slot}, GPU ${gpu_id}) ========="
 
     local dataset_dir="${DATASETS_DIR}/${dataset}"
     local filter_dir="${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}"
@@ -2648,12 +2736,10 @@ do_placer2() {
     echo "Starting run on GPU(s): ${GPU_IDS_ARR[*]}"
     local start_time=$(date +%s)
 
-    local idx=0
-    for dataset in "${DATASETS[@]}"; do
-        local gpu_id=${GPU_IDS_ARR[$((idx % NUM_GPUS))]}
-        echo "${dataset} ${gpu_id}"
-        idx=$((idx + 1))
-    done | parallel -j "$NUM_GPUS" --line-buffer --colsep ' ' placer2_process_dataset {1} {2}
+    # {%} is GNU parallel's own job-slot number - see placer_process_dataset's
+    # comment for why this (not a precomputed per-dataset value) is what
+    # actually prevents two concurrent jobs sharing a GPU.
+    printf '%s\n' "${DATASETS[@]}" | parallel -j "$NUM_GPUS" --line-buffer placer2_process_dataset {1} {%}
 
     echo "All jobs completed"
     print_elapsed "$start_time"
@@ -2928,6 +3014,15 @@ filter2_process_dataset() {
     [ -n "$f2_clustering_cutoff" ] && f2_extra_args+=(--clustering_cutoff "$f2_clustering_cutoff")
     [ -n "$f2_clash_vdw_scale" ] && f2_extra_args+=(--clash_vdw_scale "$f2_clash_vdw_scale")
     [ -n "$f2_halogen_rscc_floor" ] && f2_extra_args+=(--halogen_rscc_floor "$f2_halogen_rscc_floor")
+    [ -n "$f2_sulfonyl_rscc_floor" ] && f2_extra_args+=(--sulfonyl_rscc_floor "$f2_sulfonyl_rscc_floor")
+
+    local lig_cifs=()
+    mapfile -t lig_cifs < <(manifest_ligand_cifs "${dataset_dir}/${run_name}/fit_ligand_manifest.csv")
+    if [ ${#lig_cifs[@]} -gt 0 ]; then
+        f2_extra_args+=(--ligand_cif "${lig_cifs[@]}")
+    else
+        log_issue "${dataset}" "Warning [${dataset}]: no ligand cif found via fit_ligand_manifest.csv, filter2's sulfonyl rscc filtering skipped."
+    fi
 
     filter "${dataset_dir}" \
         "${dataset_dir}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/*_refined.pdb" \
@@ -3107,7 +3202,7 @@ build_final_process_dataset() {
 
     echo "Processing ${dataset}: fragment_id=${fragment_id}, resolution=${resolution}"
 
-    local apo_structure="${dataset_dir}/${dataset}-aligned-structure.pdb"
+    local apo_structure="${dataset_dir}/${INPUT_PDB_PATTERN//\{dataset\}/${dataset}}"
 
     if [ ! -f "$apo_structure" ]; then
         log_issue "${dataset}" "ERROR [${dataset}]: apo structure not found: ${apo_structure}"
@@ -3751,7 +3846,7 @@ despot_process_dataset() {
     local final_dir="${filter2_dir}/${final_run_name}"
     local rotamer_dir="${final_dir}/${rotamer_run_name}"
     local final_model="${rotamer_dir}/optimized.pdb"
-    local apo_structure="${dataset_dir}/${dataset}-aligned-structure.pdb"
+    local apo_structure="${dataset_dir}/${INPUT_PDB_PATTERN//\{dataset\}/${dataset}}"
     local despot_dir="${rotamer_dir}/${despot_run_name}"
     local despot_csv_check="${despot_dir}/${dataset}_DESPOT.csv"
     local conformer_map_check="${despot_dir}/conformer_map.csv"
