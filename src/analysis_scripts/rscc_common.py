@@ -304,13 +304,34 @@ def split_pdb_models(pdb_path):
     return [parse_lines(lines) for lines in blocks]
 
 
+def _element_of(name):
+    """Extracts the element symbol from a PDB atom name (e.g. 'C6' -> 'C')."""
+    m = re.match(r'^[A-Za-z]+', name)
+    return m.group(0) if m else name
+
+
+def _centroid_excluding_h(atom_list):
+    """Mean coordinate of atom_list, excluding hydrogens (element from _element_of). Reference-
+    set ligands are typically modeled with explicit hydrogens; PLACER-sampled/pipeline ligand
+    poses never carry any. Averaging ref coordinates over all atoms while the pipeline side's
+    centroid is necessarily heavy-atom-only skews the reference centroid away from the
+    pipeline's, which can push a genuinely well-matched pair's centroid distance past
+    args.centroid_cutoff (or make a worse-fitting conformer look nearer than a better one) -
+    every ligand centroid used for centroid-distance matching should be heavy-atom-only on both
+    sides so the comparison is apples-to-apples."""
+    heavy = [a for a in atom_list if _element_of(a['name']).upper() != 'H']
+    return np.array([a['coord'] for a in heavy]).mean(axis=0)
+
+
 def lig_conformations(atoms):
     """Groups an atom list's LIG residues into {(chain_id, res_id, altloc):
     centroid}. A LIG residue with two or more distinct non-blank altlocs
     gets one entry per altloc (blank-altloc atoms are shared across all of
     them); otherwise it gets a single altloc='' entry. Mirrors qfit
     compare_lig_rscc's _find_lig_keys, but returns only the centroid since
-    no RSCC or RMSD is computed here."""
+    no RSCC or RMSD is computed here. Centroids are heavy-atom-only (see
+    _centroid_excluding_h) so they're directly comparable to the pipeline
+    side's necessarily hydrogen-free centroids."""
     lig_atoms = [a for a in atoms if a['res_name'] == 'LIG']
     if not lig_atoms:
         return {}
@@ -323,13 +344,11 @@ def lig_conformations(atoms):
     for (chain_id, res_id), res_atoms in by_residue.items():
         explicit_altlocs = sorted({a['altloc'] for a in res_atoms if a['altloc'] != ''})
         if not explicit_altlocs:
-            coords = np.array([a['coord'] for a in res_atoms])
-            conformations[(chain_id, res_id, '')] = coords.mean(axis=0)
+            conformations[(chain_id, res_id, '')] = _centroid_excluding_h(res_atoms)
         else:
             for altloc in explicit_altlocs:
                 alt_atoms = [a for a in res_atoms if a['altloc'] in (altloc, '')]
-                coords = np.array([a['coord'] for a in alt_atoms])
-                conformations[(chain_id, res_id, altloc)] = coords.mean(axis=0)
+                conformations[(chain_id, res_id, altloc)] = _centroid_excluding_h(alt_atoms)
     return conformations
 
 
@@ -366,9 +385,10 @@ def _group_lig_residues(atoms, chain_id=None, res_id=None):
 def lig_conformations_filtered(atoms, chain_id=None, res_id=None):
     """Like lig_conformations, but restricted to a given chain_id/res_id
     before grouping (used for sampled model files where the ligand's
-    chain/resi convention is known, e.g. PLACER's chain C res 1)."""
+    chain/resi convention is known, e.g. PLACER's chain C res 1). Centroids
+    are heavy-atom-only (see _centroid_excluding_h)."""
     return {
-        key: np.array([a['coord'] for a in res_atoms]).mean(axis=0)
+        key: _centroid_excluding_h(res_atoms)
         for key, res_atoms in _group_lig_residues(atoms, chain_id, res_id).items()
     }
 
@@ -382,12 +402,6 @@ def lig_atom_groups(atoms, chain_id=None, res_id=None):
         key: [{'name': a['name'], 'coord': a['coord']} for a in res_atoms]
         for key, res_atoms in _group_lig_residues(atoms, chain_id, res_id).items()
     }
-
-
-def _element_of(name):
-    """Extracts the element symbol from a PDB atom name (e.g. 'C6' -> 'C')."""
-    m = re.match(r'^[A-Za-z]+', name)
-    return m.group(0) if m else name
 
 
 def compute_rmsd_symmetric(model_atoms, ref_atoms):
@@ -660,8 +674,45 @@ def residue_label_from_key(chain_id, res_id, altloc):
     return label
 
 
+def _resolve_altloc_conflicts(candidates, ref_atom_groups, pipeline_atom_lists):
+    """Enforces a strict one-to-one pipeline-row-to-reference-ligand match: groups candidates
+    (each a dict with at least 'ref_key' and 'best_row', produced by the centroid-distance
+    search in _dataset_lig_vs_ref/_dataset_despot_vs_ref) by best_row, and for any best_row
+    centroid-claimed by more than one reference ligand (e.g. two altloc conformations of the
+    same site both nearest to the same single pipeline pose), keeps only the lowest full-atom
+    symmetric-RMSD candidate (compute_rmsd_symmetric, using ref_atom_groups[ref_key] and
+    pipeline_atom_lists[best_row]) as that row's canonical match. The losing candidate(s) are
+    NOT reassigned to a second-choice pipeline row - they are simply not matched (see the
+    'pipeline_match_claimed_by_lower_rmsd_altloc' unmatched reason the callers use).
+
+    Returns (winners, losers): winners has one (unmodified) candidate dict per best_row - either
+    the sole claimant of an uncontested row, or the RMSD winner of a conflict. losers has one
+    candidate dict per losing side of a conflict, each with an added 'conflict_rmsd' key (that
+    candidate's own RMSD to the pipeline pose it lost; None if compute_rmsd_symmetric found no
+    shared element type to score, treated as the worst possible match, not a tying 0)."""
+    groups = defaultdict(list)
+    for c in candidates:
+        groups[c['best_row']].append(c)
+
+    winners, losers = [], []
+    for best_row, group in groups.items():
+        if len(group) == 1:
+            winners.append(group[0])
+            continue
+        scored = [
+            (c, compute_rmsd_symmetric(pipeline_atom_lists[best_row], ref_atom_groups[c['ref_key']]))
+            for c in group
+        ]
+        scored.sort(key=lambda pair: (pair[1] is None, pair[1]))
+        winners.append(scored[0][0])
+        for c, rmsd in scored[1:]:
+            c['conflict_rmsd'] = rmsd
+            losers.append(c)
+    return winners, losers
+
+
 def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_override=None,
-                         rscc_column='rscc', symmetry=None):
+                         rscc_column='rscc', symmetry=None, altloc_aware=False):
     """For one dataset, matches every reference LIG conformation in
     ref_pdb_path(args, dataset) to the nearest cluster-rep ligand pose in
     run_dir/cluster_rep_models.pdb (by centroid distance, no RSCC
@@ -699,6 +750,18 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
     into matching). Only which pairs count as matched changes - the RSCC values themselves
     are read exactly as before.
 
+    altloc_aware: when True, enforces a strict one-to-one relationship between pipeline rows and
+    reference ligands (see _resolve_altloc_conflicts), instead of letting a single pipeline row
+    independently become more than one reference ligand's nearest match - the previous,
+    altloc-oblivious behavior, most visible when a reference ligand has multiple altloc
+    conformations whose centroids are both within args.centroid_cutoff of the same single
+    pipeline pose (both would otherwise count as "matched" to it). A reference ligand that loses
+    such a conflict (its claimed pipeline row's RMSD to it is worse than a competing reference
+    ligand's) is NOT reassigned to a second-choice row - it becomes unmatched with reason
+    'pipeline_match_claimed_by_lower_rmsd_altloc', and unmatched_ref_rows additionally carries a
+    'conflict_rmsd' key for those specific rows (see _resolve_altloc_conflicts). False (default)
+    preserves the exact original behavior for every existing caller.
+
     Returns (matched_ref_rscc, matched_pipeline_rscc, n_unmatched_ref,
     n_excess_pipeline, matched_rows, unmatched_ref_rows, excess_pipeline_rows).
 
@@ -720,10 +783,11 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
     cluster_csv_override, if given - doesn't exist, e.g. a failed/incomplete
     pipeline run for this dataset; every reference ligand with a known
     ref_rscc is counted unmatched this way rather than the whole dataset
-    being silently skipped), or 'no_pipeline_match_within_cutoff' (every
+    being silently skipped), 'no_pipeline_match_within_cutoff' (every
     eligible cluster-rep ligand was farther than args.centroid_cutoff, or
-    none were eligible at all); ref_rscc is the reference RSCC when known,
-    else None.
+    none were eligible at all), or - only possible when altloc_aware=True -
+    'pipeline_match_claimed_by_lower_rmsd_altloc' (see altloc_aware below);
+    ref_rscc is the reference RSCC when known, else None.
 
     excess_pipeline_rows has one dict per eligible cluster-rep ligand that
     never became any reference ligand's nearest match - {cluster_rep_index,
@@ -743,10 +807,12 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
               f'(ref_pdb={ref_pdb.exists()}, ref_rscc={ref_csv.exists()}); skipping.')
         return [], [], 0, 0, [], [], []
 
-    ref_ligs = lig_conformations(read_pdb_raw_atoms(ref_pdb))
+    ref_atoms = read_pdb_raw_atoms(ref_pdb)
+    ref_ligs = lig_conformations(ref_atoms)
     if not ref_ligs:
         print(f'  {dataset}: no LIG residue found in reference {ref_pdb}; skipping.')
         return [], [], 0, 0, [], [], []
+    ref_atom_groups = lig_atom_groups(ref_atoms)
     ref_rscc_df = read_calc_rscc_csv(ref_csv)
     ref_rscc = dict(zip(ref_rscc_df['residue'], ref_rscc_df['rscc']))
 
@@ -761,7 +827,7 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
               f'counting every reference ligand as unmatched.')
         n_models = 0
         pipeline_rscc_by_row, placer_file_by_row, index_by_row = [], [], []
-        pipeline_centroids, pipeline_chains = [], []
+        pipeline_centroids, pipeline_chains, pipeline_atom_lists = [], [], []
     else:
         cluster_df = pd.read_csv(rscc_csv_path)
         pipeline_rscc_by_row = list(cluster_df[rscc_column])
@@ -776,20 +842,26 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
 
         pipeline_centroids = []
         pipeline_chains = []
+        pipeline_atom_lists = []
         for i in range(n_models):
             if alive_rows is not None and (i + 1) not in alive_rows:
                 pipeline_centroids.append(None)
                 pipeline_chains.append(None)
+                pipeline_atom_lists.append(None)
                 continue
             lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
             pipeline_centroids.append(
-                np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
+                _centroid_excluding_h(lig_atoms) if lig_atoms else None
             )
             pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
+            pipeline_atom_lists.append(
+                [{'name': a['name'], 'coord': a['coord']} for a in lig_atoms] if lig_atoms else None
+            )
 
     used_rows = set()
     matched_ref, matched_pipeline, matched_rows = [], [], []
     unmatched_ref_rows = []
+    candidates = []
     for (chain_id, res_id, altloc), ref_centroid in ref_ligs.items():
         ref_label = residue_label_from_key(chain_id, res_id, altloc)
         ref_val = ref_rscc.get(ref_label)
@@ -819,11 +891,28 @@ def _dataset_lig_vs_ref(dataset, args, run_dir, alive_rows=None, cluster_csv_ove
             })
             continue
 
+        candidates.append({'ref_key': (chain_id, res_id, altloc), 'ref_val': ref_val, 'best_row': best_row})
+
+    if altloc_aware:
+        winners, losers = _resolve_altloc_conflicts(candidates, ref_atom_groups, pipeline_atom_lists)
+        for loser in losers:
+            chain_id, res_id, altloc = loser['ref_key']
+            unmatched_ref_rows.append({
+                'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+                'ref_rscc': loser['ref_val'], 'reason': 'pipeline_match_claimed_by_lower_rmsd_altloc',
+                'conflict_rmsd': loser.get('conflict_rmsd'),
+            })
+    else:
+        winners = candidates
+
+    for c in winners:
+        chain_id, res_id, altloc = c['ref_key']
+        best_row = c['best_row']
         pipeline_val = pipeline_rscc_by_row[best_row]
-        matched_ref.append(ref_val)
+        matched_ref.append(c['ref_val'])
         matched_pipeline.append(pipeline_val)
         matched_rows.append({
-            'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc, 'ref_rscc': ref_val,
+            'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc, 'ref_rscc': c['ref_val'],
             'cluster_rep_index': best_row + 1, 'pipeline_chain': pipeline_chains[best_row],
             'pipeline_rscc': pipeline_val,
         })
@@ -889,14 +978,22 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
     RSCC values are unaffected; only which pairs count as matched can change. A dataset
     missing from cell_lookup falls back to identity-frame-only matching for that dataset's
     _sa pass (same fallback centroid_rmsd_all.py uses).
+
+    Whenever cell_lookup is given, a THIRD pass is also written on top of the _sa one:
+    <out_name stem>_sa_altloc.png/.csv/_sa_altloc_unmatched_ref.csv/_sa_altloc_excess_pipeline.csv
+    - the same symmetry-aware matching basis as the _sa pass, but with _dataset_lig_vs_ref's
+    altloc_aware=True, so a pipeline ligand can only be one reference ligand's canonical match
+    (see _resolve_altloc_conflicts). Its unmatched_ref csv additionally carries a 'conflict_rmsd'
+    column (empty for every reason except 'pipeline_match_claimed_by_lower_rmsd_altloc').
     """
     out_stem = Path(out_name).stem
     out_suffix = Path(out_name).suffix
-    passes = [(None, out_name)]
+    passes = [(None, out_name, False)]
     if cell_lookup is not None:
-        passes.append((cell_lookup, f'{out_stem}_sa{out_suffix}'))
+        passes.append((cell_lookup, f'{out_stem}_sa{out_suffix}', False))
+        passes.append((cell_lookup, f'{out_stem}_sa_altloc{out_suffix}', True))
 
-    for lookup, this_out_name in passes:
+    for lookup, this_out_name, altloc_aware in passes:
         datasets = read_datasets(args.datasets_file)
         all_ref, all_pipeline, all_rows = [], [], []
         all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
@@ -920,7 +1017,7 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
              unmatched_ref_rows, excess_pipeline_rows) = _dataset_lig_vs_ref(
                 dataset, args, run_dir, alive_rows=alive_rows,
                 cluster_csv_override=cluster_csv_override, rscc_column=rscc_column,
-                symmetry=symmetry,
+                symmetry=symmetry, altloc_aware=altloc_aware,
             )
             all_ref.extend(ref_vals)
             all_pipeline.extend(pipeline_vals)
@@ -943,10 +1040,16 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
 
         graphs_dir = Path(args.graphs_dir)
         graphs_dir.mkdir(parents=True, exist_ok=True)
+        title_bits = []
+        if lookup is not None:
+            title_bits.append('Symmetry Aware')
+        if altloc_aware:
+            title_bits.append('Altloc Aware')
+        full_title = title if not title_bits else f"{title} ({', '.join(title_bits)})"
         plot_rscc_scatter(
             all_ref, all_pipeline,
             xlabel='Reference RSCC', ylabel='Pipeline RSCC',
-            title=title if lookup is None else f'{title} (Symmetry Aware)',
+            title=full_title,
             out_path=graphs_dir / this_out_name,
             extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
                         f'Excess pipeline LIGs: {total_excess}'),
@@ -961,9 +1064,13 @@ def plot_lig_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_for_d
 
         this_out_stem = Path(this_out_name).stem
         if all_unmatched_ref_rows:
-            unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
-                ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc', 'reason']
-            ]
+            unmatched_cols = ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_rscc', 'reason']
+            unmatched_df = pd.DataFrame(all_unmatched_ref_rows)
+            if altloc_aware:
+                unmatched_cols.append('conflict_rmsd')
+                if 'conflict_rmsd' not in unmatched_df.columns:
+                    unmatched_df['conflict_rmsd'] = None
+            unmatched_df = unmatched_df[unmatched_cols]
             write_plot_csv(graphs_dir, f'{this_out_stem}_unmatched_ref.png', unmatched_df)
 
         if all_excess_pipeline_rows:
@@ -1720,12 +1827,12 @@ def _ref_despot_conformations(dataset, args):
         raw_score = scores_by_label.get(label)
         if raw_score is None:
             continue
-        centroid = np.array([a['coord'] for a in atom_list]).mean(axis=0)
+        centroid = _centroid_excluding_h(atom_list)
         result[(chain_id, resi, altloc)] = (centroid, raw_score / n_heavy)
     return result
 
 
-def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=None):
+def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=None, altloc_aware=False):
     """For one dataset, matches every reference LIG conformation with a
     heavy-atom-normalized DESPOT score (_ref_despot_conformations) to the
     nearest cluster-rep ligand pose in run_dir/cluster_rep_models.pdb (by
@@ -1758,20 +1865,30 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=Non
     cluster_rep_models.pdb, or despot_filtered_scores.csv doesn't exist, e.g.
     a failed/incomplete despot run for this dataset; every reference ligand
     is counted unmatched this way rather than the whole dataset being
-    silently skipped), 'no_pipeline_match_within_cutoff', or
-    'no_pipeline_despot_score' (matched a cluster-rep pose, but that row has
-    no despot_filtered_scores.csv entry). excess_pipeline_rows has one dict
-    per eligible cluster-rep ligand that was never any reference ligand's
-    nearest match - {cluster_rep_index, pipeline_chain, placer_file, index} -
+    silently skipped), 'no_pipeline_match_within_cutoff', 'no_pipeline_despot_score' (matched a
+    cluster-rep pose, but that row has no despot_filtered_scores.csv entry), or - only possible
+    when altloc_aware=True - 'pipeline_match_claimed_by_lower_rmsd_altloc' (see altloc_aware
+    below). excess_pipeline_rows has one dict per eligible cluster-rep ligand that was never any
+    reference ligand's nearest match - {cluster_rep_index, pipeline_chain, placer_file, index} -
     placer_file/index are that row's own cluster_reps.csv columns.
 
     symmetry: optional CrystalSymmetry - same meaning as _dataset_lig_vs_ref's own symmetry
     argument (crystal-symmetry-aware centroid matching instead of identity-frame only).
+
+    altloc_aware: same meaning as _dataset_lig_vs_ref's own altloc_aware argument (see
+    _resolve_altloc_conflicts) - enforces a strict one-to-one relationship between pipeline rows
+    and reference ligands instead of letting a single pipeline row independently become more
+    than one reference ligand's nearest match. A reference ligand that loses such a conflict
+    becomes unmatched with reason 'pipeline_match_claimed_by_lower_rmsd_altloc', and
+    unmatched_ref_rows additionally carries a 'conflict_rmsd' key for those rows. False
+    (default) preserves the exact original behavior.
     """
     ref_conformations = _ref_despot_conformations(dataset, args)
     if not ref_conformations:
         print(f'  {dataset}: no reference DESPOT score(s) found; skipping.')
         return [], [], 0, 0, [], [], []
+
+    ref_atom_groups = lig_atom_groups(read_pdb_raw_atoms(ref_pdb_path(args, dataset)))
 
     cluster_csv = run_dir / 'cluster_reps.csv'
     cluster_pdb = run_dir / 'cluster_rep_models.pdb'
@@ -1789,7 +1906,7 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=Non
               f'as unmatched.')
         n_models = 0
         placer_file_by_row, index_by_row = [], []
-        pipeline_centroids, pipeline_chains = [], []
+        pipeline_centroids, pipeline_chains, pipeline_atom_lists = [], [], []
         pipeline_normalized_by_resi = {}
     else:
         pipeline_scores_df = read_despot_filtered_scores_csv(scores_csv)
@@ -1807,20 +1924,26 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=Non
 
         pipeline_centroids = []
         pipeline_chains = []
+        pipeline_atom_lists = []
         for i in range(n_models):
             if alive_rows is not None and (i + 1) not in alive_rows:
                 pipeline_centroids.append(None)
                 pipeline_chains.append(None)
+                pipeline_atom_lists.append(None)
                 continue
             lig_atoms = [a for a in model_blocks[i] if a['res_name'] == 'LIG']
             pipeline_centroids.append(
-                np.array([a['coord'] for a in lig_atoms]).mean(axis=0) if lig_atoms else None
+                _centroid_excluding_h(lig_atoms) if lig_atoms else None
             )
             pipeline_chains.append(lig_atoms[0]['chain_id'] if lig_atoms else None)
+            pipeline_atom_lists.append(
+                [{'name': a['name'], 'coord': a['coord']} for a in lig_atoms] if lig_atoms else None
+            )
 
     used_rows = set()
     matched_ref, matched_pipeline, matched_rows = [], [], []
     unmatched_ref_rows = []
+    candidates = []
     for (chain_id, res_id, altloc), (ref_centroid, ref_val) in ref_conformations.items():
         best_row, best_dist = None, float('inf')
         for i in range(n_models):
@@ -1841,19 +1964,37 @@ def _dataset_despot_vs_ref(dataset, args, run_dir, alive_rows=None, symmetry=Non
             })
             continue
 
+        candidates.append({'ref_key': (chain_id, res_id, altloc), 'ref_val': ref_val, 'best_row': best_row})
+
+    if altloc_aware:
+        winners, losers = _resolve_altloc_conflicts(candidates, ref_atom_groups, pipeline_atom_lists)
+        for loser in losers:
+            chain_id, res_id, altloc = loser['ref_key']
+            unmatched_ref_rows.append({
+                'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
+                'ref_despot_normalized': loser['ref_val'],
+                'reason': 'pipeline_match_claimed_by_lower_rmsd_altloc',
+                'conflict_rmsd': loser.get('conflict_rmsd'),
+            })
+    else:
+        winners = candidates
+
+    for c in winners:
+        chain_id, res_id, altloc = c['ref_key']
+        best_row = c['best_row']
         pipeline_val = pipeline_normalized_by_resi.get(best_row + 1)
         if pipeline_val is None or pd.isna(pipeline_val):
             unmatched_ref_rows.append({
                 'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
-                'ref_despot_normalized': ref_val, 'reason': 'no_pipeline_despot_score',
+                'ref_despot_normalized': c['ref_val'], 'reason': 'no_pipeline_despot_score',
             })
             continue
 
-        matched_ref.append(ref_val)
+        matched_ref.append(c['ref_val'])
         matched_pipeline.append(pipeline_val)
         matched_rows.append({
             'ref_chain': chain_id, 'ref_resi': res_id, 'ref_altloc': altloc,
-            'ref_despot_normalized': ref_val,
+            'ref_despot_normalized': c['ref_val'],
             'cluster_rep_index': best_row + 1, 'pipeline_chain': pipeline_chains[best_row],
             'pipeline_despot_normalized': pipeline_val,
         })
@@ -1909,14 +2050,22 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
     given, ALSO writes a crystal-symmetry-aware twin of every output (<out_name stem>_sa.png/
     .csv/_sa_unmatched_ref.csv/_sa_excess_pipeline.csv), matching via
     _dataset_despot_vs_ref's symmetry argument instead of plain identity-frame distance.
+
+    Whenever cell_lookup is given, a THIRD pass is also written on top of the _sa one - same
+    convention as plot_lig_vs_ref's own altloc-aware pass: <out_name stem>_sa_altloc.png/.csv/
+    _sa_altloc_unmatched_ref.csv/_sa_altloc_excess_pipeline.csv, with
+    _dataset_despot_vs_ref's altloc_aware=True so a pipeline ligand can only be one reference
+    ligand's canonical match. Its unmatched_ref csv additionally carries a 'conflict_rmsd'
+    column (empty for every reason except 'pipeline_match_claimed_by_lower_rmsd_altloc').
     """
     out_stem = Path(out_name).stem
     out_suffix = Path(out_name).suffix
-    passes = [(None, out_name)]
+    passes = [(None, out_name, False)]
     if cell_lookup is not None:
-        passes.append((cell_lookup, f'{out_stem}_sa{out_suffix}'))
+        passes.append((cell_lookup, f'{out_stem}_sa{out_suffix}', False))
+        passes.append((cell_lookup, f'{out_stem}_sa_altloc{out_suffix}', True))
 
-    for lookup, this_out_name in passes:
+    for lookup, this_out_name, altloc_aware in passes:
         datasets = read_datasets(args.datasets_file)
         all_ref, all_pipeline, all_rows = [], [], []
         all_unmatched_ref_rows, all_excess_pipeline_rows = [], []
@@ -1935,6 +2084,7 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
             (ref_vals, pipeline_vals, n_unmatched, n_excess, matched_rows,
              unmatched_ref_rows, excess_pipeline_rows) = _dataset_despot_vs_ref(
                 dataset, args, run_dir, alive_rows=alive_rows, symmetry=symmetry,
+                altloc_aware=altloc_aware,
             )
             all_ref.extend(ref_vals)
             all_pipeline.extend(pipeline_vals)
@@ -1960,9 +2110,14 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
 
         this_out_stem = Path(this_out_name).stem
         if all_unmatched_ref_rows:
-            unmatched_df = pd.DataFrame(all_unmatched_ref_rows)[
-                ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc', 'ref_despot_normalized', 'reason']
-            ]
+            unmatched_cols = ['dataset', 'ref_chain', 'ref_resi', 'ref_altloc',
+                               'ref_despot_normalized', 'reason']
+            unmatched_df = pd.DataFrame(all_unmatched_ref_rows)
+            if altloc_aware:
+                unmatched_cols.append('conflict_rmsd')
+                if 'conflict_rmsd' not in unmatched_df.columns:
+                    unmatched_df['conflict_rmsd'] = None
+            unmatched_df = unmatched_df[unmatched_cols]
             write_plot_csv(graphs_dir, f'{this_out_stem}_unmatched_ref.png', unmatched_df)
         if all_excess_pipeline_rows:
             excess_df = pd.DataFrame(all_excess_pipeline_rows)[
@@ -1974,11 +2129,17 @@ def plot_despot_vs_ref(args, run_dir_for_dataset, title, out_name, alive_rows_fo
             print(f'  No matched ligand(s) found for any dataset; skipping {this_out_name}.')
             continue
 
+        title_bits = []
+        if lookup is not None:
+            title_bits.append('Symmetry Aware')
+        if altloc_aware:
+            title_bits.append('Altloc Aware')
+        full_title = title if not title_bits else f"{title} ({', '.join(title_bits)})"
         plot_rscc_scatter(
             all_ref, all_pipeline,
             xlabel='Reference DESPOT Score (normalized)',
             ylabel='Pipeline DESPOT Score (normalized)',
-            title=title if lookup is None else f'{title} (Symmetry Aware)',
+            title=full_title,
             out_path=graphs_dir / this_out_name,
             extra_text=(f'Unmatched reference LIGs: {total_unmatched}\n'
                         f'Excess pipeline LIGs: {total_excess}'),

@@ -2592,6 +2592,7 @@ do_plot_residues_vs_ref_backbone() {
 filter1_ref_comparison_outputs_exist() {
     local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}"
     files_exist "${out_dir}/lig_vs_reference_rscc.png" \
+                "${out_dir}/lig_vs_reference_rscc_sa_altloc.png" \
                 "${out_dir}/backbone_refined_vs_reference_rscc.png" \
                 "${out_dir}/backbone_refined_vs_reference_rscc_restricted.png"
 }
@@ -3170,7 +3171,9 @@ do_plot_lig_vs_ref_filter2() {
 }
 
 filter2_ref_comparison_outputs_exist() {
-    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/lig_vs_reference_rscc.png"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}"
+    files_exist "${out_dir}/lig_vs_reference_rscc.png" \
+                "${out_dir}/lig_vs_reference_rscc_sa_altloc.png"
 }
 
 ######################################################################
@@ -4035,7 +4038,9 @@ do_plot_lig_vs_ref_despot() {
 }
 
 despot_lig_vs_ref_outputs_exist() {
-    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/lig_vs_reference_rscc.png"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
+    files_exist "${out_dir}/lig_vs_reference_rscc.png" \
+                "${out_dir}/lig_vs_reference_rscc_sa_altloc.png"
 }
 
 ######################################################################
@@ -4061,7 +4066,9 @@ do_plot_despot_vs_ref() {
 }
 
 despot_vs_ref_outputs_exist() {
-    files_exist "${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}/despot_vs_reference.png"
+    local out_dir="${GRAPHS_DIR}/${run_name}/${placer_run_name}/${filter_run_name}/${placer2_run_name}/${filter2_run_name}/${final_run_name}/${rotamer_run_name}/${despot_run_name}"
+    files_exist "${out_dir}/despot_vs_reference.png" \
+                "${out_dir}/despot_vs_reference_sa_altloc.png"
 }
 
 ######################################################################
